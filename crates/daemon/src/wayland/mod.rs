@@ -1,0 +1,647 @@
+pub mod dispatch;
+pub mod frame;
+pub mod xkb;
+
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::io::RawFd;
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
+use wayland_client::{
+    globals::{registry_queue_init, GlobalListContents},
+    protocol::{wl_registry, wl_seat::WlSeat},
+    Connection, Dispatch, EventQueue, QueueHandle,
+};
+
+use crate::config::Config;
+use crate::protocols::{
+    input_method_v2::{
+        zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
+        zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
+        zwp_input_method_v2::ZwpInputMethodV2,
+    },
+    virtual_keyboard_v1::{
+        zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+        zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+    },
+};
+use crate::sink::WaylandSink;
+use crate::window::WindowState;
+use viet_ime_edit_strategy::uinput_device::UinputDevice;
+use viet_ime_edit_strategy::{
+    detect_method, BackspaceMethod, CapabilityProbe, ModifierState, SurroundingFrame,
+};
+
+use frame::DoneFrame;
+use xkb::XkbState;
+
+// Linux evdev code for Backspace.
+const KEY_BACKSPACE: u32 = 14;
+// Navigation keys that move the cursor — trigger shadow reset.
+const NAV_KEYS: &[u32] = &[
+    105, 106, 103, 108, // Left, Right, Up, Down
+    102, 107,           // Home, End
+    104, 109,           // PageUp, PageDown
+];
+
+/// Extract just the word immediately before the cursor (scan back to last
+/// whitespace). For retroactive editing, the engine only needs the current
+/// word's context — not the entire document.
+fn current_word_before_cursor(text: &str, cursor: u32) -> &str {
+    let cursor = (cursor as usize).min(text.len());
+    let cursor = (0..=cursor)
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0);
+    let before = &text[..cursor];
+    let start = before
+        .rfind(|c: char| c.is_whitespace() || c == '\0')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    &before[start..]
+}
+
+/// Entire application state. Owns all Wayland proxy objects and per-window
+/// composition state. The `Dispatch` trait impls (in dispatch.rs) call methods
+/// here.
+pub struct AppState {
+    pub config: Config,
+
+    // Wayland proxies (set after globals binding + setup)
+    pub seat: Option<WlSeat>,
+    pub im_manager: Option<ZwpInputMethodManagerV2>,
+    pub vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
+    pub im: Option<ZwpInputMethodV2>,
+    pub grab: Option<ZwpInputMethodKeyboardGrabV2>,
+    pub vk: Option<ZwpVirtualKeyboardV1>,
+
+    // xkb state (set on first Keymap event from the grab)
+    pub xkb: Option<XkbState>,
+    pub keymap_init: bool,
+
+    // Protocol state
+    pub serial: u32,
+    pub modifiers: ModifierState,
+    pub raw_mods: (u32, u32, u32, u32), // depressed, latched, locked, group
+
+    // Pending double-buffered frame (applied at Done)
+    pub pending_frame: DoneFrame,
+    pub current_active: bool,
+
+    /// Timestamp of the last user-keystroke daemon action — used to
+    /// distinguish "compositor echo of our action" (recent) from "user
+    /// clicked mid-word" (not recent) in surrounding_text frames.
+    pub last_action_at: Instant,
+
+    // Per-text-input composition state (one at a time on wlroots)
+    pub window: Option<WindowState>,
+
+    // uinput device for Tier 3 — None if /dev/uinput is not accessible
+    pub uinput: Option<UinputDevice>,
+
+    pub should_exit: bool,
+}
+
+impl AppState {
+    pub fn new(config: Config) -> Self {
+        let uinput = match UinputDevice::open() {
+            Ok(d) => {
+                tracing::info!("uinput device opened (Tier 3 available)");
+                Some(d)
+            }
+            Err(e) => {
+                tracing::warn!("uinput unavailable ({e}); Tier 3 demoted to ForwardKey");
+                None
+            }
+        };
+
+        Self {
+            config,
+            seat: None,
+            im_manager: None,
+            vk_manager: None,
+            im: None,
+            grab: None,
+            vk: None,
+            xkb: None,
+            keymap_init: false,
+            serial: 0,
+            modifiers: ModifierState::empty(),
+            raw_mods: (0, 0, 0, 0),
+            pending_frame: DoneFrame::default(),
+            current_active: false,
+            last_action_at: Instant::now() - std::time::Duration::from_secs(60),
+            window: None,
+            uinput,
+            should_exit: false,
+        }
+    }
+
+    // ── Activation / deactivation ───────────────────────────────────────────
+
+    /// Called when the Done event fires — apply the accumulated pending frame.
+    pub fn apply_done_frame(&mut self) {
+        self.serial = self.serial.wrapping_add(1);
+
+        let activate = self.pending_frame.pending_activate && !self.current_active;
+        let deactivate = self.pending_frame.pending_deactivate && self.current_active;
+
+        tracing::debug!(
+            serial = self.serial,
+            activate,
+            deactivate,
+            purpose = self.pending_frame.purpose,
+            has_surrounding = self.pending_frame.surrounding_text.is_some(),
+            "Done frame"
+        );
+
+        if activate {
+            let (app_id, title) = crate::focused_app::focused_app_info()
+                .unwrap_or_else(|| ("?".to_owned(), "?".to_owned()));
+            tracing::info!(app_id = %app_id, title = %title, "activate");
+            self.current_active = true;
+
+            // Detect capability from this frame's surrounding_text.
+            let method = self.detect_capability();
+            let effective_method = if method == BackspaceMethod::UInput && self.uinput.is_none() {
+                tracing::debug!("UInput requested but unavailable → ForwardKey");
+                BackspaceMethod::ForwardKey
+            } else {
+                method
+            };
+
+            tracing::info!("capability detected: {:?}", effective_method);
+            let ws = WindowState::new(self.config.method.to_engine(), effective_method);
+            self.window = Some(ws);
+        } else if deactivate {
+            tracing::debug!("deactivate");
+            self.current_active = false;
+            self.window = None;
+        }
+
+        // Re-sync shadow on every surrounding_text frame. Re-seed engine
+        // ONLY on activate or when there's no recent daemon action (= user
+        // moved the cursor by clicking).
+        //
+        // Why not on every frame: vnkey-engine's feed_context resets on
+        // non-ASCII chars. After we commit `â`, the next surrounding_text
+        // echoes "trâ" → feed_context would wipe engine state, losing the
+        // tone applied to `â`. Normal typing requires engine state to
+        // accumulate naturally across keystrokes.
+        if let Some(ref st) = self.pending_frame.surrounding_text.clone() {
+            if let Some(ref mut w) = self.window {
+                w.strategy.on_surrounding_text(&st.text, st.cursor);
+
+                let recent_action = self.last_action_at.elapsed()
+                    < std::time::Duration::from_millis(150);
+                let should_reseed = activate || !recent_action;
+                if should_reseed {
+                    let word = current_word_before_cursor(&st.text, st.cursor);
+                    w.engine.reset();
+                    if !word.is_empty() && word.chars().all(|c| c.is_ascii()) {
+                        tracing::debug!(word, "re-seed engine (activate or cursor jump)");
+                        w.engine.feed_context(word);
+                    }
+                }
+            }
+        }
+
+        self.pending_frame.reset();
+    }
+
+    fn detect_capability(&self) -> BackspaceMethod {
+        let probe = CapabilityProbe {
+            purpose: self.pending_frame.purpose,
+            surrounding_text_seen: self.pending_frame.surrounding_text.as_ref().map(|st| {
+                SurroundingFrame {
+                    text: st.text.clone(),
+                    cursor: st.cursor,
+                }
+            }),
+        };
+        detect_method(&probe)
+    }
+
+    // ── Key handling ────────────────────────────────────────────────────────
+
+    pub fn on_key_pressed(&mut self, time: u32, key: u32) {
+        let Some(ref vk) = self.vk else { return };
+
+        // 2-second idle reset
+        if let Some(ref mut w) = self.window {
+            w.check_idle_reset();
+        }
+
+        // Modifier shortcuts (Ctrl/Alt/Super + key): bypass engine, forward
+        // raw. Shift is NOT included — Shift+letter is just uppercase.
+        // Modifier+key may move cursor (Ctrl+arrow, Ctrl+Home, etc.) — leave
+        // last_action_at alone so the resulting surrounding_text frame is
+        // treated as a user cursor move (re-seed enabled).
+        let shortcut_mods =
+            ModifierState::CTRL | ModifierState::ALT | ModifierState::SUPER;
+        if self.modifiers.intersects(shortcut_mods) {
+            tracing::debug!(key, mods = ?self.modifiers,
+                "modifier shortcut → bypass engine + forward");
+            if let Some(ref mut w) = self.window {
+                w.full_reset();
+            }
+            vk.key(time, key, 1);
+            return;
+        }
+
+        // Navigation keys: reset shadow, forward key. Do NOT touch
+        // last_action_at — the resulting cursor move must trigger re-seed
+        // (killer feature: typing mid-word picks up new word context).
+        if NAV_KEYS.contains(&key) {
+            tracing::debug!(key, "key: nav → reset shadow + forward");
+            if let Some(ref mut w) = self.window {
+                w.full_reset();
+            }
+            vk.key(time, key, 1);
+            return;
+        }
+
+        // Mark this as a daemon action: subsequent surrounding_text frames
+        // arriving within 150ms are treated as compositor echoes (expected),
+        // not as user mouse clicks. Done AFTER nav/shortcut handling so those
+        // paths leave the timestamp alone.
+        self.last_action_at = Instant::now();
+
+        // If no active window, just forward
+        if self.window.is_none() {
+            tracing::trace!(key, "key: no active window → forward");
+            vk.key(time, key, 1);
+            return;
+        }
+
+        // Backspace
+        if key == KEY_BACKSPACE {
+            self.handle_backspace(time);
+            return;
+        }
+
+        // Char conversion
+        let ch = match self.xkb.as_ref().and_then(|x| x.key_to_char(key)) {
+            Some(c) => c,
+            None => {
+                tracing::trace!(key, "key: no xkb char → forward raw");
+                vk.key(time, key, 1);
+                return;
+            }
+        };
+
+        self.handle_char(time, key, ch);
+    }
+
+    pub fn on_key_released(&mut self, time: u32, key: u32) {
+        if let Some(ref vk) = self.vk {
+            vk.key(time, key, 0);
+        }
+    }
+
+    fn handle_backspace(&mut self, time: u32) {
+        let w = self.window.as_mut().unwrap();
+        let r = w.engine.process_backspace();
+        tracing::debug!(consumed = r.consumed, bs = r.backspaces, "engine.process_backspace");
+
+        if r.consumed {
+            let serial = self.serial;
+            let im = self.im.as_ref().unwrap();
+            let vk = self.vk.as_ref().unwrap();
+            let mut sink = WaylandSink {
+                im,
+                vk,
+                uinput: self.uinput.as_mut(),
+                serial,
+            };
+            tracing::debug!(method = ?self.window.as_ref().unwrap().method,
+                bs = r.backspaces, commit = %r.commit, "strategy.apply (BS)");
+            self.window
+                .as_mut()
+                .unwrap()
+                .strategy
+                .apply(r.backspaces, &r.commit, serial, time, &mut sink);
+            drop(sink);
+        } else {
+            // Engine didn't consume — forward raw backspace evdev keycode (14).
+            // Update shadow to match: app will delete the last char.
+            tracing::trace!("BS not consumed → forward");
+            self.window.as_mut().unwrap().strategy.shadow.text_mut().pop();
+            if let Some(ref vk) = self.vk {
+                vk.key(time, KEY_BACKSPACE, 1);
+            }
+        }
+
+        if let Some(ref mut w) = self.window {
+            w.last_keystroke_at = Instant::now();
+        }
+    }
+
+    fn handle_char(&mut self, time: u32, key: u32, ch: char) {
+        let w = self.window.as_mut().unwrap();
+
+        // Killer feature for end-of-word: when engine has no pending
+        // composition (fresh after idle_reset, focus change, or anywhere
+        // we cleared state), seed from the current word in the shadow so
+        // retroactive composition fires. e.g. user types "tran", pauses
+        // (idle reset clears engine), types `af` — engine seeded with
+        // "tran" turns `a` into `bs=2 commit="ân"` → "trân", then `f` into
+        // `bs=2 commit="ần"` → "trần".
+        if w.engine.at_word_beginning() {
+            let shadow_text = w.strategy.shadow.text().to_owned();
+            let word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
+            if !word.is_empty() && word.chars().all(|c| c.is_ascii()) {
+                tracing::debug!(word, "seed engine from shadow at word boundary");
+                w.engine.feed_context(word);
+            }
+        }
+
+        let r = w.engine.process_key(ch);
+
+        w.last_keystroke_at = Instant::now();
+
+        tracing::debug!(key, ch = %ch, consumed = r.consumed,
+            bs = r.backspaces, commit = %r.commit,
+            shadow = %self.window.as_ref().unwrap().strategy.shadow.text(),
+            "engine.process_key");
+
+        if r.consumed {
+            let serial = self.serial;
+            let im = self.im.as_ref().unwrap();
+            let vk = self.vk.as_ref().unwrap();
+            let mut sink = WaylandSink {
+                im,
+                vk,
+                uinput: self.uinput.as_mut(),
+                serial,
+            };
+            tracing::debug!(method = ?self.window.as_ref().unwrap().method,
+                "strategy.apply (char)");
+            self.window
+                .as_mut()
+                .unwrap()
+                .strategy
+                .apply(r.backspaces, &r.commit, serial, time, &mut sink);
+            // Don't forward — engine consumed the key
+        } else {
+            // Forward original evdev keycode (NOT ch as u32 — that's the char
+            // codepoint and would land on a wildly different evdev keycode,
+            // e.g. '\r'=13=KEY_EQUAL='=').
+            //
+            // CRITICAL: even when engine doesn't claim the key, the engine
+            // remembers it internally. When a later key DOES trigger consumed
+            // (e.g. second 'a' of "aa" → "â"), engine returns `bs=N` counting
+            // back into THESE forwarded chars. So the shadow must track them
+            // too, otherwise delete_surrounding_text() gets byte_count=0 and
+            // the daemon appends "â" without deleting "a" → "traâ" not "trâ".
+            tracing::trace!(key, ch = %ch, "char not consumed → forward + shadow.push");
+            self.window.as_mut().unwrap().strategy.shadow.text_mut().push(ch);
+            if let Some(ref vk) = self.vk {
+                vk.key(time, key, 1);
+            }
+        }
+    }
+
+    // ── Modifier handling ───────────────────────────────────────────────────
+
+    pub fn on_modifiers(
+        &mut self,
+        mods_depressed: u32,
+        mods_latched: u32,
+        mods_locked: u32,
+        group: u32,
+    ) {
+        // Update xkb state
+        if let Some(ref mut xkb) = self.xkb {
+            xkb.update_modifiers(mods_depressed, mods_latched, mods_locked, group);
+        }
+
+        // Track our modifier bitmask for Tier 3 modifier guard
+        let mut m = ModifierState::empty();
+        if mods_depressed & 0x01 != 0 { m |= ModifierState::SHIFT; }
+        if mods_depressed & 0x04 != 0 { m |= ModifierState::CTRL; }
+        if mods_depressed & 0x08 != 0 { m |= ModifierState::ALT; }
+        if mods_depressed & 0x40 != 0 { m |= ModifierState::SUPER; }
+        self.modifiers = m;
+
+        if let Some(ref mut w) = self.window {
+            w.strategy.set_modifiers(m);
+        }
+
+        self.raw_mods = (mods_depressed, mods_latched, mods_locked, group);
+
+        // Mirror to virtual keyboard (kime pattern: state.rs:716-720)
+        if let Some(ref vk) = self.vk {
+            vk.modifiers(mods_depressed, mods_latched, mods_locked, group);
+        }
+    }
+}
+
+// ── Wrapper for fd used with tokio AsyncFd ───────────────────────────────────
+
+struct WlRawFd(RawFd);
+impl AsRawFd for WlRawFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+// ── Async event loop ─────────────────────────────────────────────────────────
+
+pub async fn run_event_loop(
+    conn: Connection,
+    mut event_queue: EventQueue<AppState>,
+    mut app: AppState,
+) -> Result<()> {
+    use tokio::signal;
+
+    // Wrap raw fd for tokio readability notifications (WlRawFd does not own the fd)
+    let raw = event_queue.as_fd().as_raw_fd();
+    let wl_fd = AsyncFd::with_interest(WlRawFd(raw), Interest::READABLE)
+        .context("AsyncFd on Wayland socket")?;
+
+    let ipc_server = crate::ipc::IpcServer::bind().await;
+
+    loop {
+        // Flush queued outgoing requests
+        event_queue.flush().ok();
+
+        let read_guard = event_queue.prepare_read();
+
+        tokio::select! {
+            biased;
+
+            // Ctrl-C / SIGTERM
+            _ = signal::ctrl_c() => {
+                tracing::info!("shutdown signal received");
+                drop(read_guard);
+                break;
+            }
+
+            // IPC accept (optional; errors ignored)
+            accepted = async {
+                match &ipc_server {
+                    Some(s) => Some(s.accept().await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(Ok(stream)) = accepted {
+                    tokio::spawn(crate::ipc::handle_connection(stream));
+                }
+                drop(read_guard);
+            }
+
+            // Wayland socket readable
+            ready = wl_fd.readable() => {
+                let mut guard = ready.context("AsyncFd poll")?;
+                guard.clear_ready();
+                if let Some(rg) = read_guard {
+                    rg.read().ok();
+                }
+                event_queue.dispatch_pending(&mut app)
+                    .context("Wayland dispatch_pending")?;
+
+                if app.should_exit {
+                    tracing::info!("compositor sent Unavailable — exiting");
+                    break;
+                }
+            }
+        }
+    }
+
+    // Clean up Wayland objects
+    if let Some(grab) = app.grab.take() {
+        grab.release();
+    }
+    if let Some(im) = app.im.take() {
+        im.destroy();
+    }
+    if let Some(vk) = app.vk.take() {
+        vk.destroy();
+    }
+    event_queue.flush().ok();
+
+    Ok(())
+}
+
+// ── Globals binding ──────────────────────────────────────────────────────────
+
+/// Connect to the Wayland compositor, bind globals, create input method + vk.
+pub fn connect(config: Config) -> Result<(Connection, EventQueue<AppState>, AppState)> {
+    let conn = Connection::connect_to_env().context("connect to Wayland display")?;
+
+    let (globals, mut event_queue) =
+        registry_queue_init::<AppState>(&conn).context("registry_queue_init")?;
+
+    let qh = event_queue.handle();
+    let mut app = AppState::new(config);
+
+    // Bind wl_seat
+    let seat = globals
+        .bind::<WlSeat, _, _>(&qh, 1..=8, ())
+        .context("bind wl_seat")?;
+    app.seat = Some(seat.clone());
+
+    // Bind input method manager (required)
+    let im_manager = globals
+        .bind::<ZwpInputMethodManagerV2, _, _>(&qh, 1..=1, ())
+        .context("bind zwp_input_method_manager_v2 — requires wlroots compositor")?;
+    app.im_manager = Some(im_manager.clone());
+
+    // Bind virtual keyboard manager (required for Tier 2)
+    let vk_manager = globals
+        .bind::<ZwpVirtualKeyboardManagerV1, _, _>(&qh, 1..=1, ())
+        .context("bind zwp_virtual_keyboard_manager_v1")?;
+    app.vk_manager = Some(vk_manager.clone());
+
+    // Initial roundtrip to process registry events
+    event_queue.roundtrip(&mut app).context("initial roundtrip")?;
+
+    // Create input method + grab
+    let im = im_manager.get_input_method(&seat, &qh, ());
+    let grab = im.grab_keyboard(&qh, ());
+    let vk = vk_manager.create_virtual_keyboard(&seat, &qh, ());
+
+    tracing::info!("input method and virtual keyboard created");
+
+    app.im = Some(im);
+    app.grab = Some(grab);
+    app.vk = Some(vk);
+
+    // Second roundtrip: receive Keymap + initial state from grab
+    event_queue.roundtrip(&mut app).context("second roundtrip")?;
+
+    Ok((conn, event_queue, app))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::current_word_before_cursor;
+
+    #[test]
+    fn extracts_word_at_end_of_line() {
+        // cursor at end of "tran" → entire word
+        assert_eq!(current_word_before_cursor("tran", 4), "tran");
+    }
+
+    #[test]
+    fn extracts_word_in_middle_of_line() {
+        // cursor mid-word: take chars from last-space to cursor
+        assert_eq!(current_word_before_cursor("hello tran", 10), "tran");
+    }
+
+    #[test]
+    fn extracts_partial_word_at_cursor() {
+        // Regression: user clicks between 'a' and 'n' of "tran".
+        // cursor=3 → word is "tra".
+        assert_eq!(current_word_before_cursor("tran", 3), "tra");
+    }
+
+    #[test]
+    fn empty_text_returns_empty() {
+        assert_eq!(current_word_before_cursor("", 0), "");
+    }
+
+    #[test]
+    fn cursor_at_start_returns_empty() {
+        assert_eq!(current_word_before_cursor("hello", 0), "");
+    }
+
+    #[test]
+    fn handles_multibyte_chars_at_char_boundary() {
+        // "trâ" = 4 bytes (t=1, r=1, â=2). cursor=4 lands on char boundary.
+        assert_eq!(current_word_before_cursor("trâ", 4), "trâ");
+    }
+
+    #[test]
+    fn handles_cursor_inside_multibyte_char() {
+        // cursor=3 lands MID-byte of â (which spans bytes 2-3).
+        // The fn must snap back to a valid char boundary.
+        let r = current_word_before_cursor("trâ", 3);
+        // Should be "tr" — the largest prefix ending on a char boundary <= 3
+        assert_eq!(r, "tr");
+    }
+
+    #[test]
+    fn cursor_beyond_text_clamps() {
+        // Cursor larger than text length — clamp to len
+        assert_eq!(current_word_before_cursor("hi", 99), "hi");
+    }
+
+    #[test]
+    fn space_separates_words() {
+        assert_eq!(current_word_before_cursor("foo bar baz", 11), "baz");
+    }
+
+    #[test]
+    fn tab_separates_words() {
+        assert_eq!(current_word_before_cursor("foo\tbar", 7), "bar");
+    }
+
+    #[test]
+    fn newline_separates_words() {
+        assert_eq!(current_word_before_cursor("line1\nline2", 11), "line2");
+    }
+}

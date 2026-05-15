@@ -1,0 +1,9 @@
+[submodule "vendors/vnkey"]
+	path = vendors/vnkey
+	url = https://github.com/marixdev/vnkey
+[submodule "vendors/kime"]
+	path = vendors/kime
+	url = https://github.com/Riey/kime
+[submodule "vendors/ydotool"]
+	path = vendors/ydotool
+	url = https://github.com/ReimuNotMoe/ydotool

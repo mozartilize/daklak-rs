@@ -1,0 +1,11 @@
+[package]
+name = "viet-ime-edit-strategy"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+viet-ime-engine = { path = "../engine" }
+evdev = { workspace = true }
+bitflags = { workspace = true }
+tracing = { workspace = true }

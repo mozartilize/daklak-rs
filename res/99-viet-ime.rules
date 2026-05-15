@@ -1,0 +1,13 @@
+# udev rule for viet-ime: grant access to /dev/uinput without requiring root.
+#
+# Install:
+#   sudo cp res/99-viet-ime.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --name-match=uinput
+#   sudo usermod -aG input $USER   # then log out + back in
+#
+# Verify: ls -l /dev/uinput  →  crw-rw---- root input
+#
+# TAG+="uaccess" additionally grants the active session user via systemd-logind
+# (belt-and-suspenders — works even without the `input` group membership).
+KERNEL=="uinput", GROUP="input", MODE="0660", TAG+="uaccess"
