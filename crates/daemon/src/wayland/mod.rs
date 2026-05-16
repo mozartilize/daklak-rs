@@ -291,6 +291,7 @@ impl AppState {
                 }
             }),
             app_id: self.focused_app_id.clone(),
+            force_uinput_apps: self.config.force_uinput_apps.clone(),
             terminal_override: self.terminal_override,
         };
         detect_method(&probe)

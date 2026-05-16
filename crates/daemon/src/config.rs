@@ -30,11 +30,23 @@ impl MethodConfig {
 pub struct Config {
     #[serde(default)]
     pub method: MethodConfig,
+
+    /// Apps whose `app_id` (case-insensitive) forces Tier 3 UInput routing
+    /// regardless of `purpose` or other capability signals. Use this for
+    /// apps confirmed broken on both Tier 2 ForwardKey and Tier 1
+    /// SurroundingText — e.g. chromium drops first-compose vk_key BS AND
+    /// drops every delete_surrounding_text. Env override
+    /// `DAKLAK_FORCE_UINPUT_APPS` (comma-separated) replaces this list.
+    #[serde(default)]
+    pub force_uinput_apps: Vec<String>,
 }
 
 impl Config {
     /// Load config from $XDG_CONFIG_HOME/viet-ime/config.toml, with env
-    /// override VIET_IME_METHOD={telex|vni|viqr}.
+    /// overrides:
+    /// - `VIET_IME_METHOD={telex|vni|viqr}` overrides `method`.
+    /// - `DAKLAK_FORCE_UINPUT_APPS=app1,app2,...` replaces `force_uinput_apps`
+    ///   (empty string clears the list).
     pub fn load() -> Result<Self> {
         let mut cfg = Self::load_file().unwrap_or_default();
 
@@ -44,6 +56,15 @@ impl Config {
                 "viqr" => MethodConfig::Viqr,
                 _ => MethodConfig::Telex,
             };
+        }
+
+        if let Ok(apps) = std::env::var("DAKLAK_FORCE_UINPUT_APPS") {
+            cfg.force_uinput_apps = apps
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
         }
 
         Ok(cfg)
