@@ -392,7 +392,6 @@ mod tests {
             Call::VkKey(42, 14, KeyState::Released),
             Call::VkCommitChar(42, 'â'),
         ]);
-        // No CommitString, no Commit — Tier 4 has no text_input_v3 surface.
         assert!(!sink.calls.iter().any(|c| matches!(c, Call::CommitString(_))));
         assert!(!sink.calls.iter().any(|c| matches!(c, Call::Commit(_))));
         assert_eq!(s.shadow.text(), "â");
@@ -400,9 +399,6 @@ mod tests {
 
     #[test]
     fn tier4_multichar_commit_each_via_vk() {
-        // Engine sometimes emits multi-char commits (rare). Each char
-        // must go through vk_commit_char separately so the keymap
-        // lookup happens per char.
         let mut s = Strategy::new(BackspaceMethod::VkOnly);
         s.shadow.append("tr");
         let mut sink = MockSink::default();

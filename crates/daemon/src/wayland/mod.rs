@@ -202,8 +202,8 @@ impl AppState {
                 Ok(km) => {
                     tracing::info!(
                         size = km.size,
-                        chars = keymap::inventory_len(),
-                        "synthetic Vietnamese keymap built (Path C)"
+                        vn_pairs = keymap::vn_pairs(),
+                        "synthetic Vietnamese keymap built (Path C, FOUR_LEVEL ≤255)"
                     );
                     Some(km)
                 }
@@ -520,12 +520,14 @@ impl AppState {
             let serial = self.serial;
             let im = self.im.as_ref().unwrap();
             let vk = self.vk.as_ref().unwrap();
+            let raw_mods = self.raw_mods;
             let mut sink = WaylandSink {
                 im,
                 vk,
                 uinput: self.uinput.as_mut(),
                 pending_self_emits: &mut self.pending_self_emits,
                 serial,
+                raw_mods,
             };
             tracing::debug!(method = ?self.window.as_ref().unwrap().method,
                 bs = r.backspaces, commit = %r.commit, "strategy.apply (BS)");
@@ -605,12 +607,14 @@ impl AppState {
             {
                 let im = self.im.as_ref().unwrap();
                 let vk = self.vk.as_ref().unwrap();
+                let raw_mods = self.raw_mods;
                 let mut sink = WaylandSink {
                     im,
                     vk,
                     uinput: self.uinput.as_mut(),
                     pending_self_emits: &mut self.pending_self_emits,
                     serial,
+                    raw_mods,
                 };
                 tracing::debug!(method = ?method, "strategy.apply (char)");
                 self.window
@@ -728,7 +732,13 @@ pub async fn run_event_loop(
                     .await
                     .ok()
                     .flatten();
-                let app_id = info.map(|(id, _)| id);
+                // Treat empty/whitespace app_ids as "no focused IME-eligible
+                // window" — surfaces without a meaningful identifier
+                // (some scratchpads, lock screens) shouldn't trigger the
+                // synthetic activate path.
+                let app_id = info
+                    .map(|(id, _)| id)
+                    .filter(|id| !id.trim().is_empty());
                 if app_id != last {
                     if tx.send(app_id.clone()).is_err() {
                         break; // receiver dropped

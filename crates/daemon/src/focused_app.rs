@@ -20,9 +20,22 @@ pub fn focused_app_info() -> Option<(String, String)> {
 
 fn find_focused(node: &serde_json::Value) -> Option<(String, String)> {
     if node.get("focused").and_then(|v| v.as_bool()) == Some(true) {
+        // Native Wayland: `app_id` is the canonical identifier.
+        // XWayland: Sway sets `app_id` to null/empty and exposes the
+        //   WM_CLASS class in `window_properties.class`. Falling through
+        //   lets force_vk_only_apps match XWayland clients (Chromium-via-X,
+        //   VS Code-via-X, JetBrains IDEs in their X mode, etc.) by their
+        //   X class name. Match in the user-supplied list stays
+        //   case-insensitive so users can write "chromium" not "Chromium".
         let app_id = node
             .get("app_id")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                node.get("window_properties")
+                    .and_then(|wp| wp.get("class"))
+                    .and_then(|v| v.as_str())
+            })
             .unwrap_or("")
             .to_owned();
         let name = node
