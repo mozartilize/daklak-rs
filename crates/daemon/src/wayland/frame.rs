@@ -25,6 +25,15 @@ impl DoneFrame {
         self.pending_deactivate = false;
         self.surrounding_text = None;
         self.change_cause = None;
-        // purpose persists across frames (sticky per text-input object)
+        // purpose stays sticky WITHIN a session; cleared on session boundary
+    }
+
+    /// Called when a deactivate frame applies — the next activate is a fresh
+    /// text-input session and must not inherit the previous app's purpose.
+    /// Without this, e.g. focusing chromium right after foot keeps purpose=13
+    /// (PURPOSE_TERMINAL) and mis-routes chromium through the terminal arm of
+    /// `detect_method`.
+    pub fn end_session(&mut self) {
+        self.purpose = 0; // PURPOSE_NORMAL default
     }
 }

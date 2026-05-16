@@ -1,3 +1,6 @@
+use std::collections::VecDeque;
+use std::time::Instant;
+
 use viet_ime_edit_strategy::{KeyState, OutputSink};
 
 use crate::protocols::{
@@ -9,11 +12,14 @@ use viet_ime_edit_strategy::uinput_device::UinputDevice;
 /// Bridges `edit_strategy::OutputSink` to live Wayland proxy calls.
 ///
 /// Borrows proxy references from `AppState` — borrow checker allows this
-/// because `sink`, `im`, `vk`, and `uinput` are distinct struct fields.
+/// because `im`, `vk`, `uinput`, and `pending_self_emits` are distinct fields.
 pub struct WaylandSink<'a> {
     pub im: &'a ZwpInputMethodV2,
     pub vk: &'a ZwpVirtualKeyboardV1,
     pub uinput: Option<&'a mut UinputDevice>,
+    /// Queue daklak's own uinput emissions go into so the grab handler can
+    /// match and drop their round-trips. AppState owns it.
+    pub pending_self_emits: &'a mut VecDeque<(u16, i32, Instant)>,
     pub serial: u32,
 }
 
@@ -45,6 +51,8 @@ impl OutputSink for WaylandSink<'_> {
     fn uinput_key(&mut self, key_code: u16, value: i32) {
         if let Some(u) = &mut self.uinput {
             let _ = u.emit(key_code, value);
+            self.pending_self_emits
+                .push_back((key_code, value, Instant::now()));
         }
     }
 }

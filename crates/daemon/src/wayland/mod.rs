@@ -2,9 +2,10 @@ pub mod dispatch;
 pub mod frame;
 pub mod xkb;
 
+use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::io::RawFd;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::unix::AsyncFd;
@@ -77,6 +78,13 @@ pub struct AppState {
     pub grab: Option<ZwpInputMethodKeyboardGrabV2>,
     pub vk: Option<ZwpVirtualKeyboardV1>,
 
+    /// Connection clone for grab-release/regrab flush around Tier 3 uinput
+    /// emission. With this in place we can prove whether BS escapes the grab
+    /// AND whether the focused surface honors it.
+    pub conn: Option<Connection>,
+    pub qh: Option<QueueHandle<AppState>>,
+
+
     // xkb state (set on first Keymap event from the grab)
     pub xkb: Option<XkbState>,
     pub keymap_init: bool,
@@ -101,6 +109,23 @@ pub struct AppState {
     // uinput device for Tier 3 — None if /dev/uinput is not accessible
     pub uinput: Option<UinputDevice>,
 
+    /// Queue of (keycode, value, emitted_at) for kernel events daklak just
+    /// synthesized via /dev/uinput. Each entry is round-tripped through the
+    /// IM grab; on_key_pressed / on_key_released match and drop the matching
+    /// entry so we don't re-process our own emissions.
+    pub pending_self_emits: VecDeque<(u16, i32, Instant)>,
+
+    /// Forced tier for `purpose == PURPOSE_TERMINAL`, read once from
+    /// `DAKLAK_TERMINAL_TIER` at startup. None → use the detect_method
+    /// default (ForwardKey).
+    pub terminal_override: Option<BackspaceMethod>,
+
+    /// Focused window's `app_id` captured at activate via Sway IPC
+    /// (`focused_app_info()`). Threaded into the capability probe so
+    /// known-broken-on-ForwardKey terminals can auto-escalate. `None`
+    /// outside an active session or when Sway IPC is unavailable.
+    pub focused_app_id: Option<String>,
+
     pub should_exit: bool,
 }
 
@@ -117,6 +142,32 @@ impl AppState {
             }
         };
 
+        let terminal_override = match std::env::var("DAKLAK_TERMINAL_TIER")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("uinput") => {
+                tracing::info!("DAKLAK_TERMINAL_TIER=uinput → terminals route to Tier 3 UInput");
+                Some(BackspaceMethod::UInput)
+            }
+            Some("surrounding") | Some("surrounding_text") | Some("tier1") => {
+                tracing::info!(
+                    "DAKLAK_TERMINAL_TIER=surrounding → terminals route to Tier 1 SurroundingText"
+                );
+                Some(BackspaceMethod::SurroundingText)
+            }
+            Some("forward") | Some("forward_key") | Some("tier2") | Some("") | None => None,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "DAKLAK_TERMINAL_TIER unrecognized; falling back to default (ForwardKey)"
+                );
+                None
+            }
+        };
+
         Self {
             config,
             seat: None,
@@ -125,6 +176,8 @@ impl AppState {
             im: None,
             grab: None,
             vk: None,
+            conn: None,
+            qh: None,
             xkb: None,
             keymap_init: false,
             serial: 0,
@@ -135,6 +188,9 @@ impl AppState {
             last_action_at: Instant::now() - std::time::Duration::from_secs(60),
             window: None,
             uinput,
+            pending_self_emits: VecDeque::new(),
+            terminal_override,
+            focused_app_id: None,
             should_exit: false,
         }
     }
@@ -158,10 +214,15 @@ impl AppState {
         );
 
         if activate {
-            let (app_id, title) = crate::focused_app::focused_app_info()
+            let focused = crate::focused_app::focused_app_info();
+            let (app_id, title) = focused
+                .clone()
                 .unwrap_or_else(|| ("?".to_owned(), "?".to_owned()));
             tracing::info!(app_id = %app_id, title = %title, "activate");
             self.current_active = true;
+            // Stash for the capability probe + future per-app routing.
+            // None on non-Sway compositors (focused_app_info returned None).
+            self.focused_app_id = focused.map(|(id, _)| id);
 
             // Detect capability from this frame's surrounding_text.
             let method = self.detect_capability();
@@ -179,6 +240,11 @@ impl AppState {
             tracing::debug!("deactivate");
             self.current_active = false;
             self.window = None;
+            self.focused_app_id = None;
+            // Clear sticky purpose so the next activate doesn't inherit it
+            // (e.g. focusing chromium right after foot must not carry
+            // purpose=13).
+            self.pending_frame.end_session();
         }
 
         // Re-sync shadow on every surrounding_text frame. Re-seed engine
@@ -200,7 +266,11 @@ impl AppState {
                 if should_reseed {
                     let word = current_word_before_cursor(&st.text, st.cursor);
                     w.engine.reset();
-                    if !word.is_empty() && word.chars().all(|c| c.is_ascii()) {
+                    // Only seed with all-lowercase ASCII: Vietnamese typing
+                    // is lowercase. Capitalized words signal English content
+                    // (e.g. thunar's "Folder") where seeding poisons the
+                    // engine and prevents subsequent compose triggers.
+                    if !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase()) {
                         tracing::debug!(word, "re-seed engine (activate or cursor jump)");
                         w.engine.feed_context(word);
                     }
@@ -220,13 +290,48 @@ impl AppState {
                     cursor: st.cursor,
                 }
             }),
+            app_id: self.focused_app_id.clone(),
+            terminal_override: self.terminal_override,
         };
         detect_method(&probe)
     }
 
     // ── Key handling ────────────────────────────────────────────────────────
 
+    /// Check whether the incoming grab key event matches a recent self-emit
+    /// from /dev/uinput. Drains expired entries (>50ms old) before matching.
+    /// Returns true if the event should be suppressed (i.e. dropped silently).
+    fn suppress_self_emit(&mut self, key: u32, value: i32) -> bool {
+        const SELF_EMIT_WINDOW: Duration = Duration::from_millis(50);
+        while let Some(&(_, _, t)) = self.pending_self_emits.front() {
+            if t.elapsed() > SELF_EMIT_WINDOW {
+                self.pending_self_emits.pop_front();
+            } else {
+                break;
+            }
+        }
+        if let Some(idx) = self
+            .pending_self_emits
+            .iter()
+            .position(|&(k, v, _)| k as u32 == key && v == value)
+        {
+            self.pending_self_emits.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn on_key_pressed(&mut self, time: u32, key: u32) {
+        // Suppress self-emit round-trips from /dev/uinput (Tier 3 BS / modifier
+        // restore). Kernel round-trip is sub-millisecond; 50ms window absorbs
+        // scheduler jitter without swallowing real user input (reaction time
+        // >150ms).
+        if self.suppress_self_emit(key, 1) {
+            tracing::trace!(key, value = 1, "self-emit suppressed");
+            return;
+        }
+
         let Some(ref vk) = self.vk else { return };
 
         // 2-second idle reset
@@ -296,6 +401,10 @@ impl AppState {
     }
 
     pub fn on_key_released(&mut self, time: u32, key: u32) {
+        if self.suppress_self_emit(key, 0) {
+            tracing::trace!(key, value = 0, "self-emit suppressed");
+            return;
+        }
         if let Some(ref vk) = self.vk {
             vk.key(time, key, 0);
         }
@@ -314,6 +423,7 @@ impl AppState {
                 im,
                 vk,
                 uinput: self.uinput.as_mut(),
+                pending_self_emits: &mut self.pending_self_emits,
                 serial,
             };
             tracing::debug!(method = ?self.window.as_ref().unwrap().method,
@@ -352,7 +462,8 @@ impl AppState {
         if w.engine.at_word_beginning() {
             let shadow_text = w.strategy.shadow.text().to_owned();
             let word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
-            if !word.is_empty() && word.chars().all(|c| c.is_ascii()) {
+            // Lowercase-only seed gate (see apply_done_frame comment above).
+            if !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase()) {
                 tracing::debug!(word, "seed engine from shadow at word boundary");
                 w.engine.feed_context(word);
             }
@@ -369,21 +480,57 @@ impl AppState {
 
         if r.consumed {
             let serial = self.serial;
-            let im = self.im.as_ref().unwrap();
-            let vk = self.vk.as_ref().unwrap();
-            let mut sink = WaylandSink {
-                im,
-                vk,
-                uinput: self.uinput.as_mut(),
-                serial,
-            };
-            tracing::debug!(method = ?self.window.as_ref().unwrap().method,
-                "strategy.apply (char)");
-            self.window
-                .as_mut()
-                .unwrap()
-                .strategy
-                .apply(r.backspaces, &r.commit, serial, time, &mut sink);
+            let method = self.window.as_ref().unwrap().strategy.method();
+            let uinput_path = method == BackspaceMethod::UInput;
+
+            // Tier 3 race-free grab dance: release grab + flush + brief
+            // sleep so compositor processes the release before kernel BS
+            // arrives. Window must be wide enough for the compositor to
+            // process our release request, but narrow enough that user
+            // keystrokes can't slip through (worst case ~80ms/key for fast
+            // typists — empirically a 30ms window let `n` of `traanf` leak
+            // past daklak while we composed `â`). 3ms before + 3ms after
+            // = 6ms total dance, well below human keystroke interval.
+            if uinput_path {
+                if let Some(g) = self.grab.take() {
+                    g.release();
+                }
+                if let Some(ref c) = self.conn {
+                    let _ = c.flush();
+                }
+                std::thread::sleep(Duration::from_millis(3));
+            }
+
+            {
+                let im = self.im.as_ref().unwrap();
+                let vk = self.vk.as_ref().unwrap();
+                let mut sink = WaylandSink {
+                    im,
+                    vk,
+                    uinput: self.uinput.as_mut(),
+                    pending_self_emits: &mut self.pending_self_emits,
+                    serial,
+                };
+                tracing::debug!(method = ?method, "strategy.apply (char)");
+                self.window
+                    .as_mut()
+                    .unwrap()
+                    .strategy
+                    .apply(r.backspaces, &r.commit, serial, time, &mut sink);
+            }
+
+            if uinput_path {
+                if let Some(ref c) = self.conn {
+                    let _ = c.flush();
+                }
+                std::thread::sleep(Duration::from_millis(3));
+                if let (Some(im), Some(qh)) = (self.im.as_ref(), self.qh.as_ref()) {
+                    self.grab = Some(im.grab_keyboard(qh, ()));
+                    if let Some(ref c) = self.conn {
+                        let _ = c.flush();
+                    }
+                }
+            }
             // Don't forward — engine consumed the key
         } else {
             // Forward original evdev keycode (NOT ch as u32 — that's the char
@@ -569,6 +716,8 @@ pub fn connect(config: Config) -> Result<(Connection, EventQueue<AppState>, AppS
     app.im = Some(im);
     app.grab = Some(grab);
     app.vk = Some(vk);
+    app.conn = Some(conn.clone());
+    app.qh = Some(qh.clone());
 
     // Second roundtrip: receive Keymap + initial state from grab
     event_queue.roundtrip(&mut app).context("second roundtrip")?;
@@ -643,5 +792,32 @@ mod tests {
     #[test]
     fn newline_separates_words() {
         assert_eq!(current_word_before_cursor("line1\nline2", 11), "line2");
+    }
+
+    // Seed-gate filter checks: only all-lowercase ASCII words feed the engine.
+    // Mirrors the `word.chars().all(|c| c.is_ascii_lowercase())` predicate at
+    // both seed call sites (apply_done_frame and handle_char).
+
+    #[test]
+    fn seed_gate_skips_capitalized_word() {
+        // Thunar "New Folder" → word_before_cursor = "Folder" → uppercase F
+        // → gate rejects → engine starts clean for new Vietnamese typing.
+        let word = "Folder";
+        assert!(!word.chars().all(|c| c.is_ascii_lowercase()));
+    }
+
+    #[test]
+    fn seed_gate_accepts_lowercase_vietnamese_precursor() {
+        // Killer feature: user types `tran`, idles, types `f` → retroactive
+        // `trần`. Seed must fire on "tran".
+        let word = "tran";
+        assert!(word.chars().all(|c| c.is_ascii_lowercase()));
+    }
+
+    #[test]
+    fn seed_gate_skips_word_with_digit() {
+        // "abc1" is mixed; not Vietnamese-composable.
+        let word = "abc1";
+        assert!(!word.chars().all(|c| c.is_ascii_lowercase()));
     }
 }

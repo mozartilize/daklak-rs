@@ -65,6 +65,15 @@ pub fn apply(
         }
     }
 
+    // Force causal ordering at the compositor: kernel BS events go through
+    // libinput → wl_keyboard; the upcoming commit_string goes through
+    // input-method-v2 → text_input_v3. They're separate channels and apps
+    // that process them in independent handlers (e.g. ghostty) can apply
+    // them out of order, yielding wrong text. Brief sleep lets the
+    // compositor drain the BS events before the wayland commit hits the
+    // socket.
+    std::thread::sleep(std::time::Duration::from_millis(3));
+
     // Commit text still goes through Wayland — uinput has no Unicode path.
     tracing::debug!(commit = %commit, serial, "uinput tier: emit commit_string + commit");
     sink.commit_string(commit);
