@@ -19,6 +19,13 @@ pub struct CapabilityProbe {
     /// config.toml) and the env var `DAKLAK_FORCE_UINPUT_APPS`.
     /// Daklak ships with no opinionated default.
     pub force_uinput_apps: Vec<String>,
+    /// Apps whose `app_id` forces Tier 4 VkOnly (Path C). Loaded from
+    /// `force_vk_only_apps` in config.toml and env var
+    /// `DAKLAK_FORCE_VK_ONLY_APPS`. Wins over the purpose default but
+    /// loses to `force_uinput_apps` (UInput is the older, more
+    /// battle-tested escape hatch). Daklak ships with no default — both
+    /// lists are user-curated.
+    pub force_vk_only_apps: Vec<String>,
     /// Forced tier for `purpose == PURPOSE_TERMINAL`, set by the daemon from
     /// `DAKLAK_TERMINAL_TIER` once at startup. Wins over the app_id list.
     pub terminal_override: Option<BackspaceMethod>,
@@ -40,10 +47,16 @@ const PURPOSE_TERMINAL: u32 = 13;
 ///
 /// Priority:
 /// 1. Env override (terminal-only): `DAKLAK_TERMINAL_TIER` wins for purpose=13.
-/// 2. App-id list (any purpose): match against `probe.force_uinput_apps` →
-///    UInput. List is loaded by the daemon from config.toml or env
-///    (`DAKLAK_FORCE_UINPUT_APPS=app1,app2,...`).
-/// 3. Purpose-based default:
+/// 2. App-id list — `force_uinput_apps` (any purpose) → Tier 3 UInput.
+/// 3. App-id list — `force_vk_only_apps` (any purpose) → Tier 4 VkOnly
+///    (Path C). Routes everything through `zwp_virtual_keyboard_v1::key()`
+///    using daklak's synthesized Vietnamese keymap — bypasses
+///    `text_input_v3` entirely. Safe target: clients with NO
+///    `text_input_v3` at all (Qt5/XWayland-via-vk). Unsafe target:
+///    Chromium-class apps — their renderer has hard-coded
+///    `LinuxKeyCode → DomCode` tables and crashes when fed evdev 200+
+///    attached to Unicode keysyms. For those, use `force_uinput_apps`.
+/// 4. Purpose-based default:
 ///    - Terminals → ForwardKey (foot composes correctly here; cosmetic
 ///      upstream preedit bug aside).
 ///    - Non-terminals → SurroundingText if app sent a surrounding_text frame
@@ -55,8 +68,11 @@ pub fn detect_method(probe: &CapabilityProbe) -> BackspaceMethod {
         }
     }
     if let Some(ref app_id) = probe.app_id {
-        if app_id_forces_uinput(app_id, &probe.force_uinput_apps) {
+        if app_id_matches(app_id, &probe.force_uinput_apps) {
             return BackspaceMethod::UInput;
+        }
+        if app_id_matches(app_id, &probe.force_vk_only_apps) {
+            return BackspaceMethod::VkOnly;
         }
     }
     if probe.purpose == PURPOSE_TERMINAL {
@@ -68,11 +84,11 @@ pub fn detect_method(probe: &CapabilityProbe) -> BackspaceMethod {
     }
 }
 
-/// Case-insensitive match of `app_id` against the user-supplied list of apps
-/// that must route to Tier 3 UInput.
-fn app_id_forces_uinput<S: AsRef<str>>(app_id: &str, broken_list: &[S]) -> bool {
+/// Case-insensitive match of `app_id` against a user-supplied list of
+/// apps. Used by both `force_uinput_apps` and `force_vk_only_apps`.
+fn app_id_matches<S: AsRef<str>>(app_id: &str, list: &[S]) -> bool {
     let lower = app_id.to_ascii_lowercase();
-    broken_list.iter().any(|t| t.as_ref() == lower)
+    list.iter().any(|t| t.as_ref() == lower)
 }
 
 #[cfg(test)]
@@ -88,6 +104,7 @@ mod tests {
             }),
             app_id: None,
             force_uinput_apps: Vec::new(),
+            force_vk_only_apps: Vec::new(),
             terminal_override: None,
         }
     }
@@ -156,13 +173,13 @@ mod tests {
     fn app_id_match_helper_is_case_insensitive() {
         let list = &["chromium", "com.mitchellh.ghostty"];
         for input in ["chromium", "Chromium", "CHROMIUM", "ChRoMiUm"] {
-            assert!(app_id_forces_uinput(input, list), "expected match for {input}");
+            assert!(app_id_matches(input, list), "expected match for {input}");
         }
         for input in ["com.mitchellh.ghostty", "COM.MITCHELLH.GHOSTTY"] {
-            assert!(app_id_forces_uinput(input, list), "expected match for {input}");
+            assert!(app_id_matches(input, list), "expected match for {input}");
         }
         for input in ["chrome", "footclient", "foot", "gedit", ""] {
-            assert!(!app_id_forces_uinput(input, list), "did not expect match for {input}");
+            assert!(!app_id_matches(input, list), "did not expect match for {input}");
         }
     }
 
@@ -170,7 +187,7 @@ mod tests {
     fn app_id_match_helper_empty_list_matches_nothing() {
         let empty: &[&str] = &[];
         for input in ["chromium", "ghostty", "footclient"] {
-            assert!(!app_id_forces_uinput(input, empty), "empty list should never match {input}");
+            assert!(!app_id_matches(input, empty), "empty list should never match {input}");
         }
     }
 
@@ -188,6 +205,35 @@ mod tests {
     fn terminal_app_id_match_escalates_to_uinput() {
         // Config-driven list: ghostty with purpose=13 escalates to UInput.
         let p = probe_with_app_id_and_list(13, "com.mitchellh.ghostty", &["com.mitchellh.ghostty"]);
+        assert_eq!(detect_method(&p), BackspaceMethod::UInput);
+    }
+
+    #[test]
+    fn force_vk_only_routes_to_vk_only() {
+        // Chromium scenario: app advertises text_input_v3 so real Activate
+        // fires, but user listed it in force_vk_only_apps because commit
+        // delivery is flaky on Tier 1/2. force_vk_only_apps wins over the
+        // purpose-based default.
+        let mut p = probe_with_app_id(0, "chromium");
+        p.force_vk_only_apps = vec!["chromium".to_owned()];
+        assert_eq!(detect_method(&p), BackspaceMethod::VkOnly);
+
+        // Even when surrounding_text frame is present (would otherwise
+        // route to Tier 1) — force_vk_only_apps still wins.
+        let mut p = probe(0, Some(("tran", 4)));
+        p.app_id = Some("chromium".to_owned());
+        p.force_vk_only_apps = vec!["chromium".to_owned()];
+        assert_eq!(detect_method(&p), BackspaceMethod::VkOnly);
+    }
+
+    #[test]
+    fn force_uinput_beats_force_vk_only() {
+        // Both lists contain the app — UInput wins (older, more
+        // battle-tested escape hatch). Documented in detect_method's
+        // priority comment.
+        let mut p = probe_with_app_id(0, "chromium");
+        p.force_uinput_apps = vec!["chromium".to_owned()];
+        p.force_vk_only_apps = vec!["chromium".to_owned()];
         assert_eq!(detect_method(&p), BackspaceMethod::UInput);
     }
 

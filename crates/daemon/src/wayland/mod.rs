@@ -1,5 +1,6 @@
 pub mod dispatch;
 pub mod frame;
+pub mod keymap;
 pub mod xkb;
 
 use std::collections::VecDeque;
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
+use tokio::sync::mpsc;
 use wayland_client::{
     globals::{registry_queue_init, GlobalListContents},
     protocol::{wl_registry, wl_seat::WlSeat},
@@ -36,6 +38,7 @@ use viet_ime_edit_strategy::{
 };
 
 use frame::DoneFrame;
+use keymap::DaklakKeymap;
 use xkb::XkbState;
 
 // Linux evdev code for Backspace.
@@ -89,6 +92,14 @@ pub struct AppState {
     pub xkb: Option<XkbState>,
     pub keymap_init: bool,
 
+    /// Synthetic xkb keymap with Vietnamese precomposed chars at evdev
+    /// 200+. Handed to `vk.keymap()` on the first Keymap event so vk_key
+    /// events can deliver Vietnamese chars without `commit_string` / a
+    /// `zwp_text_input_v3` activate (Qt5/XWayland path). `None` if
+    /// xkbcommon rejects the synthesized keymap — daklak then falls back
+    /// to forwarding the compositor's keymap to `vk.keymap()`.
+    pub daklak_keymap: Option<DaklakKeymap>,
+
     // Protocol state
     pub serial: u32,
     pub modifiers: ModifierState,
@@ -125,6 +136,13 @@ pub struct AppState {
     /// known-broken-on-ForwardKey terminals can auto-escalate. `None`
     /// outside an active session or when Sway IPC is unavailable.
     pub focused_app_id: Option<String>,
+
+    /// True when `current_active` was synthesized by daklak (Path C —
+    /// Sway IPC focus matched `force_vk_only_apps`) rather than driven
+    /// by a compositor `zwp_input_method_v2::Activate` event. Real
+    /// activate always wins: if it fires, this flips back to false and
+    /// the synthetic window is replaced by the normal capability path.
+    pub synthetic_active: bool,
 
     pub should_exit: bool,
 }
@@ -180,6 +198,22 @@ impl AppState {
             qh: None,
             xkb: None,
             keymap_init: false,
+            daklak_keymap: match keymap::build() {
+                Ok(km) => {
+                    tracing::info!(
+                        size = km.size,
+                        chars = keymap::inventory_len(),
+                        "synthetic Vietnamese keymap built (Path C)"
+                    );
+                    Some(km)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "daklak keymap synthesis failed → falling back to compositor passthrough: {e:#}"
+                    );
+                    None
+                }
+            },
             serial: 0,
             modifiers: ModifierState::empty(),
             raw_mods: (0, 0, 0, 0),
@@ -191,6 +225,7 @@ impl AppState {
             pending_self_emits: VecDeque::new(),
             terminal_override,
             focused_app_id: None,
+            synthetic_active: false,
             should_exit: false,
         }
     }
@@ -200,6 +235,20 @@ impl AppState {
     /// Called when the Done event fires — apply the accumulated pending frame.
     pub fn apply_done_frame(&mut self) {
         self.serial = self.serial.wrapping_add(1);
+
+        // Real compositor activate always wins over a synthetic (Sway-IPC-driven)
+        // session. If one fires while we hold a synthetic VkOnly session,
+        // tear the synthetic state down first so the regular capability
+        // path can rebuild a real WindowState below.
+        if self.pending_frame.pending_activate && self.synthetic_active {
+            tracing::info!(
+                "real Activate received while synthetic session active → drop synthetic"
+            );
+            self.current_active = false;
+            self.synthetic_active = false;
+            self.window = None;
+            self.focused_app_id = None;
+        }
 
         let activate = self.pending_frame.pending_activate && !self.current_active;
         let deactivate = self.pending_frame.pending_deactivate && self.current_active;
@@ -281,6 +330,56 @@ impl AppState {
         self.pending_frame.reset();
     }
 
+    /// Sway IPC reported the focused window changed. Decide whether to
+    /// synthesize an activate/deactivate for Path C (Tier 4 VkOnly).
+    ///
+    /// Synthetic activate fires when:
+    ///   - no real compositor session is active, AND
+    ///   - the new focused app_id matches `config.force_vk_only_apps`.
+    ///
+    /// Synthetic deactivate fires when we're in a synthetic session AND
+    /// focus moves away to a non-matching app. Real activates take
+    /// precedence — if they ever fire, we let them tear down the
+    /// synthetic state first.
+    pub fn on_focus_changed(&mut self, app_id: Option<String>) {
+        let matched = app_id
+            .as_deref()
+            .map(|id| {
+                let lower = id.to_ascii_lowercase();
+                self.config
+                    .force_vk_only_apps
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(&lower))
+            })
+            .unwrap_or(false);
+
+        if matched && !self.current_active {
+            // Bootstrap a synthetic VkOnly session.
+            let id = app_id.clone().unwrap_or_default();
+            tracing::info!(app_id = %id, "synthetic activate (force_vk_only_apps → VkOnly)");
+            self.current_active = true;
+            self.synthetic_active = true;
+            self.focused_app_id = app_id;
+            let effective_method = BackspaceMethod::VkOnly;
+            let ws = WindowState::new(self.config.method.to_engine(), effective_method);
+            self.window = Some(ws);
+        } else if self.synthetic_active && !matched {
+            // Synthetic session — focus moved away, tear it down.
+            tracing::info!(
+                old = ?self.focused_app_id,
+                new = ?app_id,
+                "synthetic deactivate (focus left force_vk_only_apps)"
+            );
+            self.current_active = false;
+            self.synthetic_active = false;
+            self.window = None;
+            self.focused_app_id = None;
+        } else {
+            tracing::trace!(?app_id, matched, synthetic = self.synthetic_active,
+                current_active = self.current_active, "focus change ignored");
+        }
+    }
+
     fn detect_capability(&self) -> BackspaceMethod {
         let probe = CapabilityProbe {
             purpose: self.pending_frame.purpose,
@@ -292,6 +391,7 @@ impl AppState {
             }),
             app_id: self.focused_app_id.clone(),
             force_uinput_apps: self.config.force_uinput_apps.clone(),
+            force_vk_only_apps: self.config.force_vk_only_apps.clone(),
             terminal_override: self.terminal_override,
         };
         detect_method(&probe)
@@ -612,6 +712,37 @@ pub async fn run_event_loop(
 
     let ipc_server = crate::ipc::IpcServer::bind().await;
 
+    // Path C focus poller: when `force_vk_only_apps` is non-empty, spawn a
+    // task that polls Sway IPC for focus changes every ~300ms and
+    // forwards app_id transitions into AppState. swaymsg is fork+exec
+    // (~5ms) — wrapped in spawn_blocking to keep the runtime fluid.
+    // TODO: switch to a real Sway IPC subscription (single Unix socket +
+    // SUBSCRIBE message) — this poll is good enough for v0 demo of Path
+    // C. See focused_app.rs for current swaymsg shell-out.
+    let mut focus_rx = if !app.config.force_vk_only_apps.is_empty() {
+        let (tx, rx) = mpsc::unbounded_channel::<Option<String>>();
+        tokio::spawn(async move {
+            let mut last: Option<String> = None;
+            loop {
+                let info = tokio::task::spawn_blocking(crate::focused_app::focused_app_info)
+                    .await
+                    .ok()
+                    .flatten();
+                let app_id = info.map(|(id, _)| id);
+                if app_id != last {
+                    if tx.send(app_id.clone()).is_err() {
+                        break; // receiver dropped
+                    }
+                    last = app_id;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        });
+        Some(rx)
+    } else {
+        None
+    };
+
     loop {
         // Flush queued outgoing requests
         event_queue.flush().ok();
@@ -655,6 +786,19 @@ pub async fn run_event_loop(
                     tracing::info!("compositor sent Unavailable — exiting");
                     break;
                 }
+            }
+
+            // Sway IPC focus change (Path C — only present when
+            // force_vk_only_apps is non-empty).
+            Some(app_id) = async {
+                match focus_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                drop(read_guard);
+                tracing::debug!(?app_id, "sway IPC: focused app changed");
+                app.on_focus_changed(app_id);
             }
         }
     }

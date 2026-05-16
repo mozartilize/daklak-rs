@@ -55,4 +55,15 @@ impl OutputSink for WaylandSink<'_> {
                 .push_back((key_code, value, Instant::now()));
         }
     }
+
+    fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
+        match crate::wayland::keymap::char_to_evdev(c) {
+            Some(kc) => {
+                self.vk.key(time, kc, 1); // press
+                self.vk.key(time, kc, 0); // release
+                true
+            }
+            None => false,
+        }
+    }
 }

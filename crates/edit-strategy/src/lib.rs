@@ -5,6 +5,7 @@ mod surrounding;
 mod forward_key;
 mod uinput_backspace;
 pub mod uinput_device;
+mod vk_only;
 
 pub use capability::{CapabilityProbe, SurroundingFrame, detect_method};
 pub use shadow::ShadowBuffer;
@@ -19,6 +20,12 @@ pub enum BackspaceMethod {
     SurroundingText, // Tier 1 — delete_surrounding_text
     ForwardKey,      // Tier 2 — zwp_virtual_keyboard_v1 synthetic BS
     UInput,          // Tier 3 — /dev/uinput synthetic BS with modifier guard
+    /// Tier 4 (Path C) — everything via `zwp_virtual_keyboard_v1::key()`,
+    /// using daklak's synthesized xkb keymap that maps spare evdev slots
+    /// (200+) to Vietnamese precomposed chars. No `commit_string`, no
+    /// `zwp_text_input_v3` — usable for clients that never advertise
+    /// text-input-v3 (Qt5/XWayland-via-vk).
+    VkOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +73,10 @@ pub trait OutputSink {
     fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32);
     // Tier 3 — /dev/uinput
     fn uinput_key(&mut self, key_code: u16, value: i32); // 1=press, 0=release
+    /// Tier 4 — emit `c` via `vk_key()` using daklak's synthesized
+    /// Vietnamese keymap. Returns `false` if `c` isn't in the keymap
+    /// inventory (caller should fall back).
+    fn vk_commit_char(&mut self, time: u32, c: char) -> bool;
 }
 
 /// Per-window edit state. The daemon owns one `Strategy` per
@@ -113,6 +124,9 @@ impl Strategy {
                     sink,
                 );
             }
+            BackspaceMethod::VkOnly => {
+                vk_only::apply(&mut self.shadow, backspaces, commit, time, sink);
+            }
         }
     }
 
@@ -159,6 +173,7 @@ mod tests {
         VkKey(u32, u32, KeyState),
         VkModifiers(u32, u32, u32, u32),
         UinputKey(u16, i32),
+        VkCommitChar(u32, char),
     }
 
     impl OutputSink for MockSink {
@@ -179,6 +194,10 @@ mod tests {
         }
         fn uinput_key(&mut self, key_code: u16, value: i32) {
             self.calls.push(Call::UinputKey(key_code, value));
+        }
+        fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
+            self.calls.push(Call::VkCommitChar(time, c));
+            true
         }
     }
 
@@ -358,6 +377,59 @@ mod tests {
             .filter(|c| matches!(c, Call::UinputKey(14, _)))
             .collect();
         assert_eq!(bs_calls.len(), 4);
+    }
+
+    // ── Tier 4 — VkOnly (Path C) ──────────────────────────────────────────────
+
+    #[test]
+    fn tier4_single_backspace_and_commit() {
+        let mut s = Strategy::new(BackspaceMethod::VkOnly);
+        s.shadow.append("a");
+        let mut sink = MockSink::default();
+        s.apply(1, "â", 7, 42, &mut sink);
+        assert_eq!(sink.calls, vec![
+            Call::VkKey(42, 14, KeyState::Pressed),
+            Call::VkKey(42, 14, KeyState::Released),
+            Call::VkCommitChar(42, 'â'),
+        ]);
+        // No CommitString, no Commit — Tier 4 has no text_input_v3 surface.
+        assert!(!sink.calls.iter().any(|c| matches!(c, Call::CommitString(_))));
+        assert!(!sink.calls.iter().any(|c| matches!(c, Call::Commit(_))));
+        assert_eq!(s.shadow.text(), "â");
+    }
+
+    #[test]
+    fn tier4_multichar_commit_each_via_vk() {
+        // Engine sometimes emits multi-char commits (rare). Each char
+        // must go through vk_commit_char separately so the keymap
+        // lookup happens per char.
+        let mut s = Strategy::new(BackspaceMethod::VkOnly);
+        s.shadow.append("tr");
+        let mut sink = MockSink::default();
+        s.apply(0, "ần", 0, 5, &mut sink);
+        assert_eq!(sink.calls, vec![
+            Call::VkCommitChar(5, 'ầ'),
+            Call::VkCommitChar(5, 'n'),
+        ]);
+        assert_eq!(s.shadow.text(), "trần");
+    }
+
+    #[test]
+    fn tier4_three_backspaces() {
+        let mut s = Strategy::new(BackspaceMethod::VkOnly);
+        s.shadow.append("abc");
+        let mut sink = MockSink::default();
+        s.apply(3, "x", 1, 0, &mut sink);
+        assert_eq!(sink.calls, vec![
+            Call::VkKey(0, 14, KeyState::Pressed),
+            Call::VkKey(0, 14, KeyState::Released),
+            Call::VkKey(0, 14, KeyState::Pressed),
+            Call::VkKey(0, 14, KeyState::Released),
+            Call::VkKey(0, 14, KeyState::Pressed),
+            Call::VkKey(0, 14, KeyState::Released),
+            Call::VkCommitChar(0, 'x'),
+        ]);
+        assert_eq!(s.shadow.text(), "x");
     }
 
     // ── Shadow invalidation ───────────────────────────────────────────────────

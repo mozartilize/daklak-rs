@@ -113,12 +113,31 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
                 use std::os::fd::AsFd;
 
                 // Forward keymap to virtual keyboard FIRST (borrows fd) — must
-                // be called once before any vk.key() calls (kime pattern: state.rs:620-626)
+                // be called once before any vk.key() calls (kime pattern: state.rs:620-626).
+                //
+                // Path C: prefer our synthesized keymap (Vietnamese precomposed
+                // chars at evdev 200+). Standard QWERTY is preserved via
+                // `include "evdev+aliases(qwerty)"` so existing tiers' BS=14
+                // and other forwarded keycodes still work. If synthesis
+                // failed at startup, fall back to forwarding the compositor's
+                // keymap so vk_key still does *something* sensible.
                 if !state.keymap_init {
                     if let Some(ref vk) = state.vk {
-                        vk.keymap(format.into(), fd.as_fd(), size);
+                        if let Some(ref km) = state.daklak_keymap {
+                            // 1 == zwp_virtual_keyboard_v1::KeymapFormat::XkbV1
+                            vk.keymap(1, km.fd.as_fd(), km.size);
+                            tracing::debug!(
+                                size = km.size,
+                                "vk.keymap → daklak synthetic keymap"
+                            );
+                        } else {
+                            vk.keymap(format.into(), fd.as_fd(), size);
+                            tracing::debug!(
+                                size,
+                                "vk.keymap → compositor passthrough (daklak keymap unavailable)"
+                            );
+                        }
                         state.keymap_init = true;
-                        tracing::debug!("keymap forwarded to virtual keyboard (size={size})");
                     }
                 }
 

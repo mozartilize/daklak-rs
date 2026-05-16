@@ -39,6 +39,16 @@ pub struct Config {
     /// `DAKLAK_FORCE_UINPUT_APPS` (comma-separated) replaces this list.
     #[serde(default)]
     pub force_uinput_apps: Vec<String>,
+
+    /// Apps that never advertise `zwp_text_input_v3` (Qt5,
+    /// XWayland-via-virtual-keyboard, etc.) — daklak synthesizes an
+    /// "activate" via Sway IPC focus polling and routes them through
+    /// Tier 4 VkOnly (Path C): all output via `vk_key` using daklak's
+    /// synthesized Vietnamese keymap. Match is case-insensitive on
+    /// `app_id`. Env override `DAKLAK_FORCE_VK_ONLY_APPS` replaces this
+    /// list.
+    #[serde(default)]
+    pub force_vk_only_apps: Vec<String>,
 }
 
 impl Config {
@@ -60,6 +70,15 @@ impl Config {
 
         if let Ok(apps) = std::env::var("DAKLAK_FORCE_UINPUT_APPS") {
             cfg.force_uinput_apps = apps
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+
+        if let Ok(apps) = std::env::var("DAKLAK_FORCE_VK_ONLY_APPS") {
+            cfg.force_vk_only_apps = apps
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
