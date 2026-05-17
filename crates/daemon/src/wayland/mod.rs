@@ -126,6 +126,46 @@ pub struct AppState {
     /// entry so we don't re-process our own emissions.
     pub pending_self_emits: VecDeque<(u16, i32, Instant)>,
 
+    /// Counter of outgoing `vk.modifiers` calls daklak has made but not yet
+    /// seen mirrored back through the IM grab's `Modifiers` event. Used by
+    /// `vk_commit_char`'s level-selecting dance (Tier 4): increment per
+    /// emit; `on_modifiers` decrements and skips updating `self.modifiers`
+    /// for the echoed events. Without this guard, daklak's synthetic
+    /// Shift/AltGr toggles would briefly corrupt the tracked modifier
+    /// state — a real user key event arriving in the window between
+    /// "synthetic mods active" and "synthetic mods restored" mirror events
+    /// would be xkb-translated with the wrong mask.
+    pub synthetic_mods_pending: u32,
+
+    /// Timestamp of the last `vk.modifiers` emit that bumped
+    /// `synthetic_mods_pending`. The counter is reset to 0 in `on_modifiers`
+    /// if more than `SYNTHETIC_MODS_TTL` (50ms) has passed since this stamp —
+    /// a safety net for the case where the compositor coalesces two of
+    /// daklak's back-to-back emits into a single `grab.Modifiers` event,
+    /// which would otherwise leave the counter permanently above zero and
+    /// silently swallow real user modifier changes.
+    pub synthetic_mods_emitted_at: Option<Instant>,
+
+    /// Tail-char-drop diagnostic (obs 1377). Last keycode + timestamp daklak
+    /// forwarded as a vk.key press (non-consumed user keystroke or
+    /// no-active-window pass-through). Read in handle_char's consumed
+    /// branch: when the commit's tail char resolves to this same keycode,
+    /// vk_only re-emits it back-to-back with the user's just-emitted press,
+    /// and XWayland coalesces the consecutive same-keycode pair as auto-
+    /// repeat → tail char missing. Logging the gap here confirms the race
+    /// without yet fixing it.
+    pub last_forwarded_key: Option<(u32, Instant)>,
+
+    /// Companion of `last_forwarded_key` — last keycode + timestamp daklak
+    /// forwarded as a vk.key RELEASE. The release-to-reemit gap is the
+    /// causally meaningful one: XWayland's X-server input thread won't
+    /// process the synthetic press of keycode K until it has processed the
+    /// user's release of K. If the synthetic press arrives while X still
+    /// thinks K is down, X silently ignores it (key-already-down dedupe,
+    /// NOT autorepeat). Press gap reflects user hold time + release gap;
+    /// release gap is the actual race window.
+    pub last_forwarded_release: Option<(u32, Instant)>,
+
     /// Forced tier for `purpose == PURPOSE_TERMINAL`, read once from
     /// `DAKLAK_TERMINAL_TIER` at startup. None → use the detect_method
     /// default (ForwardKey).
@@ -136,6 +176,15 @@ pub struct AppState {
     /// known-broken-on-ForwardKey terminals can auto-escalate. `None`
     /// outside an active session or when Sway IPC is unavailable.
     pub focused_app_id: Option<String>,
+
+    /// Long-lived cache of the most-recently-seen focused app_id. Unlike
+    /// `focused_app_id` (cleared on Deactivate / synthetic teardown), this
+    /// is populated unconditionally by the focus poller channel and never
+    /// cleared except when the poller reports `None`. Activate uses it to
+    /// avoid a synchronous `swaymsg get_tree` shell-out on the Wayland
+    /// dispatch hot path. Cold-start (no poller cycle yet) falls back to
+    /// the direct lookup.
+    pub last_focused_app_id: Option<String>,
 
     /// True when `current_active` was synthesized by daklak (Path C —
     /// Sway IPC focus matched `force_vk_only_apps`) rather than driven
@@ -223,8 +272,13 @@ impl AppState {
             window: None,
             uinput,
             pending_self_emits: VecDeque::new(),
+            synthetic_mods_pending: 0,
+            synthetic_mods_emitted_at: None,
+            last_forwarded_key: None,
+            last_forwarded_release: None,
             terminal_override,
             focused_app_id: None,
+            last_focused_app_id: None,
             synthetic_active: false,
             should_exit: false,
         }
@@ -234,6 +288,10 @@ impl AppState {
 
     /// Called when the Done event fires — apply the accumulated pending frame.
     pub fn apply_done_frame(&mut self) {
+        // Daklak-local serial counter for input-method-v2 Done frames.
+        // We're the IM (not the compositor) and never import compositor-origin
+        // serials into this counter — so u32 wraparound is fine indefinitely
+        // (at one tx/sec that's ~136 years).
         self.serial = self.serial.wrapping_add(1);
 
         // Real compositor activate always wins over a synthetic (Sway-IPC-driven)
@@ -263,15 +321,41 @@ impl AppState {
         );
 
         if activate {
-            let focused = crate::focused_app::focused_app_info();
+            // Look up the focused app_id at activate time. We skip the
+            // lookup entirely when neither force list is configured (the
+            // routing decision wouldn't consult app_id anyway). Otherwise
+            // we MUST go to swaymsg synchronously — the `last_focused_app_id`
+            // cache populated by the 300ms poller can lag a focus change by
+            // up to its cadence, and Activate routinely fires within ~50ms
+            // of focus (compositor delivers focus → text_input enter very
+            // fast). Trusting the cache caused real bugs (footclient
+            // misroute → ghostty got ForwardKey, drops Vietnamese commits).
+            //
+            // Cost: ~3-5ms fork+exec+JSON parse per activate. That cost
+            // is bounded — Activate only fires when the focused widget
+            // changes, not per keystroke. Long-term fix: Sway IPC
+            // subscription (not polling) so the cache is always fresh
+            // and we can drop the sync lookup entirely.
+            let need_app_id = !self.config.force_uinput_apps.is_empty()
+                || !self.config.force_vk_only_apps.is_empty();
+            // Note: shell type (XWayland or native) is fetched here but
+            // unused on the activate path — the capability probe routes by
+            // app_id alone. The auto_vk_only_for_xwayland flag is honored
+            // through the focus poller / on_focus_changed branch instead.
+            let focused: Option<(String, String, bool)> = if need_app_id {
+                crate::focused_app::focused_app_info()
+            } else {
+                None
+            };
             let (app_id, title) = focused
-                .clone()
+                .as_ref()
+                .map(|(id, name, _)| (id.clone(), name.clone()))
                 .unwrap_or_else(|| ("?".to_owned(), "?".to_owned()));
             tracing::info!(app_id = %app_id, title = %title, "activate");
             self.current_active = true;
             // Stash for the capability probe + future per-app routing.
             // None on non-Sway compositors (focused_app_info returned None).
-            self.focused_app_id = focused.map(|(id, _)| id);
+            self.focused_app_id = focused.map(|(id, _, _)| id);
 
             // Detect capability from this frame's surrounding_text.
             let method = self.detect_capability();
@@ -341,22 +425,48 @@ impl AppState {
     /// focus moves away to a non-matching app. Real activates take
     /// precedence — if they ever fire, we let them tear down the
     /// synthetic state first.
-    pub fn on_focus_changed(&mut self, app_id: Option<String>) {
-        let matched = app_id
+    pub fn on_focus_changed(&mut self, app_id: Option<String>, is_xwayland: bool) {
+        // Lowercased app_id once for repeated matching below.
+        let lower = app_id.as_deref().map(str::to_ascii_lowercase);
+        let in_force_uinput = lower
             .as_deref()
             .map(|id| {
-                let lower = id.to_ascii_lowercase();
+                self.config
+                    .force_uinput_apps
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(id))
+            })
+            .unwrap_or(false);
+        let in_force_vk_only = lower
+            .as_deref()
+            .map(|id| {
                 self.config
                     .force_vk_only_apps
                     .iter()
-                    .any(|t| t.eq_ignore_ascii_case(&lower))
+                    .any(|t| t.eq_ignore_ascii_case(id))
             })
             .unwrap_or(false);
+
+        // `force_uinput_apps` is the deny override for synthetic VkOnly.
+        // Chromium-class XWayland apps crash on evdev-200+ keycodes
+        // (project_path_c_vkonly.md). When such an app appears, we
+        // explicitly do NOT bootstrap a synthetic session — defer to the
+        // real Activate flow + capability probe, which will route the app
+        // through Tier 3 UInput.
+        let auto_xwayland_match =
+            self.config.auto_vk_only_for_xwayland && is_xwayland && app_id.is_some();
+        let matched = !in_force_uinput && (in_force_vk_only || auto_xwayland_match);
 
         if matched && !self.current_active {
             // Bootstrap a synthetic VkOnly session.
             let id = app_id.clone().unwrap_or_default();
-            tracing::info!(app_id = %id, "synthetic activate (force_vk_only_apps → VkOnly)");
+            let reason = if in_force_vk_only {
+                "force_vk_only_apps"
+            } else {
+                "auto_vk_only_for_xwayland"
+            };
+            tracing::info!(app_id = %id, reason, is_xwayland,
+                "synthetic activate → VkOnly");
             self.current_active = true;
             self.synthetic_active = true;
             self.focused_app_id = app_id;
@@ -368,7 +478,9 @@ impl AppState {
             tracing::info!(
                 old = ?self.focused_app_id,
                 new = ?app_id,
-                "synthetic deactivate (focus left force_vk_only_apps)"
+                is_xwayland,
+                in_force_uinput,
+                "synthetic deactivate (no longer matches VkOnly conditions)"
             );
             self.current_active = false;
             self.synthetic_active = false;
@@ -400,10 +512,21 @@ impl AppState {
     // ── Key handling ────────────────────────────────────────────────────────
 
     /// Check whether the incoming grab key event matches a recent self-emit
-    /// from /dev/uinput. Drains expired entries (>50ms old) before matching.
+    /// from /dev/uinput. Drains expired entries (>20ms old) before matching.
     /// Returns true if the event should be suppressed (i.e. dropped silently).
+    ///
+    /// Matching is **strict FIFO**: only the front entry's (keycode, value) is
+    /// considered. A previous looser matcher (`.position()` across the whole
+    /// queue) lost ordering — if daklak emitted two synthetic BS and the user
+    /// physically pressed BS between them, the mid-queue match would suppress
+    /// the real keystroke. Strict FIFO keeps the suppression queue consistent
+    /// with the emission order.
+    ///
+    /// Window: 20ms. Tier 3 grab-dance is ~9ms (3 × 3ms sleeps); 20ms is 2×
+    /// headroom. The old 50ms window overlapped human inter-key interval
+    /// (50-200ms) and increased the race surface.
     fn suppress_self_emit(&mut self, key: u32, value: i32) -> bool {
-        const SELF_EMIT_WINDOW: Duration = Duration::from_millis(50);
+        const SELF_EMIT_WINDOW: Duration = Duration::from_millis(20);
         while let Some(&(_, _, t)) = self.pending_self_emits.front() {
             if t.elapsed() > SELF_EMIT_WINDOW {
                 self.pending_self_emits.pop_front();
@@ -411,15 +534,12 @@ impl AppState {
                 break;
             }
         }
-        if let Some(idx) = self
-            .pending_self_emits
-            .iter()
-            .position(|&(k, v, _)| k as u32 == key && v == value)
-        {
-            self.pending_self_emits.remove(idx);
-            true
-        } else {
-            false
+        match self.pending_self_emits.front() {
+            Some(&(k, v, _)) if k as u32 == key && v == value => {
+                self.pending_self_emits.pop_front();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -479,6 +599,7 @@ impl AppState {
         if self.window.is_none() {
             tracing::trace!(key, "key: no active window → forward");
             vk.key(time, key, 1);
+            self.last_forwarded_key = Some((key, Instant::now()));
             return;
         }
 
@@ -494,6 +615,7 @@ impl AppState {
             None => {
                 tracing::trace!(key, "key: no xkb char → forward raw");
                 vk.key(time, key, 1);
+                self.last_forwarded_key = Some((key, Instant::now()));
                 return;
             }
         };
@@ -509,6 +631,7 @@ impl AppState {
         if let Some(ref vk) = self.vk {
             vk.key(time, key, 0);
         }
+        self.last_forwarded_release = Some((key, Instant::now()));
     }
 
     fn handle_backspace(&mut self, time: u32) {
@@ -526,8 +649,15 @@ impl AppState {
                 vk,
                 uinput: self.uinput.as_mut(),
                 pending_self_emits: &mut self.pending_self_emits,
+                synthetic_mods_pending: &mut self.synthetic_mods_pending,
+                synthetic_mods_emitted_at: &mut self.synthetic_mods_emitted_at,
                 serial,
                 raw_mods,
+                // Backspace path emits only KEY_BACKSPACE (kc=14); user is
+                // unlikely to be holding BS while triggering a BS-flavored
+                // commit, and even if so the prelude release is harmless.
+                // Leaving None keeps the codepath inert here.
+                held_user_kc: None,
             };
             tracing::debug!(method = ?self.window.as_ref().unwrap().method,
                 bs = r.backspaces, commit = %r.commit, "strategy.apply (BS)");
@@ -545,6 +675,7 @@ impl AppState {
             if let Some(ref vk) = self.vk {
                 vk.key(time, KEY_BACKSPACE, 1);
             }
+            self.last_forwarded_key = Some((KEY_BACKSPACE, Instant::now()));
         }
 
         if let Some(ref mut w) = self.window {
@@ -601,7 +732,104 @@ impl AppState {
                 if let Some(ref c) = self.conn {
                     let _ = c.flush();
                 }
-                std::thread::sleep(Duration::from_millis(3));
+                // block_in_place: hand the worker back to the runtime for
+                // the 3ms wall-clock spacing. Other tasks (focus poller
+                // spawn_blocking return, IPC, signal) keep running on the
+                // other worker. The Wayland dispatch loop itself is still
+                // pinned to this future, so we don't lose ordering — but
+                // we no longer starve unrelated traffic during the dance.
+                // The inner uinput_backspace sleep (3ms between BS and
+                // commit_string) is NOT wrapped because edit-strategy has
+                // no tokio dep; that's tracked separately.
+                tokio::task::block_in_place(|| {
+                    std::thread::sleep(Duration::from_millis(3));
+                });
+            }
+
+            // ── XWayland tail-char-drop fix (obs 1377) ──────────────────────
+            //
+            // Problem. Vk_only path re-emits the commit's tail char as
+            // `vk.key(kc, press)`+`vk.key(kc, release)`. If the user is
+            // still holding the physical key with that same keycode at
+            // the moment of the re-emit (typical for fast typists who
+            // overlap consecutive keys), XWayland's X-server input thread
+            // sees a press for a keycode already marked DOWN and silently
+            // no-ops it. The release also no-ops because the key is now
+            // marked UP — but the press never reached the focused app.
+            // Result: tail char missing (`Trầ` instead of `Trần`).
+            //
+            // Fix candidates considered:
+            //
+            //   A) Synthetic release-before-press. Before emitting the
+            //      normal press/release pair for a keycode that matches a
+            //      held user key, emit an extra `vk.key(kc, release)`.
+            //      X transitions the keycode to UP, accepts our subsequent
+            //      press, and the user's eventual physical release is
+            //      forwarded as a redundant release (no-op in X). Chosen:
+            //      smallest patch, surgical, no state machine.
+            //
+            //   B) Defer the commit until the user's release fires. Park
+            //      r.backspaces + r.commit in AppState; replay on the
+            //      matching `on_key_released`. Cleaner semantically but
+            //      adds state, timeout handling, and focus-loss edges.
+            //      Held-key races become "what if user never releases?"
+            //
+            //   C) Escalate to Tier 3 (uinput) for the tail char only.
+            //      Kernel evdev events bypass the wlroots→X X-marked-down
+            //      problem entirely. Requires app to be on uinput list +
+            //      mixes emit paths within a single commit. Heaviest.
+            //
+            // We log the diagnostic (kept) AND apply Path A (held_user_kc
+            // threaded into the sink). If A proves insufficient under
+            // pathological typing patterns, B or C remain on the table.
+            let held_user_kc: Option<u32> = match (self.last_forwarded_key, self.last_forwarded_release) {
+                // Same keycode, release timestamp strictly newer than press:
+                // user has fully released the key. Not held.
+                (Some((kc_p, t_p)), Some((kc_r, t_r))) if kc_p == kc_r && t_r > t_p => None,
+                // Otherwise: there is a press without a matching newer
+                // release of the same keycode → user is still holding it.
+                // Includes the case where last_release is for a DIFFERENT
+                // keycode (e.g. user pressed `c`, released `c`, pressed
+                // `d`, still holding `d` — last_release has c, last_press
+                // has d; d is held).
+                (Some((kc_p, _)), _) => Some(kc_p),
+                (None, _) => None,
+            };
+
+            if method == BackspaceMethod::VkOnly {
+                if let Some(tail) = r.commit.chars().last() {
+                    if let Some(spec) = crate::wayland::keymap::char_to_emit(tail) {
+                        let press_match = self.last_forwarded_key
+                            .filter(|(kc, _)| *kc == spec.keycode);
+                        let release_match = self.last_forwarded_release
+                            .filter(|(kc, _)| *kc == spec.keycode);
+                        let press_gap_us = press_match
+                            .map(|(_, t)| t.elapsed().as_micros() as u64);
+                        let release_gap_us = release_match
+                            .map(|(_, t)| t.elapsed().as_micros() as u64);
+                        let held = held_user_kc == Some(spec.keycode);
+                        if press_match.is_some() || release_match.is_some() {
+                            tracing::warn!(
+                                tail = %tail,
+                                tail_kc = spec.keycode,
+                                ?press_gap_us,
+                                ?release_gap_us,
+                                held,
+                                backspaces = r.backspaces,
+                                commit = %r.commit,
+                                "DUPLICATE-TAIL: vk_only commit tail keycode matches user's last forwarded press/release → Path A prelude release will be emitted if held"
+                            );
+                        } else {
+                            tracing::debug!(
+                                tail = %tail,
+                                tail_kc = spec.keycode,
+                                last_press_kc = ?self.last_forwarded_key.map(|(k, _)| k),
+                                last_release_kc = ?self.last_forwarded_release.map(|(k, _)| k),
+                                "tail-check: vk_only commit tail keycode differs from last forwarded"
+                            );
+                        }
+                    }
+                }
             }
 
             {
@@ -613,8 +841,11 @@ impl AppState {
                     vk,
                     uinput: self.uinput.as_mut(),
                     pending_self_emits: &mut self.pending_self_emits,
+                    synthetic_mods_pending: &mut self.synthetic_mods_pending,
+                    synthetic_mods_emitted_at: &mut self.synthetic_mods_emitted_at,
                     serial,
                     raw_mods,
+                    held_user_kc,
                 };
                 tracing::debug!(method = ?method, "strategy.apply (char)");
                 self.window
@@ -628,7 +859,9 @@ impl AppState {
                 if let Some(ref c) = self.conn {
                     let _ = c.flush();
                 }
-                std::thread::sleep(Duration::from_millis(3));
+                tokio::task::block_in_place(|| {
+                    std::thread::sleep(Duration::from_millis(3));
+                });
                 if let (Some(im), Some(qh)) = (self.im.as_ref(), self.qh.as_ref()) {
                     self.grab = Some(im.grab_keyboard(qh, ()));
                     if let Some(ref c) = self.conn {
@@ -653,6 +886,7 @@ impl AppState {
             if let Some(ref vk) = self.vk {
                 vk.key(time, key, 1);
             }
+            self.last_forwarded_key = Some((key, Instant::now()));
         }
     }
 
@@ -665,6 +899,41 @@ impl AppState {
         mods_locked: u32,
         group: u32,
     ) {
+        // Skip echoes of daklak's own `vk.modifiers` emits (Tier 4 dance in
+        // `vk_commit_char`). The compositor merges virtual_keyboard state
+        // with physical keyboard state and forwards the result back to the
+        // IM grab — without this guard, daklak's transient Shift/AltGr
+        // toggles would temporarily overwrite `self.modifiers` and any real
+        // user key arriving during the dance window would be xkb-translated
+        // with the wrong mask. TTL safety net: if more than 50ms has passed
+        // since the last synthetic emit, force-reset the counter so a
+        // compositor-coalesced echo can't leave it stuck above zero and
+        // silently swallow real user modifier changes thereafter.
+        const SYNTHETIC_MODS_TTL: Duration = Duration::from_millis(50);
+        if self.synthetic_mods_pending > 0
+            && self
+                .synthetic_mods_emitted_at
+                .is_some_and(|t| t.elapsed() > SYNTHETIC_MODS_TTL)
+        {
+            tracing::trace!(
+                pending = self.synthetic_mods_pending,
+                "on_modifiers: synthetic counter TTL expired, force-reset"
+            );
+            self.synthetic_mods_pending = 0;
+            self.synthetic_mods_emitted_at = None;
+        }
+        if self.synthetic_mods_pending > 0 {
+            self.synthetic_mods_pending = self.synthetic_mods_pending.saturating_sub(1);
+            if self.synthetic_mods_pending == 0 {
+                self.synthetic_mods_emitted_at = None;
+            }
+            tracing::trace!(
+                pending_after = self.synthetic_mods_pending,
+                "on_modifiers: skipping synthetic echo"
+            );
+            return;
+        }
+
         // Update xkb state
         if let Some(ref mut xkb) = self.xkb {
             xkb.update_modifiers(mods_depressed, mods_latched, mods_locked, group);
@@ -716,17 +985,29 @@ pub async fn run_event_loop(
 
     let ipc_server = crate::ipc::IpcServer::bind().await;
 
-    // Path C focus poller: when `force_vk_only_apps` is non-empty, spawn a
-    // task that polls Sway IPC for focus changes every ~300ms and
-    // forwards app_id transitions into AppState. swaymsg is fork+exec
-    // (~5ms) — wrapped in spawn_blocking to keep the runtime fluid.
-    // TODO: switch to a real Sway IPC subscription (single Unix socket +
-    // SUBSCRIBE message) — this poll is good enough for v0 demo of Path
-    // C. See focused_app.rs for current swaymsg shell-out.
-    let mut focus_rx = if !app.config.force_vk_only_apps.is_empty() {
-        let (tx, rx) = mpsc::unbounded_channel::<Option<String>>();
+    // Path C focus poller: when *either* force list is non-empty, spawn a
+    // task that polls Sway IPC for focus changes every ~300ms and forwards
+    // app_id transitions into AppState. Two consumers: `on_focus_changed`
+    // (synthesizes Path C VkOnly sessions when `force_vk_only_apps`
+    // matches) AND `last_focused_app_id` cache (read by `apply_done_frame`
+    // on Activate to avoid a synchronous swaymsg shell-out — see P0d).
+    // Without the cache, the activate path would spend ~3-5ms in
+    // `Command::new("swaymsg").output()` on the Wayland dispatch hot path.
+    // swaymsg is fork+exec — wrapped in spawn_blocking to keep the runtime
+    // fluid. TODO: switch to a real Sway IPC subscription (single Unix
+    // socket + SUBSCRIBE message). See focused_app.rs for current shell-out.
+    let mut focus_rx = if !app.config.force_vk_only_apps.is_empty()
+        || !app.config.force_uinput_apps.is_empty()
+        || app.config.auto_vk_only_for_xwayland
+    {
+        // Channel carries (app_id, is_xwayland). is_xwayland is only
+        // meaningful when app_id is Some — the auto_vk_only_for_xwayland
+        // path uses it to bootstrap a synthetic VkOnly session for any
+        // XWayland window without requiring it on the force_vk_only_apps
+        // allowlist.
+        let (tx, rx) = mpsc::unbounded_channel::<(Option<String>, bool)>();
         tokio::spawn(async move {
-            let mut last: Option<String> = None;
+            let mut last: (Option<String>, bool) = (None, false);
             loop {
                 let info = tokio::task::spawn_blocking(crate::focused_app::focused_app_info)
                     .await
@@ -736,14 +1017,16 @@ pub async fn run_event_loop(
                 // window" — surfaces without a meaningful identifier
                 // (some scratchpads, lock screens) shouldn't trigger the
                 // synthetic activate path.
-                let app_id = info
-                    .map(|(id, _)| id)
-                    .filter(|id| !id.trim().is_empty());
-                if app_id != last {
-                    if tx.send(app_id.clone()).is_err() {
+                let (app_id, is_xwayland) = match info {
+                    Some((id, _, xw)) if !id.trim().is_empty() => (Some(id), xw),
+                    _ => (None, false),
+                };
+                let curr = (app_id, is_xwayland);
+                if curr != last {
+                    if tx.send(curr.clone()).is_err() {
                         break; // receiver dropped
                     }
-                    last = app_id;
+                    last = curr;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
@@ -798,17 +1081,22 @@ pub async fn run_event_loop(
                 }
             }
 
-            // Sway IPC focus change (Path C — only present when
-            // force_vk_only_apps is non-empty).
-            Some(app_id) = async {
+            // Sway IPC focus change. Present when either force list is
+            // non-empty (see poller spawn condition above). Updates the
+            // long-lived `last_focused_app_id` cache used by `apply_done_frame`
+            // unconditionally — even when the focused app doesn't match
+            // `force_vk_only_apps`, the cache value is useful for the next
+            // Activate's `app_id_matches(force_uinput_apps, ...)` check.
+            Some((app_id, is_xwayland)) = async {
                 match focus_rx.as_mut() {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
             } => {
                 drop(read_guard);
-                tracing::debug!(?app_id, "sway IPC: focused app changed");
-                app.on_focus_changed(app_id);
+                tracing::debug!(?app_id, is_xwayland, "sway IPC: focused app changed");
+                app.last_focused_app_id = app_id.clone();
+                app.on_focus_changed(app_id, is_xwayland);
             }
         }
     }

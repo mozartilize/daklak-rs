@@ -156,7 +156,15 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for AppState {
             }
 
             zwp_input_method_keyboard_grab_v2::Event::Key { time, key, state: key_state, .. } => {
-                // key_state is u32 (enum= stripped from XML): 0=released, 1=pressed, 2=repeat
+                // key_state is u32 (enum stripped from XML): 0=released, 1=pressed.
+                // Wayland's wl_keyboard::key::state has no "repeat" value —
+                // auto-repeat is a client-side responsibility (wl_keyboard::
+                // repeat_info delay/rate + a local timer). daklak doesn't
+                // run such a timer, so the engine sees exactly one
+                // press+release per physical keystroke regardless of hold
+                // duration. If we ever add a daklak-side repeat timer (e.g.
+                // for Tier 4 keymap chars), it MUST filter the synthetic
+                // press to avoid feeding the composition engine repeats.
                 tracing::trace!(key, key_state, "grab.Key");
                 if key_state != 0 {
                     state.on_key_pressed(time, key);

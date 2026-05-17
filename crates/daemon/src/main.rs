@@ -25,7 +25,16 @@ fn main() -> Result<()> {
 
     let (conn, event_queue, app) = wayland::connect(config)?;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Multi-thread runtime so the Tier 3 grab-dance blocking sleeps (wrapped in
+    // `tokio::task::block_in_place` at their call sites) can hand the worker
+    // back to the executor for the duration of the sleep — other tokio tasks
+    // (focus poller spawn_blocking returns, IPC accepts, signal handler)
+    // keep progressing instead of being starved. Two workers is plenty —
+    // daklak is I/O bound and the second worker only carries traffic during
+    // a Tier 3 compose. block_in_place requires multi-thread runtime to
+    // function (it errors on current_thread).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()?;
 

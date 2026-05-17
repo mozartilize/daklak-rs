@@ -72,6 +72,16 @@ pub fn apply(
     // them out of order, yielding wrong text. Brief sleep lets the
     // compositor drain the BS events before the wayland commit hits the
     // socket.
+    //
+    // FIXME: this is a blocking sleep on the daemon's tokio runtime thread.
+    // The outer Tier 3 sleeps in daemon/src/wayland/mod.rs are wrapped in
+    // `tokio::task::block_in_place` so they hand the worker back to the
+    // executor. This one isn't, because edit-strategy has no tokio dep —
+    // adding one for a single 3ms hint would pull tokio's full feature
+    // surface into the strategy crate. Two cleaner fixes (deferred):
+    // (a) hoist this sleep out into the daemon caller (split `apply` into
+    // emit_backspaces + emit_commit so the daemon paces between them), or
+    // (b) thread an opaque "pause hint" callback in from the daemon.
     std::thread::sleep(std::time::Duration::from_millis(3));
 
     // Commit text still goes through Wayland — uinput has no Unicode path.

@@ -49,6 +49,20 @@ pub struct Config {
     /// list.
     #[serde(default)]
     pub force_vk_only_apps: Vec<String>,
+
+    /// When true, the Sway IPC focus poller treats any XWayland-backed
+    /// focused window as if it were on `force_vk_only_apps` — bootstrap
+    /// a synthetic VkOnly session for it. Useful as a blanket policy
+    /// when most XWayland apps benefit from Tier 4 routing (OnlyOffice,
+    /// XWayland-bridged Qt5, JetBrains IDEs in X mode, etc.) without
+    /// the user having to enumerate every WM_CLASS. `force_uinput_apps`
+    /// still wins on conflict — chromium-class XWayland apps remain
+    /// routable to Tier 3 via that list to avoid the evdev-200+ render
+    /// crash (see [project_path_c_vkonly.md]). Env override
+    /// `DAKLAK_AUTO_VK_ONLY_XWAYLAND` (any non-empty/non-"0"/non-"false"
+    /// value enables).
+    #[serde(default)]
+    pub auto_vk_only_for_xwayland: bool,
 }
 
 impl Config {
@@ -69,22 +83,30 @@ impl Config {
         }
 
         if let Ok(apps) = std::env::var("DAKLAK_FORCE_UINPUT_APPS") {
-            cfg.force_uinput_apps = apps
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect();
+            cfg.force_uinput_apps = parse_app_list(&apps);
         }
 
         if let Ok(apps) = std::env::var("DAKLAK_FORCE_VK_ONLY_APPS") {
-            cfg.force_vk_only_apps = apps
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect();
+            cfg.force_vk_only_apps = parse_app_list(&apps);
         }
+
+        if let Ok(v) = std::env::var("DAKLAK_AUTO_VK_ONLY_XWAYLAND") {
+            // Truthy heuristic — accept "1", "true", "yes", "on" (any case);
+            // anything else (including "0", "false", "") disables. Falling
+            // back to the TOML value on unrecognized strings would make the
+            // env var silently ignored.
+            cfg.auto_vk_only_for_xwayland = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        // Canonicalize TOML-loaded entries the same way env-overrides are
+        // shaped (trim, drop empties, lowercase). Match against `app_id`
+        // happens on already-lowercased input (`app_id_matches`) — keeping
+        // the list lowercased here means each compare is a direct `==`.
+        cfg.force_uinput_apps = canonicalize_app_list(cfg.force_uinput_apps);
+        cfg.force_vk_only_apps = canonicalize_app_list(cfg.force_vk_only_apps);
 
         Ok(cfg)
     }
@@ -102,5 +124,51 @@ impl Config {
         let path = config_dir.join("viet-ime").join("config.toml");
         let text = std::fs::read_to_string(path).ok()?;
         toml::from_str(&text).ok()
+    }
+}
+
+/// Parse a comma-separated env-var list into canonical app_id entries.
+fn parse_app_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Normalize a user-supplied list (TOML): trim, drop empties, lowercase.
+fn canonicalize_app_list(list: Vec<String>) -> Vec<String> {
+    list.into_iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_app_list_trims_and_lowercases() {
+        let r = parse_app_list("  Chromium , com.MITCHELLH.ghostty  ,, KeePassXC");
+        assert_eq!(r, vec!["chromium", "com.mitchellh.ghostty", "keepassxc"]);
+    }
+
+    #[test]
+    fn parse_app_list_empty_input_yields_empty() {
+        assert!(parse_app_list("").is_empty());
+        assert!(parse_app_list("   ").is_empty());
+        assert!(parse_app_list(",,,").is_empty());
+    }
+
+    #[test]
+    fn canonicalize_app_list_trims_and_lowercases() {
+        let r = canonicalize_app_list(vec![
+            "  Chromium  ".to_owned(),
+            "".to_owned(),
+            "ONLYOFFICE".to_owned(),
+            "\tkeepassxc ".to_owned(),
+        ]);
+        assert_eq!(r, vec!["chromium", "onlyoffice", "keepassxc"]);
     }
 }

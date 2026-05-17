@@ -1,6 +1,5 @@
 [workspace]
-resolver = "2"
-license = "GPL-3.0-or-later"
+resolver = "3"
 
 members = [
     "vendors/vnkey/vnkey-engine",
@@ -10,6 +9,9 @@ members = [
     "crates/wayland-adapter",
     "tools/probe",
 ]
+
+[workspace.package]
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 vnkey-engine = { path = "vendors/vnkey/vnkey-engine" }

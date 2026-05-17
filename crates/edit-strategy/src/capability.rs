@@ -75,9 +75,19 @@ pub fn detect_method(probe: &CapabilityProbe) -> BackspaceMethod {
             return BackspaceMethod::VkOnly;
         }
     }
-    if probe.purpose == PURPOSE_TERMINAL {
-        return BackspaceMethod::ForwardKey;
-    }
+    // if probe.purpose == PURPOSE_TERMINAL {
+    //     return BackspaceMethod::ForwardKey;
+    // }
+    // XXX Some/None here conflates "explicit unsupported" with "no evidence
+    // within probe window" (delayed frame, focus race, async client).
+    // Currently safe because branches 1-4 (terminal_override, force_uinput_apps,
+    // force_vk_only_apps, terminal-purpose) short-circuit every app we have
+    // empirical data on. Only unknown apps with `purpose != PURPOSE_TERMINAL`
+    // land here. If a Tier 1 ↔ Tier 2 flap is ever observed on such an app,
+    // promote `surrounding_text_seen` to:
+    //   enum SurroundingSupport { Confirmed, TimedOut, ExplicitlyUnsupported }
+    // and route TimedOut → keep last decision (or default), ExplicitlyUnsupported
+    // → ForwardKey, Confirmed → SurroundingText.
     match &probe.surrounding_text_seen {
         Some(_) => BackspaceMethod::SurroundingText,
         None => BackspaceMethod::ForwardKey,
@@ -86,8 +96,14 @@ pub fn detect_method(probe: &CapabilityProbe) -> BackspaceMethod {
 
 /// Case-insensitive match of `app_id` against a user-supplied list of
 /// apps. Used by both `force_uinput_apps` and `force_vk_only_apps`.
+///
+/// `app_id` is trimmed defensively — the source is either Sway IPC (which
+/// shouldn't pad) or the `WM_CLASS` fallback for XWayland (which can have
+/// trailing nulls or whitespace on some clients). List entries are
+/// canonicalized at load time (`Config::load`), so we only need to trim
+/// the input side here.
 fn app_id_matches<S: AsRef<str>>(app_id: &str, list: &[S]) -> bool {
-    let lower = app_id.to_ascii_lowercase();
+    let lower = app_id.trim().to_ascii_lowercase();
     list.iter().any(|t| t.as_ref() == lower)
 }
 
