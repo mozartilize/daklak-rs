@@ -5,4 +5,16 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 
 [dependencies]
+viet-ime-edit-strategy = { path = "../edit-strategy" }
+
 wayland-client = { workspace = true }
+wayland-backend = { workspace = true }
+wayland-protocols-misc = { workspace = true }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+xkbcommon = { workspace = true }
+libc = "0.2"
+serde_json = { workspace = true }
+anyhow = { workspace = true }

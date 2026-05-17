@@ -614,19 +614,14 @@ name = "viet-ime-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "libc",
  "serde",
- "serde_json",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
  "viet-ime-edit-strategy",
  "viet-ime-engine",
- "wayland-backend",
- "wayland-client",
- "wayland-scanner",
- "xkbcommon",
+ "viet-ime-wayland-adapter",
 ]
 
 [[package]]
@@ -650,7 +645,16 @@ dependencies = [
 name = "viet-ime-wayland-adapter"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "libc",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "viet-ime-edit-strategy",
+ "wayland-backend",
  "wayland-client",
+ "wayland-protocols-misc",
+ "xkbcommon",
 ]
 
 [[package]]
@@ -700,6 +704,19 @@ dependencies = [
  "bitflags",
  "wayland-backend",
  "wayland-client",
+ "wayland-scanner",
+]
+
+[[package]]
+name = "wayland-protocols-misc"
+version = "0.3.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e9567599ef23e09b8dad6e429e5738d4509dfc46b3b21f32841a304d16b29c8"
+dependencies = [
+ "bitflags",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "wayland-scanner",
 ]
 

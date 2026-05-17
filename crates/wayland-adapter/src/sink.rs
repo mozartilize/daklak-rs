@@ -3,54 +3,52 @@ use std::time::Instant;
 
 use viet_ime_edit_strategy::{KeyState, OutputSink};
 
-use crate::protocols::{
-    input_method_v2::zwp_input_method_v2::ZwpInputMethodV2,
-    virtual_keyboard_v1::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+use wayland_protocols_misc::{
+    zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2,
+    zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
 };
 use viet_ime_edit_strategy::uinput_device::UinputDevice;
 
 /// Bridges `edit_strategy::OutputSink` to live Wayland proxy calls.
 ///
-/// Borrows proxy references from `AppState` — borrow checker allows this
-/// because `im`, `vk`, `uinput`, and `pending_self_emits` are distinct fields.
-pub struct WaylandSink<'a> {
-    pub im: &'a ZwpInputMethodV2,
-    pub vk: &'a ZwpVirtualKeyboardV1,
-    pub uinput: Option<&'a mut UinputDevice>,
+/// Constructed via `AdapterCtx::with_sink` — borrows proxy references from
+/// `AdapterState`. Borrow checker allows this because `im`, `vk`, `uinput`,
+/// and `pending_self_emits` are distinct fields.
+pub struct AdapterSink<'a> {
+    pub(crate) im: &'a ZwpInputMethodV2,
+    pub(crate) vk: &'a ZwpVirtualKeyboardV1,
+    pub(crate) uinput: Option<&'a mut UinputDevice>,
     /// Queue daklak's own uinput emissions go into so the grab handler can
-    /// match and drop their round-trips. AppState owns it.
-    pub pending_self_emits: &'a mut VecDeque<(u16, i32, Instant)>,
+    /// match and drop their round-trips. AdapterState owns it.
+    pub(crate) pending_self_emits: &'a mut VecDeque<(u16, i32, Instant)>,
     /// Counter of `vk.modifiers` calls daklak has emitted but not yet seen
     /// echoed back through the IM grab's `Modifiers` event. Incremented per
-    /// emit in `vk_commit_char`; AppState's `on_modifiers` handler decrements
+    /// emit in `vk_commit_char`; AdapterState's `on_modifiers` handler decrements
     /// and skips its own `self.modifiers` update so daklak's modifier state
     /// tracking isn't transiently corrupted by its own dance.
-    pub synthetic_mods_pending: &'a mut u32,
+    pub(crate) synthetic_mods_pending: &'a mut u32,
     /// Stamp of the most recent `synthetic_mods_pending` increment — read by
     /// `on_modifiers` as a TTL safety net (force-reset the counter if no
     /// echo arrives within 50ms, in case the compositor coalesced events).
-    pub synthetic_mods_emitted_at: &'a mut Option<Instant>,
-    pub serial: u32,
+    pub(crate) synthetic_mods_emitted_at: &'a mut Option<Instant>,
+    pub(crate) serial: u32,
     /// Snapshot of the user's physical modifier state at the time of the
     /// daemon action. `vk_commit_char` may temporarily override these to
     /// address xkb level 2/3/4 of the daklak custom keymap, then restores.
     /// Tuple = (depressed, latched, locked, group) as in
     /// `zwp_input_method_keyboard_grab_v2::Modifiers`.
-    pub raw_mods: (u32, u32, u32, u32),
-    /// Tail-char-drop fix (Path A — see comment block in mod.rs
-    /// `handle_char`). When the user is currently holding a key whose
-    /// keycode equals the one daklak is about to re-emit via
+    pub(crate) raw_mods: (u32, u32, u32, u32),
+    /// Tail-char-drop fix (Path A). When the user is currently holding a
+    /// key whose keycode equals the one daklak is about to re-emit via
     /// `vk_commit_char`, the XWayland X-server input thread silently
     /// drops the synthetic press because that keycode is already
     /// marked DOWN in its state table. Solution: emit a prelude
     /// release for that keycode before the normal press/release pair,
-    /// transitioning X's state to UP first. Computed in `handle_char`
-    /// from `last_forwarded_key` / `last_forwarded_release` and threaded
-    /// through here so the sink can act on per-char keycode information.
-    pub held_user_kc: Option<u32>,
+    /// transitioning X's state to UP first.
+    pub(crate) held_user_kc: Option<u32>,
 }
 
-impl OutputSink for WaylandSink<'_> {
+impl OutputSink for AdapterSink<'_> {
     fn delete_surrounding_text(&mut self, before: u32, after: u32) {
         self.im.delete_surrounding_text(before, after);
     }
@@ -94,7 +92,7 @@ impl OutputSink for WaylandSink<'_> {
     }
 
     fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
-        let Some(spec) = crate::wayland::keymap::char_to_emit(c) else {
+        let Some(spec) = crate::keymap::char_to_emit(c) else {
             tracing::trace!(tier = 4, char = %c, "vk_commit_char: char not in synthetic keymap");
             return false;
         };
@@ -162,19 +160,6 @@ impl OutputSink for WaylandSink<'_> {
 /// override the modifier state for the emit, then restore the user's physical
 /// mask). Returns `None` if the char sits at L1 of its key — no override
 /// needed.
-///
-/// The OR combine is intentional: when the user holds Shift and we need
-/// AltGr for a L3 char, the emit mask is `Shift | AltGr` (L4). That's the
-/// keysym at the corresponding xkb level for the precomposed Vietnamese
-/// char — see daemon/src/wayland/keymap.rs. The downside is that holding
-/// non-level modifiers (e.g. Ctrl) during a tone-trigger keystroke means
-/// the synthetic emit happens with Ctrl active, which could trip an app
-/// shortcut. Today this hazard is empirical only — Vietnamese tone triggers
-/// (a/e/o/d/f/s/r/x/j/w) don't overlap common-held shortcut roots
-/// (C/V/X/Z/S/W/T/N), so no incident has been reported. The
-/// `synthetic_mods_pending` counter in AppState prevents these emits from
-/// corrupting daklak's internal `self.modifiers` tracking when the
-/// compositor mirrors them back through the IM grab.
 fn plan_mod_dance(dep: u32, spec_mods: u32) -> Option<(u32, u32)> {
     if spec_mods == 0 {
         None
@@ -187,8 +172,6 @@ fn plan_mod_dance(dep: u32, spec_mods: u32) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
 
-    // xkb modifier bitmask values used in daklak — mirror the bits checked
-    // in AppState::on_modifiers (mod.rs).
     const SHIFT: u32 = 0x01;
     const CTRL: u32 = 0x04;
     const ALT: u32 = 0x08;
@@ -204,38 +187,26 @@ mod tests {
 
     #[test]
     fn dance_l2_shift_with_no_user_mods() {
-        // Engine commits a Shift-level char (e.g. capital Vietnamese) while
-        // user holds nothing. Emit at Shift, restore to 0.
         assert_eq!(plan_mod_dance(0, SHIFT), Some((SHIFT, 0)));
     }
 
     #[test]
     fn dance_l3_altgr_with_no_user_mods() {
-        // Most common Vietnamese commit path: lowercase precomposed char at L3.
         assert_eq!(plan_mod_dance(0, ALTGR), Some((ALTGR, 0)));
     }
 
     #[test]
     fn dance_l4_shift_altgr_with_no_user_mods() {
-        // Capital Vietnamese precomposed char at L4.
         assert_eq!(plan_mod_dance(0, SHIFT_ALTGR), Some((SHIFT_ALTGR, 0)));
     }
 
     #[test]
     fn dance_or_combines_user_shift_with_spec_altgr() {
-        // User holds Shift, engine wants AltGr for L3 char. OR-combined emit
-        // mask becomes Shift|AltGr (= L4 in the xkb type table). Restore
-        // returns to user's Shift.
         assert_eq!(plan_mod_dance(SHIFT, ALTGR), Some((SHIFT_ALTGR, SHIFT)));
     }
 
     #[test]
     fn dance_preserves_ctrl_in_emit_and_restore() {
-        // User holds Ctrl (e.g. mid-shortcut), engine commits L4 char.
-        // Emit happens with Ctrl|Shift|AltGr — risk: app may see Ctrl
-        // active and trip a shortcut. Restore returns to Ctrl alone.
-        // Documents the current behavior; a future "gate-during-mods"
-        // policy would short-circuit and forward instead.
         assert_eq!(
             plan_mod_dance(CTRL, SHIFT_ALTGR),
             Some((CTRL | SHIFT_ALTGR, CTRL))
@@ -244,9 +215,6 @@ mod tests {
 
     #[test]
     fn dance_ctrl_shift_held_with_spec_altgr() {
-        // User holds Ctrl+Shift (common terminal/editor shortcut prefix),
-        // engine wants AltGr for L3. Combined mask: Ctrl|Shift|AltGr.
-        // Restore returns to Ctrl|Shift.
         assert_eq!(
             plan_mod_dance(CTRL | SHIFT, ALTGR),
             Some((CTRL | SHIFT | ALTGR, CTRL | SHIFT))
@@ -255,16 +223,11 @@ mod tests {
 
     #[test]
     fn dance_alt_held_with_spec_shift() {
-        // User holds Alt, engine wants Shift for L2. OR-combined: Alt|Shift.
         assert_eq!(plan_mod_dance(ALT, SHIFT), Some((ALT | SHIFT, ALT)));
     }
 
     #[test]
     fn dance_user_already_holding_spec_mods_still_dances() {
-        // Edge: user already holds Shift+AltGr (rare) and engine wants L4.
-        // OR is idempotent → emit mask same as dep → effectively no change
-        // on the wire, but we still emit the pair so the protocol sequence
-        // stays consistent with non-trivial cases.
         assert_eq!(
             plan_mod_dance(SHIFT_ALTGR, SHIFT_ALTGR),
             Some((SHIFT_ALTGR, SHIFT_ALTGR))

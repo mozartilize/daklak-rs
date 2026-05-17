@@ -11,20 +11,12 @@ path = "src/main.rs"
 [dependencies]
 viet-ime-engine = { path = "../engine" }
 viet-ime-edit-strategy = { path = "../edit-strategy" }
+viet-ime-wayland-adapter = { path = "../wayland-adapter" }
 
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-wayland-client = { workspace = true }
-wayland-backend = { workspace = true }
-
-xkbcommon = { workspace = true }
-libc = "0.2"
 serde = { workspace = true }
-serde_json = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
-wayland-scanner = { workspace = true }
-
-[build-dependencies]
