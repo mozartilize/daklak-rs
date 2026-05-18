@@ -1,10 +1,16 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::sync::mpsc;
 use viet_ime_edit_strategy::uinput_device::UinputDevice;
 use viet_ime_edit_strategy::ModifierState;
+use wayland_client::backend::ObjectId;
 use wayland_client::Connection;
 
+use crate::focus::wlr::ToplevelEntry;
+use crate::focus::x11::X11Bridge;
+use crate::focus::FocusEvent;
 use crate::frame::DoneFrame;
 use crate::keymap::{self, DaklakKeymap};
 use wayland_protocols_misc::{
@@ -18,6 +24,7 @@ use wayland_protocols_misc::{
         zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
     },
 };
+use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
 use crate::xkb::XkbState;
 
 /// Window in which to drop daklak's own uinput round-trips. ~3× Tier 3
@@ -83,6 +90,24 @@ pub struct AdapterState {
     pub last_forwarded_release: Option<(u32, Instant)>,
 
     pub should_exit: bool,
+
+    // ── wlr-foreign-toplevel-management focus tracking ───────────────────────
+    /// Manager proxy, bound when the compositor exports the global.
+    pub ftl_manager: Option<ZwlrForeignToplevelManagerV1>,
+    /// Per-handle accumulated app_id/title/activated state, keyed by ObjectId.
+    pub(crate) toplevels: HashMap<ObjectId, ToplevelEntry>,
+    /// ObjectId of the currently-activated toplevel, if any.
+    pub active_toplevel: Option<ObjectId>,
+    /// Sender into the active focus backend's channel. Populated by both wlr
+    /// and sway backends so dispatch can push focus diffs uniformly.
+    pub focus_tx: Option<mpsc::UnboundedSender<FocusEvent>>,
+    /// Shared snapshot of the currently-focused app. Written by dispatch
+    /// (wlr) or the sway poller; read synchronously from
+    /// `apply_done_frame` at activate time.
+    pub focus_current: Arc<Mutex<Option<FocusEvent>>>,
+    /// X11 bridge for XWayland detection. `Some` when `$DISPLAY` is set and
+    /// the x11rb connection succeeded.
+    pub(crate) x11_bridge: Option<X11Bridge>,
 }
 
 impl AdapterState {
@@ -135,6 +160,12 @@ impl AdapterState {
             last_forwarded_key: None,
             last_forwarded_release: None,
             should_exit: false,
+            ftl_manager: None,
+            toplevels: HashMap::new(),
+            active_toplevel: None,
+            focus_tx: None,
+            focus_current: Arc::new(Mutex::new(None)),
+            x11_bridge: None,
         }
     }
 

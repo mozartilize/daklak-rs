@@ -75,9 +75,14 @@ pub fn detect_method(probe: &CapabilityProbe) -> BackspaceMethod {
             return BackspaceMethod::VkOnly;
         }
     }
-    // if probe.purpose == PURPOSE_TERMINAL {
-    //     return BackspaceMethod::ForwardKey;
-    // }
+    // Terminals: default to ForwardKey regardless of surrounding_text
+    // presence. SurroundingText would self-emit-loop and drop commits on
+    // foot/ghostty (see memory/project_terminal_tier.md). UInput would
+    // race the terminal's own read loop. ForwardKey is the only safe
+    // default; users can override via DAKLAK_TERMINAL_TIER.
+    if probe.purpose == PURPOSE_TERMINAL {
+        return BackspaceMethod::ForwardKey;
+    }
     // XXX Some/None here conflates "explicit unsupported" with "no evidence
     // within probe window" (delayed frame, focus race, async client).
     // Currently safe because branches 1-4 (terminal_override, force_uinput_apps,

@@ -1,11 +1,11 @@
 use wayland_client::{
-    delegate_noop,
+    delegate_noop, event_created_child,
     globals::GlobalListContents,
     protocol::{
         wl_keyboard,
         wl_registry, wl_seat,
     },
-    Connection, Dispatch, QueueHandle, WEnum,
+    Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
 
 use wayland_protocols_misc::{
@@ -19,6 +19,12 @@ use wayland_protocols_misc::{
         zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
     },
 };
+use wayland_protocols_wlr::foreign_toplevel::v1::client::{
+    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
+    zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
+};
+use crate::focus::wlr::ToplevelEntry;
+use crate::focus::FocusEvent;
 use crate::{AdapterHandler, WaylandAdapter};
 
 // ── No-op dispatches ─────────────────────────────────────────────────────────
@@ -206,6 +212,132 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for WaylandAd
                 // Key repeat not implemented yet
             }
 
+            _ => {}
+        }
+    }
+}
+
+// ── wlr-foreign-toplevel-management dispatch ─────────────────────────────────
+
+impl<H: AdapterHandler> Dispatch<ZwlrForeignToplevelManagerV1, ()> for WaylandAdapter<H> {
+    fn event(
+        state: &mut Self,
+        _manager: &ZwlrForeignToplevelManagerV1,
+        event: zwlr_foreign_toplevel_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } => {
+                tracing::trace!(id = ?toplevel.id(), "ftl: new toplevel");
+                state
+                    .state
+                    .toplevels
+                    .insert(toplevel.id(), ToplevelEntry::default());
+            }
+            zwlr_foreign_toplevel_manager_v1::Event::Finished => {
+                tracing::debug!("ftl: manager finished");
+                state.state.toplevels.clear();
+                state.state.active_toplevel = None;
+                state.state.ftl_manager = None;
+            }
+            _ => {}
+        }
+    }
+
+    event_created_child!(WaylandAdapter<H>, ZwlrForeignToplevelManagerV1, [
+        0 => (ZwlrForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl<H: AdapterHandler> Dispatch<ZwlrForeignToplevelHandleV1, ()> for WaylandAdapter<H> {
+    fn event(
+        state: &mut Self,
+        handle: &ZwlrForeignToplevelHandleV1,
+        event: zwlr_foreign_toplevel_handle_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let id = handle.id();
+        match event {
+            zwlr_foreign_toplevel_handle_v1::Event::AppId { app_id } => {
+                if let Some(e) = state.state.toplevels.get_mut(&id) {
+                    e.pending_app_id = Some(app_id);
+                }
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::Title { title } => {
+                if let Some(e) = state.state.toplevels.get_mut(&id) {
+                    e.pending_title = Some(title);
+                }
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::State { state: bytes } => {
+                // `state` is array of u32 LE bytes; each u32 is a State enum
+                // variant. ACTIVATED variant == 2 per wlr-protocols XML.
+                let activated = bytes
+                    .chunks_exact(4)
+                    .any(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) == 2);
+                if let Some(e) = state.state.toplevels.get_mut(&id) {
+                    e.pending_activated = Some(activated);
+                }
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::Done => {
+                let entry_changed = state
+                    .state
+                    .toplevels
+                    .get_mut(&id)
+                    .map(|e| e.commit())
+                    .unwrap_or(false);
+                let new_active = state
+                    .state
+                    .toplevels
+                    .iter()
+                    .find(|(_, e)| e.activated)
+                    .map(|(k, _)| k.clone());
+                let active_changed = new_active != state.state.active_toplevel;
+                if entry_changed || active_changed {
+                    state.state.active_toplevel = new_active.clone();
+                    let ev = match new_active.as_ref().and_then(|k| state.state.toplevels.get(k)) {
+                        Some(e) => {
+                            let app_id = e
+                                .app_id
+                                .as_ref()
+                                .filter(|s| !s.trim().is_empty())
+                                .cloned();
+                            let title = e.title.as_deref();
+                            let is_xwayland = state
+                                .state
+                                .x11_bridge
+                                .as_ref()
+                                .map(|b| b.matches(app_id.as_deref(), title))
+                                .unwrap_or(false);
+                            FocusEvent { app_id, is_xwayland }
+                        }
+                        None => FocusEvent::default(),
+                    };
+                    if let Ok(mut g) = state.state.focus_current.lock() {
+                        *g = Some(ev.clone());
+                    }
+                    if let Some(tx) = state.state.focus_tx.as_ref() {
+                        let _ = tx.send(ev);
+                    }
+                }
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::Closed => {
+                state.state.toplevels.remove(&id);
+                if state.state.active_toplevel.as_ref() == Some(&id) {
+                    state.state.active_toplevel = None;
+                    let ev = FocusEvent::default();
+                    if let Ok(mut g) = state.state.focus_current.lock() {
+                        *g = Some(ev.clone());
+                    }
+                    if let Some(tx) = state.state.focus_tx.as_ref() {
+                        let _ = tx.send(ev);
+                    }
+                }
+                handle.destroy();
+            }
             _ => {}
         }
     }

@@ -4,15 +4,24 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
+[features]
+default = []
+# Enables the KDE Plasma window-management focus backend. Stub today;
+# protocol XML vendoring + scanner wiring lands in a follow-up PR.
+kde = []
+
 [dependencies]
 viet-ime-edit-strategy = { path = "../edit-strategy" }
 
 wayland-client = { workspace = true }
 wayland-backend = { workspace = true }
 wayland-protocols-misc = { workspace = true }
+wayland-protocols-wlr = { workspace = true }
 
 tokio = { workspace = true }
 tracing = { workspace = true }
+async-trait = "0.1"
+x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code"] }
 
 xkbcommon = { workspace = true }
 libc = "0.2"

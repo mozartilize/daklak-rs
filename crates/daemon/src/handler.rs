@@ -46,9 +46,9 @@ pub struct Daemon {
     pub current_active: bool,
 
     /// True when `current_active` was synthesized by daklak (Path C —
-    /// Sway IPC focus matched `force_vk_only_apps` / `auto_vk_only_for_xwayland`)
-    /// rather than driven by a compositor `zwp_input_method_v2::Activate`
-    /// event. Real activate always wins.
+    /// FocusBackend reported a focused toplevel matching `force_vk_only_apps`
+    /// / `auto_vk_only_for_xwayland`) rather than driven by a compositor
+    /// `zwp_input_method_v2::Activate` event. Real activate always wins.
     pub synthetic_active: bool,
 
     pub window: Option<WindowState>,
@@ -66,6 +66,16 @@ pub struct Daemon {
     /// capability probe so known-broken-on-ForwardKey terminals can
     /// auto-escalate. None outside an active session.
     pub focused_app_id: Option<String>,
+
+    /// Last printable user keystroke fed to `handle_char`. Tracks user
+    /// intent independently of the shadow buffer — the shadow can drop
+    /// just-forwarded chars when a stale surrounding_text echo arrives
+    /// before the compositor commits the new state. Used to gate the
+    /// word-boundary seed: skip seeding when the previous keystroke was
+    /// a separator (whitespace/punct/etc.), because a new word is
+    /// starting and seeding from the prior word would poison the
+    /// engine state.
+    pub last_input_char: Option<char>,
 }
 
 impl Daemon {
@@ -105,6 +115,7 @@ impl Daemon {
             last_action_at: Instant::now() - Duration::from_secs(60),
             terminal_override,
             focused_app_id: None,
+            last_input_char: None,
         }
     }
 
@@ -125,19 +136,12 @@ impl Daemon {
         detect_method(&probe)
     }
 
-    /// Whether any focus-driven routing is configured — drives both the
-    /// activate-time swaymsg lookup and the 300ms focus poller.
-    fn any_focus_routing_configured(&self) -> bool {
-        !self.config.force_uinput_apps.is_empty()
-            || !self.config.force_vk_only_apps.is_empty()
-            || self.config.auto_vk_only_for_xwayland
-    }
 }
 
 impl AdapterHandler for Daemon {
     fn on_done_frame(&mut self, _ctx: &mut AdapterCtx<'_>, frame: &FrameSnapshot) {
         // Real compositor activate always wins over a synthetic
-        // (Sway-IPC-driven) session. Tear synthetic down first.
+        // (FocusBackend-driven) session. Tear synthetic down first.
         if frame.activate && self.synthetic_active {
             tracing::info!(
                 "real Activate received while synthetic session active → drop synthetic"
@@ -146,6 +150,7 @@ impl AdapterHandler for Daemon {
             self.synthetic_active = false;
             self.window = None;
             self.focused_app_id = None;
+            self.last_input_char = None;
         }
 
         let activate = frame.activate && !self.current_active;
@@ -156,6 +161,7 @@ impl AdapterHandler for Daemon {
             tracing::info!(app_id = ?app_id, "activate");
             self.current_active = true;
             self.focused_app_id = app_id;
+            self.last_input_char = None;
 
             let method = self.detect_capability(frame);
             // UInput requires /dev/uinput; the adapter demotes silently via
@@ -182,6 +188,7 @@ impl AdapterHandler for Daemon {
             self.current_active = false;
             self.window = None;
             self.focused_app_id = None;
+            self.last_input_char = None;
         }
 
         // Re-sync shadow on every surrounding_text frame. Re-seed engine
@@ -233,6 +240,7 @@ impl AdapterHandler for Daemon {
             if let Some(w) = self.window.as_mut() {
                 w.full_reset();
             }
+            self.last_input_char = None;
             // Forward without stamping last_forwarded_key — shortcut keys
             // don't participate in the Path A held-key dance.
             ctx.vk_key_press_unstamped(time, key);
@@ -246,6 +254,7 @@ impl AdapterHandler for Daemon {
             if let Some(w) = self.window.as_mut() {
                 w.full_reset();
             }
+            self.last_input_char = None;
             ctx.vk_key_press_unstamped(time, key);
             return KeyDecision::Consumed;
         }
@@ -368,16 +377,6 @@ impl AdapterHandler for Daemon {
         }
     }
 
-    fn want_focus_poller(&self) -> bool {
-        self.any_focus_routing_configured()
-    }
-
-    fn want_focused_app_lookup(&self) -> bool {
-        // Match original semantics: skip the swaymsg shell-out when neither
-        // force list is configured. auto_vk_only_for_xwayland affects only
-        // the focus poller branch, not activate-time routing.
-        !self.config.force_uinput_apps.is_empty() || !self.config.force_vk_only_apps.is_empty()
-    }
 }
 
 impl Daemon {
@@ -406,6 +405,17 @@ impl Daemon {
     }
 
     fn handle_char(&mut self, _key: u32, ch: char) -> KeyDecision {
+        // Capture prior keystroke before overwriting — used to gate the
+        // word-boundary seed below. Read off self before borrowing window.
+        // None means "no prior keystroke in this session" (fresh activate,
+        // nav reset, etc.) — treat as seed-eligible so first-char
+        // retroactive composition still fires.
+        let prev_was_separator = matches!(
+            self.last_input_char,
+            Some(c) if !c.is_ascii_alphabetic()
+        );
+        self.last_input_char = Some(ch);
+
         let Some(w) = self.window.as_mut() else {
             return KeyDecision::ForwardRaw;
         };
@@ -416,7 +426,14 @@ impl Daemon {
         // retroactive composition fires. e.g. user types "tran", pauses
         // (idle reset clears engine), types `af` — engine seeded with
         // "tran" turns `a` into `bs=2 commit="ân"` → "trân".
-        if w.engine.at_word_beginning() {
+        //
+        // Gated by `!prev_was_separator`: if the prior keystroke was a
+        // separator (space/punct/etc.), a new word is starting and the
+        // shadow's previous word is no longer the composition context.
+        // Necessary because surrounding_text echoes from the compositor
+        // race ahead of our local shadow push and can clobber the
+        // separator before the next key arrives.
+        if w.engine.at_word_beginning() && !prev_was_separator {
             let shadow_text = w.strategy.shadow.text().to_owned();
             let word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
             if !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase()) {

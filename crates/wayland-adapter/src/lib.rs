@@ -6,7 +6,7 @@
 //! - Daklak synthetic keymap upload to vk (Path C / Tier 4 enablement)
 //! - Tier 3 grab-release/regrab dance around /dev/uinput emissions
 //! - Self-emit suppression queue + synthetic-mods echo suppression
-//! - Sway IPC focus poller (optional, gated by handler)
+//! - Focus tracking via `wlr-foreign-toplevel-management-v1` + X11 bridge
 //! - `last_forwarded_key` / `last_forwarded_release` bookkeeping for Path A
 //!
 //! Does NOT own:
@@ -17,7 +17,7 @@
 //!
 //! Daemon implements `AdapterHandler` and is called as protocol events fire.
 
-pub mod focused_app;
+pub mod focus;
 pub mod frame;
 pub mod keymap;
 pub mod xkb;
@@ -33,15 +33,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
-use tokio::sync::mpsc;
 use wayland_client::{
     globals::registry_queue_init, protocol::wl_seat::WlSeat, Connection, EventQueue, QueueHandle,
 };
+
+use crate::focus::{wlr::WlrForeignToplevelBackend, x11::X11Bridge, FocusBackend};
 
 use wayland_protocols_misc::{
     zwp_input_method_v2::client::zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
     zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
 };
+use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
 
 pub use crate::sink::AdapterSink;
 pub use crate::state::AdapterState;
@@ -56,9 +58,9 @@ pub struct FrameSnapshot {
     pub deactivate: bool,
     pub surrounding_text: Option<(String, u32)>,
     pub purpose: u32,
-    /// Focused app_id at this Done frame's activate (looked up via Sway IPC).
-    /// Populated only when `AdapterHandler::want_focused_app_lookup` is true
-    /// AND `activate` is true. None otherwise.
+    /// Focused app_id at this Done frame's activate. Read from the cached
+    /// `FocusBackend` snapshot (no IPC fork). `Some` only when `activate`
+    /// is true and a focused toplevel is known.
     pub app_id: Option<String>,
     /// Whether the focused window is an XWayland-backed surface. Meaningful
     /// only when `app_id` is Some.
@@ -122,24 +124,13 @@ pub trait AdapterHandler: 'static {
     /// already updated adapter-side + vk.modifiers already mirrored).
     fn on_modifiers(&mut self, ctx: &mut AdapterCtx<'_>, mods: ModifierState);
 
-    /// Sway IPC focus changed (only fires when `want_focus_poller` is true).
+    /// Focused app changed (fired by the active `FocusBackend`).
     fn on_focus_changed(
         &mut self,
         ctx: &mut AdapterCtx<'_>,
         app_id: Option<String>,
         is_xwayland: bool,
     );
-
-    /// Whether the adapter should spawn the 300ms Sway IPC focus poller.
-    fn want_focus_poller(&self) -> bool {
-        false
-    }
-
-    /// Whether activate-path frames should perform a synchronous swaymsg
-    /// lookup to populate `FrameSnapshot::app_id`.
-    fn want_focused_app_lookup(&self) -> bool {
-        false
-    }
 }
 
 /// Context handed to handler callbacks. Borrows adapter state.
@@ -353,12 +344,12 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             .as_ref()
             .map(|st| (st.text.clone(), st.cursor));
 
-        // Activate-time focused-app lookup (synchronous swaymsg). Cost is
-        // ~3-5ms but only on activate, not per-keystroke. Gated by daemon
-        // policy — adapter does the call when the handler asks for it.
-        let (app_id, is_xwayland) = if activate && self.handler.want_focused_app_lookup() {
-            match crate::focused_app::focused_app_info() {
-                Some((id, _name, xw)) => (Some(id), xw),
+        // Activate-time focused-app lookup. Reads the cached snapshot the
+        // active `FocusBackend` (wlr dispatch / sway poller) maintains in
+        // `state.focus_current`. No I/O on this path.
+        let (app_id, is_xwayland) = if activate {
+            match self.state.focus_current.lock().ok().and_then(|g| g.clone()) {
+                Some(ev) => (ev.app_id, ev.is_xwayland),
                 None => (None, false),
             }
         } else {
@@ -535,14 +526,19 @@ impl AsRawFd for WlRawFd {
 /// Connect to Wayland, bind globals, create input method + virtual keyboard,
 /// then drive the event loop until ctrl-c or compositor `Unavailable`.
 pub async fn run<H: AdapterHandler>(handler: H) -> Result<()> {
-    let (conn, event_queue, app) = connect(handler)?;
-    run_event_loop(conn, event_queue, app).await
+    let (conn, event_queue, app, backend) = connect(handler)?;
+    run_event_loop(conn, event_queue, app, backend).await
 }
 
 /// Connect to the Wayland compositor, bind globals, create input method + vk.
 fn connect<H: AdapterHandler>(
     handler: H,
-) -> Result<(Connection, EventQueue<WaylandAdapter<H>>, WaylandAdapter<H>)> {
+) -> Result<(
+    Connection,
+    EventQueue<WaylandAdapter<H>>,
+    WaylandAdapter<H>,
+    Option<Box<dyn FocusBackend>>,
+)> {
     let conn = Connection::connect_to_env().context("connect to Wayland display")?;
 
     let (globals, mut event_queue) =
@@ -571,6 +567,29 @@ fn connect<H: AdapterHandler>(
         .context("bind zwp_virtual_keyboard_manager_v1")?;
     app.state.vk_manager = Some(vk_manager.clone());
 
+    // Focus backend: wlr-foreign-toplevel-management. Bound BEFORE the initial
+    // roundtrip so toplevel events emitted at bind time populate state.toplevels
+    // before any IM activate frame fires. X11 bridge augments XWayland detection
+    // when $DISPLAY is set.
+    let backend: Option<Box<dyn FocusBackend>> =
+        match globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ()) {
+            Ok(m) => {
+                app.state.ftl_manager = Some(m);
+                app.state.x11_bridge = X11Bridge::spawn();
+                let (b, tx) =
+                    WlrForeignToplevelBackend::new(app.state.focus_current.clone());
+                app.state.focus_tx = Some(tx);
+                tracing::info!("focus backend: wlr-foreign-toplevel-management v3");
+                Some(Box::new(b))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "wlr-foreign-toplevel unavailable ({e:#}); focus tracking disabled"
+                );
+                None
+            }
+        };
+
     event_queue.roundtrip(&mut app).context("initial roundtrip")?;
 
     let im = im_manager.get_input_method(&seat, &qh, ());
@@ -585,13 +604,14 @@ fn connect<H: AdapterHandler>(
 
     event_queue.roundtrip(&mut app).context("second roundtrip")?;
 
-    Ok((conn, event_queue, app))
+    Ok((conn, event_queue, app, backend))
 }
 
 async fn run_event_loop<H: AdapterHandler>(
     _conn: Connection,
     mut event_queue: EventQueue<WaylandAdapter<H>>,
     mut app: WaylandAdapter<H>,
+    mut focus_backend: Option<Box<dyn FocusBackend>>,
 ) -> Result<()> {
     use tokio::signal;
 
@@ -599,35 +619,9 @@ async fn run_event_loop<H: AdapterHandler>(
     let wl_fd = AsyncFd::with_interest(WlRawFd(raw), Interest::READABLE)
         .context("AsyncFd on Wayland socket")?;
 
-    // Sway IPC focus poller (300ms) — only spawned when daemon opts in.
-    let mut focus_rx = if app.handler.want_focus_poller() {
-        let (tx, rx) = mpsc::unbounded_channel::<(Option<String>, bool)>();
-        tokio::spawn(async move {
-            let mut last: (Option<String>, bool) = (None, false);
-            loop {
-                let info = tokio::task::spawn_blocking(crate::focused_app::focused_app_info)
-                    .await
-                    .ok()
-                    .flatten();
-                // Treat empty/whitespace app_ids as "no focused IME-eligible window".
-                let (app_id, is_xwayland) = match info {
-                    Some((id, _, xw)) if !id.trim().is_empty() => (Some(id), xw),
-                    _ => (None, false),
-                };
-                let curr = (app_id, is_xwayland);
-                if curr != last {
-                    if tx.send(curr.clone()).is_err() {
-                        break;
-                    }
-                    last = curr;
-                }
-                tokio::time::sleep(Duration::from_millis(300)).await;
-            }
-        });
-        Some(rx)
-    } else {
-        None
-    };
+    if let Some(b) = focus_backend.as_ref() {
+        tracing::debug!(backend = b.name(), "focus backend active");
+    }
 
     loop {
         // Flush queued outgoing requests
@@ -661,17 +655,17 @@ async fn run_event_loop<H: AdapterHandler>(
                 }
             }
 
-            // Sway IPC focus change
-            Some((app_id, is_xwayland)) = async {
-                match focus_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
+            // Focus backend event (sway poller today; wlr+x11 later).
+            Some(ev) = async {
+                match focus_backend.as_mut() {
+                    Some(b) => b.next_event().await,
                     None => std::future::pending().await,
                 }
             } => {
                 drop(read_guard);
-                tracing::debug!(?app_id, is_xwayland, "sway IPC: focused app changed");
+                tracing::debug!(?ev, "focus backend: focused app changed");
                 let mut ctx = AdapterCtx { state: &mut app.state };
-                app.handler.on_focus_changed(&mut ctx, app_id, is_xwayland);
+                app.handler.on_focus_changed(&mut ctx, ev.app_id, ev.is_xwayland);
             }
         }
     }
