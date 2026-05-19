@@ -6,6 +6,7 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 viet-ime-engine = { path = "../engine" }
+viet-ime-keymap = { workspace = true }
 evdev = { workspace = true }
 bitflags = { workspace = true }
 tracing = { workspace = true }

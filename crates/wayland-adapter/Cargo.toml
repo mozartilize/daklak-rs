@@ -12,6 +12,8 @@ kde = []
 
 [dependencies]
 viet-ime-edit-strategy = { path = "../edit-strategy" }
+viet-ime-focus = { path = "../focus" }
+viet-ime-keymap = { workspace = true }
 
 wayland-client = { workspace = true }
 wayland-backend = { workspace = true }

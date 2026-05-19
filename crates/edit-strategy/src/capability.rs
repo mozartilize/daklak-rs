@@ -26,6 +26,7 @@ pub struct CapabilityProbe {
     /// battle-tested escape hatch). Daklak ships with no default — both
     /// lists are user-curated.
     pub force_vk_only_apps: Vec<String>,
+
     /// Forced tier for `purpose == PURPOSE_TERMINAL`, set by the daemon from
     /// `DAKLAK_TERMINAL_TIER` once at startup. Wins over the app_id list.
     pub terminal_override: Option<BackspaceMethod>,
@@ -85,7 +86,7 @@ pub fn detect_method(probe: &CapabilityProbe) -> BackspaceMethod {
     }
     // XXX Some/None here conflates "explicit unsupported" with "no evidence
     // within probe window" (delayed frame, focus race, async client).
-    // Currently safe because branches 1-4 (terminal_override, force_uinput_apps,
+    // Currently safe because branches 1-3 (terminal_override, force_uinput_apps,
     // force_vk_only_apps, terminal-purpose) short-circuit every app we have
     // empirical data on. Only unknown apps with `purpose != PURPOSE_TERMINAL`
     // land here. If a Tier 1 ↔ Tier 2 flap is ever observed on such an app,
@@ -241,7 +242,7 @@ mod tests {
 
         // Even when surrounding_text frame is present (would otherwise
         // route to Tier 1) — force_vk_only_apps still wins.
-        let mut p = probe(0, Some(("tran", 4)));
+        let mut p = probe(0, Some(("phow", 4)));
         p.app_id = Some("chromium".to_owned());
         p.force_vk_only_apps = vec!["chromium".to_owned()];
         assert_eq!(detect_method(&p), BackspaceMethod::VkOnly);
@@ -271,7 +272,7 @@ mod tests {
     #[test]
     fn gedit_non_empty_surrounding_is_tier1() {
         assert_eq!(
-            detect_method(&probe(0, Some(("tran viet ha", 12)))),
+            detect_method(&probe(0, Some(("phow bo ngon", 12)))),
             BackspaceMethod::SurroundingText
         );
     }

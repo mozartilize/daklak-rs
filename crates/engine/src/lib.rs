@@ -309,28 +309,28 @@ mod tests {
     #[test]
     fn feed_context_enables_retroactive_tone() {
         // Scenario from protocol-behavior.md:
-        // Existing text "tran", cursor positioned after 'a' (offset 3).
-        // Seed engine with "tra", then type Telex tone keys.
+        // Existing text "phow", cursor positioned after 'o' (offset 3).
+        // Seed engine with "pho", then type Telex tone keys.
         //
-        // Engine returns the patch to apply: backspaces=1, commit="â".
+        // Engine returns the patch to apply: backspaces=1, commit="ơ".
         // The daemon turns that into delete_surrounding_text(before=1, after=0)
-        // + commit_string("â"), preserving the trailing 'n' that sits after
+        // + commit_string("ơ"), preserving the trailing 'w' that sits after
         // the cursor.
         let mut eng = EngineState::new(InputMethod::Telex);
-        let fed = eng.feed_context("tra");
+        let fed = eng.feed_context("pho");
         assert!(fed);
 
-        let r = eng.process_key('a');
+        let r = eng.process_key('w');
         assert!(r.consumed);
         assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "â");
+        assert_eq!(r.commit, "ơ");
 
-        // Adding `f` should change `â` to `ầ` — engine deletes 1 char and
-        // commits the toned glyph. Net visible: tr + ầ + (n after cursor).
-        let r = eng.process_key('f');
+        // Adding `r` should change `ơ` to `ở` — engine deletes 1 char and
+        // commits the toned glyph. Net visible: ph + ở + (w after cursor).
+        let r = eng.process_key('r');
         assert!(r.consumed);
         assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "ầ");
+        assert_eq!(r.commit, "ở");
     }
 
     #[test]
@@ -355,19 +355,19 @@ mod tests {
         let mut eng = EngineState::new(InputMethod::Telex);
 
         // First seed with pure ASCII — engine retains state
-        assert!(eng.feed_context("tra"));
-        // Now typing 'a' should produce "â" (engine knows we're in word ctx)
-        let r = eng.process_key('a');
+        assert!(eng.feed_context("pho"));
+        // Now typing 'w' should produce "ơ" (engine knows we're in word ctx)
+        let r = eng.process_key('w');
         assert!(r.consumed);
-        assert_eq!(r.commit, "â");
+        assert_eq!(r.commit, "ơ");
 
         // Second seed with text containing Vietnamese char — engine WIPES
         eng.reset();
-        let _ = eng.feed_context("trâ");
-        // Try typing 'f' — engine should compose tone... but it can't,
-        // because the â was treated as a reset, not as composed vowel.
-        let r = eng.process_key('f');
-        // Engine is in fresh state (post-reset), 'f' alone has no vowel target
+        let _ = eng.feed_context("phơ");
+        // Try typing 'r' — engine should compose tone... but it can't,
+        // because the ơ was treated as a reset, not as composed vowel.
+        let r = eng.process_key('r');
+        // Engine is in fresh state (post-reset), 'r' alone has no vowel target
         assert!(!r.consumed, "feed_context with non-ASCII left engine empty");
     }
 

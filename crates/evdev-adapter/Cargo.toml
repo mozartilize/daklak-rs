@@ -1,0 +1,16 @@
+[package]
+name = "viet-ime-evdev-adapter"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+viet-ime-edit-strategy = { path = "../edit-strategy" }
+viet-ime-keymap = { workspace = true }
+
+anyhow = { workspace = true }
+evdev = { workspace = true, features = ["tokio", "stream-trait"] }
+futures-util = "0.3"
+tokio = { workspace = true }
+tracing = { workspace = true }
+xkbcommon = { workspace = true }

@@ -155,10 +155,10 @@ mod tests {
 
     #[test]
     fn observe_surrounding_handles_multibyte_cursor() {
-        // cursor in bytes — "trâ" = 4 bytes (t=1, r=1, â=2)
+        // cursor in bytes — "làn" = 4 bytes (l=1, à=2, n=1)
         let mut buf = ShadowBuffer::new();
-        buf.observe_surrounding("trân", 4);
-        assert_eq!(buf.text(), "trâ");
+        buf.observe_surrounding("lành", 4);
+        assert_eq!(buf.text(), "làn");
     }
 
     #[test]

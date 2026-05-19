@@ -4,6 +4,3 @@
 [submodule "vendors/kime"]
 	path = vendors/kime
 	url = https://github.com/Riey/kime
-[submodule "vendors/ydotool"]
-	path = vendors/ydotool
-	url = https://github.com/ReimuNotMoe/ydotool

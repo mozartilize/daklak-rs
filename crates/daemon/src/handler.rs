@@ -14,6 +14,7 @@ use crate::window::WindowState;
 
 // Linux evdev code for Backspace.
 const KEY_BACKSPACE: u32 = 14;
+// Linux evdev code for Escape — used as evdev emergency escape chord.
 // Navigation keys that move the cursor — trigger shadow reset.
 const NAV_KEYS: &[u32] = &[
     105, 106, 103, 108, // Left, Right, Up, Down
@@ -76,6 +77,7 @@ pub struct Daemon {
     /// starting and seeding from the prior word would poison the
     /// engine state.
     pub last_input_char: Option<char>,
+
 }
 
 impl Daemon {
@@ -135,13 +137,10 @@ impl Daemon {
         };
         detect_method(&probe)
     }
-
 }
 
 impl AdapterHandler for Daemon {
     fn on_done_frame(&mut self, _ctx: &mut AdapterCtx<'_>, frame: &FrameSnapshot) {
-        // Real compositor activate always wins over a synthetic
-        // (FocusBackend-driven) session. Tear synthetic down first.
         if frame.activate && self.synthetic_active {
             tracing::info!(
                 "real Activate received while synthetic session active → drop synthetic"
@@ -164,22 +163,9 @@ impl AdapterHandler for Daemon {
             self.last_input_char = None;
 
             let method = self.detect_capability(frame);
-            // UInput requires /dev/uinput; the adapter demotes silently via
-            // its UinputDevice::open failure path (no fd → vk_only-like
-            // emit, but adapter-side that's not modeled). Keep the daemon
-            // honest: log here and fall back to ForwardKey when adapter
-            // didn't open uinput. The adapter still tracks `uinput == None`
-            // — we'd need a ctx accessor to query it for perfect parity.
-            // For now we rely on adapter's existing semantics (uinput_key
-            // is a no-op when uinput is None) — that effectively makes the
-            // method behave like ForwardKey for Tier 3 BS.
-            let effective_method = method;
-
-            tracing::info!("capability detected: {:?}", effective_method);
-            let ws = WindowState::new(self.config.method.to_engine(), effective_method);
+            tracing::info!("capability detected: {:?}", method);
+            let ws = WindowState::new(self.config.method.to_engine(), method);
             self.window = Some(ws);
-            // Sync current modifier mask into the new window's strategy
-            // (Tier 3 modifier guard reads this).
             if let Some(w) = self.window.as_mut() {
                 w.strategy.set_modifiers(self.modifiers);
             }
@@ -203,10 +189,6 @@ impl AdapterHandler for Daemon {
                 if should_reseed {
                     let word = current_word_before_cursor(text, *cursor);
                     w.engine.reset();
-                    // Lowercase-only seed gate: Vietnamese typing is
-                    // lowercase. Capitalized words signal English content
-                    // (e.g. thunar's "Folder") where seeding poisons the
-                    // engine and prevents subsequent compose triggers.
                     if !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase()) {
                         tracing::debug!(word, "re-seed engine (activate or cursor jump)");
                         w.engine.feed_context(word);
@@ -223,16 +205,10 @@ impl AdapterHandler for Daemon {
         key: u32,
         ch: Option<char>,
     ) -> KeyDecision {
-        // 2-second idle reset
         if let Some(w) = self.window.as_mut() {
             w.check_idle_reset();
         }
 
-        // Modifier shortcuts (Ctrl/Alt/Super + key): bypass engine, forward
-        // raw. Shift is NOT included — Shift+letter is just uppercase.
-        // Modifier+key may move cursor (Ctrl+arrow, Ctrl+Home, etc.) — leave
-        // last_action_at alone so the resulting surrounding_text frame is
-        // treated as a user cursor move (re-seed enabled).
         let shortcut_mods = ModifierState::CTRL | ModifierState::ALT | ModifierState::SUPER;
         if self.modifiers.intersects(shortcut_mods) {
             tracing::debug!(key, mods = ?self.modifiers,
@@ -241,14 +217,10 @@ impl AdapterHandler for Daemon {
                 w.full_reset();
             }
             self.last_input_char = None;
-            // Forward without stamping last_forwarded_key — shortcut keys
-            // don't participate in the Path A held-key dance.
             ctx.vk_key_press_unstamped(time, key);
             return KeyDecision::Consumed;
         }
 
-        // Navigation keys: reset shadow, forward key. Do NOT touch
-        // last_action_at — the resulting cursor move must trigger re-seed.
         if NAV_KEYS.contains(&key) {
             tracing::debug!(key, "key: nav → reset shadow + forward");
             if let Some(w) = self.window.as_mut() {
@@ -259,13 +231,8 @@ impl AdapterHandler for Daemon {
             return KeyDecision::Consumed;
         }
 
-        // Mark this as a daemon action: subsequent surrounding_text frames
-        // arriving within 150ms are treated as compositor echoes (expected),
-        // not as user mouse clicks. Done AFTER nav/shortcut handling so those
-        // paths leave the timestamp alone.
         self.last_action_at = Instant::now();
 
-        // No active window → pass through.
         if self.window.is_none() {
             tracing::trace!(key, "key: no active window → forward");
             return KeyDecision::ForwardRaw;
@@ -336,11 +303,11 @@ impl AdapterHandler for Daemon {
             })
             .unwrap_or(false);
 
-        // `force_uinput_apps` is the deny override for synthetic VkOnly.
-        // Chromium-class XWayland apps crash on evdev-200+ keycodes.
-        let auto_xwayland_match =
+        let auto_xwayland_vk_only =
             self.config.auto_vk_only_for_xwayland && is_xwayland && app_id.is_some();
-        let matched = !in_force_uinput && (in_force_vk_only || auto_xwayland_match);
+        let vk_only_matched =
+            !in_force_uinput && (in_force_vk_only || auto_xwayland_vk_only);
+        let matched = vk_only_matched;
 
         if matched && !self.current_active {
             let id = app_id.clone().unwrap_or_default();
@@ -349,6 +316,7 @@ impl AdapterHandler for Daemon {
             } else {
                 "auto_vk_only_for_xwayland"
             };
+
             tracing::info!(app_id = %id, reason, is_xwayland,
                 "synthetic activate → VkOnly");
             self.current_active = true;
@@ -371,16 +339,63 @@ impl AdapterHandler for Daemon {
             self.synthetic_active = false;
             self.window = None;
             self.focused_app_id = None;
-        } else {
-            tracing::trace!(?app_id, matched, synthetic = self.synthetic_active,
-                current_active = self.current_active, "focus change ignored");
+            self.last_input_char = None;
+        } else if !self.synthetic_active && matched {
+            tracing::trace!("focus_changed skipped: already active via IM");
         }
     }
 
 }
 
-impl Daemon {
+impl viet_ime_evdev_adapter::EvdevHandler for Daemon {
+    fn handle_char(&mut self, code: u32, ch: char) -> KeyDecision {
+        Daemon::handle_char(self, code, ch)
+    }
+
     fn handle_backspace(&mut self) -> KeyDecision {
+        Daemon::handle_backspace(self)
+    }
+
+    fn clear_session(&mut self) {
+        self.current_active = false;
+        self.synthetic_active = false;
+        self.window = None;
+        self.focused_app_id = None;
+        self.last_input_char = None;
+    }
+
+    fn clear_last_input_char(&mut self) {
+        self.last_input_char = None;
+    }
+
+    fn full_reset_window(&mut self) {
+        if let Some(w) = self.window.as_mut() {
+            w.full_reset();
+        }
+    }
+
+    fn check_idle_reset_window(&mut self) {
+        if let Some(w) = self.window.as_mut() {
+            w.check_idle_reset();
+        }
+    }
+}
+
+impl Daemon {
+    /// Bootstrap a synthetic session for evdev-only mode. Sets up a
+    /// window with VkOnly routing so `handle_char` and `handle_backspace`
+    /// work without a Wayland compositor.
+    pub fn activate_evdev(&mut self) {
+        let ws = WindowState::new(self.config.method.to_engine(), BackspaceMethod::VkOnly);
+        self.current_active = true;
+        self.synthetic_active = true;
+        self.window = Some(ws);
+        if let Some(w) = self.window.as_mut() {
+            w.strategy.set_modifiers(self.modifiers);
+        }
+    }
+
+    pub fn handle_backspace(&mut self) -> KeyDecision {
         let Some(w) = self.window.as_mut() else {
             return KeyDecision::ForwardRaw;
         };
@@ -396,7 +411,6 @@ impl Daemon {
                 commit: r.commit,
             }
         } else {
-            // Engine didn't consume — forward raw backspace + shadow.pop().
             tracing::trace!("BS not consumed → forward");
             w.strategy.shadow.text_mut().pop();
             w.last_keystroke_at = Instant::now();
@@ -404,12 +418,7 @@ impl Daemon {
         }
     }
 
-    fn handle_char(&mut self, _key: u32, ch: char) -> KeyDecision {
-        // Capture prior keystroke before overwriting — used to gate the
-        // word-boundary seed below. Read off self before borrowing window.
-        // None means "no prior keystroke in this session" (fresh activate,
-        // nav reset, etc.) — treat as seed-eligible so first-char
-        // retroactive composition still fires.
+    pub fn handle_char(&mut self, _key: u32, ch: char) -> KeyDecision {
         let prev_was_separator = matches!(
             self.last_input_char,
             Some(c) if !c.is_ascii_alphabetic()
@@ -420,19 +429,6 @@ impl Daemon {
             return KeyDecision::ForwardRaw;
         };
 
-        // Killer feature for end-of-word: when engine has no pending
-        // composition (fresh after idle_reset, focus change, or anywhere
-        // we cleared state), seed from the current word in the shadow so
-        // retroactive composition fires. e.g. user types "tran", pauses
-        // (idle reset clears engine), types `af` — engine seeded with
-        // "tran" turns `a` into `bs=2 commit="ân"` → "trân".
-        //
-        // Gated by `!prev_was_separator`: if the prior keystroke was a
-        // separator (space/punct/etc.), a new word is starting and the
-        // shadow's previous word is no longer the composition context.
-        // Necessary because surrounding_text echoes from the compositor
-        // race ahead of our local shadow push and can clobber the
-        // separator before the next key arrives.
         if w.engine.at_word_beginning() && !prev_was_separator {
             let shadow_text = w.strategy.shadow.text().to_owned();
             let word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
@@ -463,11 +459,6 @@ impl Daemon {
                 commit: r.commit,
             }
         } else {
-            // CRITICAL: engine remembers the key internally even when not
-            // claimed. When a later key DOES trigger consumed (e.g. second
-            // 'a' of "aa" → "â"), engine returns bs=N counting back into
-            // these forwarded chars. Shadow must track them so Tier 1 gets
-            // correct byte counts.
             w.strategy.shadow.text_mut().push(ch);
             KeyDecision::ForwardRaw
         }
@@ -480,17 +471,17 @@ mod tests {
 
     #[test]
     fn extracts_word_at_end_of_line() {
-        assert_eq!(current_word_before_cursor("tran", 4), "tran");
+        assert_eq!(current_word_before_cursor("phow", 4), "phow");
     }
 
     #[test]
     fn extracts_word_in_middle_of_line() {
-        assert_eq!(current_word_before_cursor("hello tran", 10), "tran");
+        assert_eq!(current_word_before_cursor("hello phow", 10), "phow");
     }
 
     #[test]
     fn extracts_partial_word_at_cursor() {
-        assert_eq!(current_word_before_cursor("tran", 3), "tra");
+        assert_eq!(current_word_before_cursor("phow", 3), "pho");
     }
 
     #[test]
@@ -534,7 +525,6 @@ mod tests {
         assert_eq!(current_word_before_cursor("line1\nline2", 11), "line2");
     }
 
-    // Seed-gate filter checks: only all-lowercase ASCII words feed the engine.
     #[test]
     fn seed_gate_skips_capitalized_word() {
         let word = "Folder";
@@ -543,7 +533,7 @@ mod tests {
 
     #[test]
     fn seed_gate_accepts_lowercase_vietnamese_precursor() {
-        let word = "tran";
+        let word = "phow";
         assert!(word.chars().all(|c| c.is_ascii_lowercase()));
     }
 

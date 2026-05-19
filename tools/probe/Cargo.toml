@@ -8,10 +8,19 @@ description = "Wayland protocol probe for viet-ime development"
 name = "probe"
 path = "src/main.rs"
 
+[[bin]]
+name = "vk_xkb_probe"
+path = "src/bin/vk_xkb_probe.rs"
+
+[[bin]]
+name = "vk_xkb_probe_eight"
+path = "src/bin/vk_xkb_probe_eight.rs"
+
 [dependencies]
 wayland-backend = { workspace = true }
 wayland-client = { workspace = true }
 wayland-protocols = { workspace = true }
 wayland-protocols-wlr = { workspace = true }
 wayland-scanner = "0.31"
+libc = "0.2"
 

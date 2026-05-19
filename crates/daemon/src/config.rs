@@ -31,6 +31,11 @@ pub struct Config {
     #[serde(default)]
     pub method: MethodConfig,
 
+    /// When false, skip Wayland IME setup and fall through to the evdev-only
+    /// placeholder loop. Must match a compiled-in `wayland` feature.
+    #[serde(default = "default_enable_wayland")]
+    pub enable_wayland: bool,
+
     /// Apps whose `app_id` (case-insensitive) forces Tier 3 UInput routing
     /// regardless of `purpose` or other capability signals. Use this for
     /// apps confirmed broken on both Tier 2 ForwardKey and Tier 1
@@ -63,6 +68,20 @@ pub struct Config {
     /// value enables).
     #[serde(default)]
     pub auto_vk_only_for_xwayland: bool,
+
+    /// Master switch for evdev-grab mode. When true, daklak opens
+    /// `/dev/input/event*` devices and takes a kernel-level `EVIOCGRAB`
+    /// at startup, acquiring all physical keyboards for exclusive use.
+    /// Keys are then routed through the evdev event loop (bypassing the
+    /// compositor's grab), composed by the engine, and re-emitted via
+    /// uinput as the corresponding Vietnamese output. Env override
+    /// `DAKLAK_ENABLE_EVDEV_GRAB` (truthy heuristic).
+    #[serde(default)]
+    pub enable_evdev_grab: bool,
+}
+
+fn default_enable_wayland() -> bool {
+    true
 }
 
 impl Config {
@@ -90,21 +109,27 @@ impl Config {
             cfg.force_vk_only_apps = parse_app_list(&apps);
         }
 
+        if let Ok(v) = std::env::var("DAKLAK_ENABLE_WAYLAND") {
+            cfg.enable_wayland = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
         if let Ok(v) = std::env::var("DAKLAK_AUTO_VK_ONLY_XWAYLAND") {
-            // Truthy heuristic — accept "1", "true", "yes", "on" (any case);
-            // anything else (including "0", "false", "") disables. Falling
-            // back to the TOML value on unrecognized strings would make the
-            // env var silently ignored.
             cfg.auto_vk_only_for_xwayland = matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );
         }
 
-        // Canonicalize TOML-loaded entries the same way env-overrides are
-        // shaped (trim, drop empties, lowercase). Match against `app_id`
-        // happens on already-lowercased input (`app_id_matches`) — keeping
-        // the list lowercased here means each compare is a direct `==`.
+        if let Ok(v) = std::env::var("DAKLAK_ENABLE_EVDEV_GRAB") {
+            cfg.enable_evdev_grab = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
         cfg.force_uinput_apps = canonicalize_app_list(cfg.force_uinput_apps);
         cfg.force_vk_only_apps = canonicalize_app_list(cfg.force_vk_only_apps);
 
@@ -171,4 +196,5 @@ mod tests {
         ]);
         assert_eq!(r, vec!["chromium", "onlyoffice", "keepassxc"]);
     }
+
 }

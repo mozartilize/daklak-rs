@@ -28,6 +28,26 @@ pub enum BackspaceMethod {
     VkOnly,
 }
 
+/// Daemon's decision after processing a single key press. Returned from
+/// the handler back into either adapter (wayland or evdev) so the adapter
+/// can dispatch correctly.
+pub enum KeyDecision {
+    /// Engine consumed the key; no emit needed.
+    Consumed,
+    /// Engine did not consume; adapter forwards the key as-is (vk.key
+    /// press on wayland, raw uinput passthrough on evdev) and stamps
+    /// `last_forwarded_key` where applicable.
+    ForwardRaw,
+    /// Engine consumed and produced an edit. Adapter wraps `apply_pending`
+    /// in the Tier-3 grab dance (when method == UInput) and computes
+    /// `held_user_kc` (Path A) before passing both to the handler.
+    Apply {
+        method: BackspaceMethod,
+        backspaces: usize,
+        commit: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyState {
     Pressed,
@@ -230,18 +250,18 @@ mod tests {
     }
 
     #[test]
-    fn tier1_retroactive_trân_to_trần() {
+    fn tier1_retroactive_pho_horn_to_pho_hook() {
         // Retroactive editing scenario from docs/protocol-behavior.md:
-        // shadow seeded with "trâ" after feed_context + one keypress.
-        // Engine returns bs=1 (the "â"), commit="ầ".
-        // "tr" = 2 bytes, "â" = 2 bytes, pop 1 char (â) → before_bytes=2.
+        // shadow seeded with "phơ" after feed_context + one keypress.
+        // Engine returns bs=1 (the "ơ"), commit="ở".
+        // "ph" = 2 bytes, "ơ" = 2 bytes, pop 1 char (ơ) → before_bytes=2.
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
-        s.shadow.append("trâ");
+        s.shadow.append("phơ");
         let mut sink = MockSink::default();
-        s.apply(1, "ầ", 1, 0, &mut sink);
+        s.apply(1, "ở", 1, 0, &mut sink);
         assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 0));
-        assert_eq!(sink.calls[1], Call::CommitString("ầ".to_owned()));
-        assert_eq!(s.shadow.text(), "trầ");
+        assert_eq!(sink.calls[1], Call::CommitString("ở".to_owned()));
+        assert_eq!(s.shadow.text(), "phở");
     }
 
     #[test]
@@ -400,14 +420,14 @@ mod tests {
     #[test]
     fn tier4_multichar_commit_each_via_vk() {
         let mut s = Strategy::new(BackspaceMethod::VkOnly);
-        s.shadow.append("tr");
+        s.shadow.append("ph");
         let mut sink = MockSink::default();
-        s.apply(0, "ần", 0, 5, &mut sink);
+        s.apply(0, "ởn", 0, 5, &mut sink);
         assert_eq!(sink.calls, vec![
-            Call::VkCommitChar(5, 'ầ'),
+            Call::VkCommitChar(5, 'ở'),
             Call::VkCommitChar(5, 'n'),
         ]);
-        assert_eq!(s.shadow.text(), "trần");
+        assert_eq!(s.shadow.text(), "phởn");
     }
 
     #[test]

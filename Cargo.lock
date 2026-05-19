@@ -110,8 +110,10 @@ checksum = "25b686663ba7f08d92880ff6ba22170f1df4e83629341cba34cf82cd65ebea99"
 dependencies = [
  "bitvec",
  "cfg-if",
+ "futures-core",
  "libc",
  "nix",
+ "tokio",
 ]
 
 [[package]]
@@ -125,6 +127,42 @@ name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
+
+[[package]]
+name = "futures-core"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+
+[[package]]
+name = "futures-macro"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "futures-task"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
+
+[[package]]
+name = "futures-util"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
+dependencies = [
+ "futures-core",
+ "futures-macro",
+ "futures-task",
+ "pin-project-lite",
+ "slab",
+]
 
 [[package]]
 name = "gethostname"
@@ -292,6 +330,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 name = "probe"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
@@ -453,6 +492,12 @@ dependencies = [
  "errno",
  "libc",
 ]
+
+[[package]]
+name = "slab"
+version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
@@ -648,6 +693,9 @@ dependencies = [
  "tracing-subscriber",
  "viet-ime-edit-strategy",
  "viet-ime-engine",
+ "viet-ime-evdev-adapter",
+ "viet-ime-focus",
+ "viet-ime-keymap",
  "viet-ime-wayland-adapter",
 ]
 
@@ -659,6 +707,7 @@ dependencies = [
  "evdev",
  "tracing",
  "viet-ime-engine",
+ "viet-ime-keymap",
 ]
 
 [[package]]
@@ -666,6 +715,38 @@ name = "viet-ime-engine"
 version = "0.1.0"
 dependencies = [
  "vnkey-engine",
+]
+
+[[package]]
+name = "viet-ime-evdev-adapter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "evdev",
+ "futures-util",
+ "tokio",
+ "tracing",
+ "viet-ime-edit-strategy",
+ "viet-ime-keymap",
+ "xkbcommon",
+]
+
+[[package]]
+name = "viet-ime-focus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "tracing",
+ "x11rb",
+]
+
+[[package]]
+name = "viet-ime-keymap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "xkbcommon",
 ]
 
 [[package]]
@@ -679,6 +760,8 @@ dependencies = [
  "tokio",
  "tracing",
  "viet-ime-edit-strategy",
+ "viet-ime-focus",
+ "viet-ime-keymap",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols-misc",

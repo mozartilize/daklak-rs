@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1;
 
 use super::{FocusBackend, FocusEvent};
 
@@ -20,6 +21,10 @@ pub(crate) struct ToplevelEntry {
     pub pending_app_id: Option<String>,
     pub pending_title: Option<String>,
     pub pending_activated: Option<bool>,
+    /// Proxy handle for `handle.activate(seat)`. Stored so the
+    /// pre-emptive evdev grab can navigate focus to a Tier 5 target
+    /// without relying on sway's keybinding processing.
+    pub handle: Option<ZwlrForeignToplevelHandleV1>,
 }
 
 impl ToplevelEntry {

@@ -129,38 +129,26 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for WaylandAd
             zwp_input_method_keyboard_grab_v2::Event::Keymap { format, fd, size } => {
                 use std::os::fd::AsFd;
 
-                // Forward keymap to virtual keyboard FIRST (borrows fd) — must
-                // be called once before any vk.key() calls.
-                //
-                // Path C: prefer our synthesized keymap (Vietnamese precomposed
-                // chars at evdev 200+). Standard QWERTY is preserved via
-                // `include "evdev+aliases(qwerty)"` so existing tiers' BS=14
-                // and other forwarded keycodes still work. If synthesis
-                // failed at startup, fall back to forwarding the compositor's
-                // keymap so vk_key still does *something* sensible.
+                // vk keymap is normally pre-uploaded at connect() (the
+                // synthesized daklak keymap). Only fall back to the
+                // compositor's keymap here if synthesis failed earlier —
+                // otherwise vk would have no keymap at all.
                 if !state.state.keymap_init {
                     if let Some(vk) = &state.state.vk {
-                        if let Some(km) = &state.state.daklak_keymap {
-                            // 1 == zwp_virtual_keyboard_v1::KeymapFormat::XkbV1
-                            vk.keymap(1, km.fd.as_fd(), km.size);
-                            tracing::debug!(
-                                size = km.size,
-                                "vk.keymap → daklak synthetic keymap"
-                            );
-                        } else {
-                            vk.keymap(format.into(), fd.as_fd(), size);
-                            tracing::debug!(
-                                size,
-                                "vk.keymap → compositor passthrough (daklak keymap unavailable)"
-                            );
-                        }
+                        vk.keymap(format.into(), fd.as_fd(), size);
+                        tracing::debug!(
+                            size,
+                            "vk.keymap → compositor passthrough (daklak keymap unavailable at connect)"
+                        );
                         state.state.keymap_init = true;
                     }
                 }
 
-                // Initialize xkb state — consumes fd after borrow above has ended
+                // Initialize xkb state from the compositor's keymap — used to
+                // decode wl_keyboard events delivered through the IM grab
+                // (Tier 1–4 input path). Independent of the vk keymap above.
                 if state.state.xkb.is_none() {
-                    match crate::xkb::XkbState::from_fd(fd, size) {
+                    match viet_ime_keymap::xkb::XkbState::from_fd(fd, size) {
                         Ok(xkb) => {
                             state.state.xkb = Some(xkb);
                             tracing::debug!("xkb state initialized");
@@ -231,10 +219,13 @@ impl<H: AdapterHandler> Dispatch<ZwlrForeignToplevelManagerV1, ()> for WaylandAd
         match event {
             zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } => {
                 tracing::trace!(id = ?toplevel.id(), "ftl: new toplevel");
-                state
-                    .state
-                    .toplevels
-                    .insert(toplevel.id(), ToplevelEntry::default());
+                state.state.toplevels.insert(
+                    toplevel.id(),
+                    ToplevelEntry {
+                        handle: Some(toplevel),
+                        ..Default::default()
+                    },
+                );
             }
             zwlr_foreign_toplevel_manager_v1::Event::Finished => {
                 tracing::debug!("ftl: manager finished");
@@ -261,6 +252,12 @@ impl<H: AdapterHandler> Dispatch<ZwlrForeignToplevelHandleV1, ()> for WaylandAda
         _qh: &QueueHandle<Self>,
     ) {
         let id = handle.id();
+        // Keep the handle proxy in the entry so code outside of
+        // dispatch (e.g. the pre-emptive evdev grab) can call
+        // `handle.activate(seat)`.
+        if let Some(entry) = state.state.toplevels.get_mut(&id) {
+            entry.handle = Some(handle.clone());
+        }
         match event {
             zwlr_foreign_toplevel_handle_v1::Event::AppId { app_id } => {
                 if let Some(e) = state.state.toplevels.get_mut(&id) {
@@ -283,6 +280,9 @@ impl<H: AdapterHandler> Dispatch<ZwlrForeignToplevelHandleV1, ()> for WaylandAda
                 }
             }
             zwlr_foreign_toplevel_handle_v1::Event::Done => {
+                let old_active = state.state.active_toplevel.clone();
+                let old_app_id = state.state.toplevels.get(&id)
+                    .and_then(|e| e.app_id.clone());
                 let entry_changed = state
                     .state
                     .toplevels
@@ -295,7 +295,16 @@ impl<H: AdapterHandler> Dispatch<ZwlrForeignToplevelHandleV1, ()> for WaylandAda
                     .iter()
                     .find(|(_, e)| e.activated)
                     .map(|(k, _)| k.clone());
-                let active_changed = new_active != state.state.active_toplevel;
+                let active_changed = new_active != old_active;
+                tracing::trace!(
+                    handle = ?id,
+                    app_id = ?old_app_id,
+                    old_active = ?old_active.as_ref().map(|k| format!("{k:?}")),
+                    new_active = ?new_active.as_ref().map(|k| format!("{k:?}")),
+                    entry_changed,
+                    active_changed,
+                    "ftl: handle Done"
+                );
                 if entry_changed || active_changed {
                     state.state.active_toplevel = new_active.clone();
                     let ev = match new_active.as_ref().and_then(|k| state.state.toplevels.get(k)) {
@@ -320,6 +329,7 @@ impl<H: AdapterHandler> Dispatch<ZwlrForeignToplevelHandleV1, ()> for WaylandAda
                         *g = Some(ev.clone());
                     }
                     if let Some(tx) = state.state.focus_tx.as_ref() {
+                        tracing::trace!(?ev, "ftl: sending focus event");
                         let _ = tx.send(ev);
                     }
                 }

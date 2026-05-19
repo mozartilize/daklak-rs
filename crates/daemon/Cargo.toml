@@ -8,10 +8,17 @@ license = "GPL-3.0-or-later"
 name = "viet-ime"
 path = "src/main.rs"
 
+[features]
+default = ["wayland"]
+wayland = []
+
 [dependencies]
 viet-ime-engine = { path = "../engine" }
 viet-ime-edit-strategy = { path = "../edit-strategy" }
+viet-ime-focus = { path = "../focus" }
+viet-ime-keymap = { workspace = true }
 viet-ime-wayland-adapter = { path = "../wayland-adapter" }
+viet-ime-evdev-adapter = { path = "../evdev-adapter" }
 
 tokio = { workspace = true }
 tracing = { workspace = true }

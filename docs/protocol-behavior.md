@@ -72,7 +72,7 @@ Terminals send empty surrounding text. foot does not expose buffer contents.
 
 **gedit** (`content_type hint=1 purpose=0`) — Tier 1 confirmed:
 ```
-surrounding_text text="tran viet ha" cursor=12 anchor=12
+surrounding_text text="phow bo ngon" cursor=12 anchor=12
 ```
 Sends `surrounding_text` on EVERY keystroke with full buffer and exact cursor position.
 `cursor == anchor` when no selection. `change_cause=0` (InputMethod) per keystroke,
@@ -137,14 +137,14 @@ can correctly handle mid-word IME operation when surrounding_text is available.
 **Retroactive word editing** — the killer feature of Tier 1:
 
 ```
-"tran" cursor=2 (after 'a')
-→ engine.feed_context("tra")  ← seed from surrounding_text before cursor
-→ type 'a': delete_surrounding_text(before=1, after=0) + commit("â")  → "trân" cursor=3
-→ type 'f': delete_surrounding_text(before=3, after=0) + commit("ầ")  → "trần" cursor=4
+"phow" cursor=2 (after 'o')
+→ engine.feed_context("pho")  ← seed from surrounding_text before cursor
+→ type 'w': delete_surrounding_text(before=1, after=0) + commit("ơ")  → "phơw" cursor=3
+→ type 'r': delete_surrounding_text(before=3, after=0) + commit("ở")  → "phởw" cursor=4
 ```
 
 `delete_surrounding_text(before, after=0)` only deletes BEFORE the cursor — characters after
-the cursor ('n' here) are untouched. This means the entire word can be retroactively corrected
+the cursor ('w' here) are untouched. This means the entire word can be retroactively corrected
 without any awareness of what follows the cursor.
 
 Daemon implementation: on `activate` with cursor mid-word, call `engine.feed_context(text_before_cursor)`

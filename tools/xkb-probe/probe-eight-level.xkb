@@ -1,0 +1,32 @@
+xkb_keymap {
+    xkb_keycodes "probe8" { include "evdev+aliases(qwerty)" };
+    xkb_types    "probe8" { include "complete" };
+    xkb_compat   "probe8" { include "complete" };
+    xkb_symbols  "probe8" {
+        include "pc+us+inet(evdev)"
+        // EIGHT_LEVEL on AC01 (kc 30). Eight distinct keysyms so xev
+        // shows exactly which level XWayland resolved:
+        //   L1 = à (agrave)        — no mods
+        //   L2 = À (Agrave)        — Shift
+        //   L3 = á (aacute)        — LevelThree (Mod5 via RALT)
+        //   L4 = Á (Aacute)        — Shift + LevelThree
+        //   L5 = â (acircumflex)   — LevelFive (Mod3 via HENK)
+        //   L6 = Â (Acircumflex)   — Shift + LevelFive
+        //   L7 = ä (adiaeresis)    — LevelThree + LevelFive
+        //   L8 = Ä (Adiaeresis)    — Shift + LevelThree + LevelFive
+        key <AC01> {
+            type[Group1] = "EIGHT_LEVEL",
+            [ agrave,      Agrave,
+              aacute,      Aacute,
+              acircumflex, Acircumflex,
+              adiaeresis,  Adiaeresis ]
+        };
+        // RALT → LevelThree (Mod5). Mirrors production keymap.
+        key <RALT> { type[Group1] = "ONE_LEVEL", [ ISO_Level3_Shift ] };
+        modifier_map Mod5 { <RALT> };
+        // HENK (kc 92, KEY_HENKAN) → LevelFive (Mod3). Japanese-only
+        // physical key — won't collide with any US/EU keystroke.
+        key <HENK> { type[Group1] = "ONE_LEVEL", [ ISO_Level5_Shift ] };
+        modifier_map Mod3 { <HENK> };
+    };
+};

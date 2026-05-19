@@ -1,4 +1,4 @@
-//! Wayland adapter — thin protocol I/O layer for the daklak Vietnamese IME.
+//! Wayland adapter — pure Wayland protocol I/O layer for the daklak Vietnamese IME.
 //!
 //! Owns:
 //! - `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` proxies
@@ -20,21 +20,23 @@
 pub mod focus;
 pub mod frame;
 pub mod keymap;
-pub mod xkb;
+pub mod wayland_handle;
+// `XkbState` lives in `viet-ime-keymap::xkb` now.
+pub use viet_ime_keymap::xkb;
 
 mod dispatch;
 mod sink;
 mod state;
 
-use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::io::RawFd;
+use std::os::fd::AsFd;
+use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use wayland_client::{
-    globals::registry_queue_init, protocol::wl_seat::WlSeat, Connection, EventQueue, QueueHandle,
+    globals::registry_queue_init, protocol::wl_seat::WlSeat, Connection, QueueHandle,
 };
 
 use crate::focus::{wlr::WlrForeignToplevelBackend, x11::X11Bridge, FocusBackend};
@@ -67,22 +69,9 @@ pub struct FrameSnapshot {
     pub is_xwayland: bool,
 }
 
-/// Daemon's decision after processing a single key press.
-pub enum KeyDecision {
-    /// Engine consumed the key; no emit needed.
-    Consumed,
-    /// Engine did not consume; adapter forwards via `vk.key(press)` and
-    /// stamps `last_forwarded_key`.
-    ForwardRaw,
-    /// Engine consumed and produced an edit. Adapter wraps `apply_pending`
-    /// in the Tier-3 grab dance (when method == UInput) and computes
-    /// `held_user_kc` (Path A) before passing both to the handler.
-    Apply {
-        method: BackspaceMethod,
-        backspaces: usize,
-        commit: String,
-    },
-}
+// `KeyDecision` lives in `viet-ime-edit-strategy` so both adapters
+// (wayland + evdev) can import it without a cross-adapter dep.
+pub use viet_ime_edit_strategy::KeyDecision;
 
 /// Daemon trait. The adapter calls these methods as protocol events fire.
 pub trait AdapterHandler: 'static {
@@ -131,11 +120,12 @@ pub trait AdapterHandler: 'static {
         app_id: Option<String>,
         is_xwayland: bool,
     );
+
 }
 
 /// Context handed to handler callbacks. Borrows adapter state.
 pub struct AdapterCtx<'a> {
-    pub(crate) state: &'a mut AdapterState,
+    pub state: &'a mut AdapterState,
 }
 
 impl<'a> AdapterCtx<'a> {
@@ -215,19 +205,17 @@ impl<'a> AdapterCtx<'a> {
 
 // ── Wayland adapter struct ───────────────────────────────────────────────────
 
-/// Owns the Wayland proxies, the user-supplied handler, and the QueueHandle
-/// used to register new objects (Tier-3 grab re-acquire).
 pub struct WaylandAdapter<H: AdapterHandler> {
-    pub(crate) handler: H,
-    pub(crate) state: AdapterState,
-    pub(crate) qh: Option<QueueHandle<WaylandAdapter<H>>>,
+    pub handler: H,
+    pub state: AdapterState,
+    pub qh: Option<QueueHandle<WaylandAdapter<H>>>,
 }
 
 impl<H: AdapterHandler> WaylandAdapter<H> {
-    /// Forward release (adapter-side bookkeeping), then notify daemon.
     pub(crate) fn dispatch_key_release(&mut self, time: u32, key: u32) {
+        tracing::trace!(key, "dispatch_key_release: IM grab delivered release");
         if self.state.suppress_self_emit(key, 0) {
-            tracing::trace!(key, value = 0, "self-emit suppressed");
+            tracing::trace!(key, value = 0, "self-emit suppressed (IM grab roundtrip)");
             return;
         }
         if let Some(vk) = &self.state.vk {
@@ -238,14 +226,13 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         self.handler.on_key_released(&mut ctx, time, key);
     }
 
-    /// Top-level dispatch for a grab Key press. Handles self-emit suppression
-    /// + xkb translation, then delegates to handler.on_key_pressed and acts
-    /// on the returned KeyDecision (including Tier-3 grab dance for UInput).
     pub(crate) fn dispatch_key_press(&mut self, time: u32, key: u32) {
+        tracing::trace!(key, "dispatch_key_press: IM grab delivered press");
         if self.state.suppress_self_emit(key, 1) {
             tracing::trace!(key, value = 1, "self-emit suppressed");
             return;
         }
+
         let ch = self.state.xkb.as_ref().and_then(|x| x.key_to_char(key));
 
         let decision = {
@@ -268,9 +255,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             } => {
                 let uinput_path = method == BackspaceMethod::UInput;
 
-                // Tier 3 race-free grab dance: release grab + flush + brief
-                // sleep so compositor processes the release before kernel BS
-                // arrives.
                 if uinput_path {
                     if let Some(g) = self.state.grab.take() {
                         g.release();
@@ -285,7 +269,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
 
                 let held_user_kc = compute_held_user_kc(&self.state);
 
-                // DUPLICATE-TAIL diagnostic for VkOnly (Path A observability).
                 if method == BackspaceMethod::VkOnly {
                     log_duplicate_tail_diagnostic(
                         &self.state,
@@ -327,10 +310,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         }
     }
 
-    /// Apply the accumulated pending frame. Calls handler.on_done_frame
-    /// with a fully populated FrameSnapshot, then resets the frame.
     pub(crate) fn apply_done_frame(&mut self) {
-        // Daklak-local serial — never imported from compositor.
         self.state.serial = self.state.serial.wrapping_add(1);
 
         let activate = self.state.pending_frame.pending_activate;
@@ -344,9 +324,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             .as_ref()
             .map(|st| (st.text.clone(), st.cursor));
 
-        // Activate-time focused-app lookup. Reads the cached snapshot the
-        // active `FocusBackend` (wlr dispatch / sway poller) maintains in
-        // `state.focus_current`. No I/O on this path.
         let (app_id, is_xwayland) = if activate {
             match self.state.focus_current.lock().ok().and_then(|g| g.clone()) {
                 Some(ev) => (ev.app_id, ev.is_xwayland),
@@ -380,15 +357,11 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         }
 
         if deactivate {
-            // Sticky-purpose clear: next activate must not inherit this app's
-            // purpose (e.g. chromium right after foot must not carry purpose=13).
             self.state.pending_frame.end_session();
         }
         self.state.pending_frame.reset();
     }
 
-    /// Modifier event from the grab. Updates xkb + mirrors to vk + applies
-    /// synthetic-echo suppression before notifying the handler.
     pub(crate) fn handle_modifiers(
         &mut self,
         mods_depressed: u32,
@@ -396,8 +369,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         mods_locked: u32,
         group: u32,
     ) {
-        // TTL safety net for synthetic_mods_pending counter — see field doc
-        // in state.rs. 50ms covers the common compositor-coalescing case.
         const SYNTHETIC_MODS_TTL: Duration = Duration::from_millis(50);
         if self.state.synthetic_mods_pending > 0
             && self
@@ -424,12 +395,10 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             return;
         }
 
-        // Update xkb state
         if let Some(xkb) = &mut self.state.xkb {
             xkb.update_modifiers(mods_depressed, mods_latched, mods_locked, group);
         }
 
-        // Track modifier bitmask for daemon's shortcut detection
         let mut m = ModifierState::empty();
         if mods_depressed & 0x01 != 0 {
             m |= ModifierState::SHIFT;
@@ -446,7 +415,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         self.state.modifiers = m;
         self.state.raw_mods = (mods_depressed, mods_latched, mods_locked, group);
 
-        // Mirror to virtual keyboard
         if let Some(vk) = &self.state.vk {
             vk.modifiers(mods_depressed, mods_latched, mods_locked, group);
         }
@@ -456,8 +424,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
     }
 }
 
-/// Path-A `held_user_kc` computation from adapter-side bookkeeping. Held when
-/// there's a press without a matching newer release of the same keycode.
 fn compute_held_user_kc(state: &AdapterState) -> Option<u32> {
     match (state.last_forwarded_key, state.last_forwarded_release) {
         (Some((kc_p, t_p)), Some((kc_r, t_r))) if kc_p == kc_r && t_r > t_p => None,
@@ -466,9 +432,6 @@ fn compute_held_user_kc(state: &AdapterState) -> Option<u32> {
     }
 }
 
-/// VkOnly DUPLICATE-TAIL diagnostic — checks whether the commit's tail char
-/// resolves to a keycode the user just pressed/released. The Path A prelude
-/// release (in `AdapterSink::vk_commit_char`) will fire when `held` matches.
 fn log_duplicate_tail_diagnostic(
     state: &AdapterState,
     commit: &str,
@@ -512,33 +475,7 @@ fn log_duplicate_tail_diagnostic(
     }
 }
 
-// ── Wrapper for fd used with tokio AsyncFd ───────────────────────────────────
-
-struct WlRawFd(RawFd);
-impl AsRawFd for WlRawFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
-}
-
-// ── Public entry point ───────────────────────────────────────────────────────
-
-/// Connect to Wayland, bind globals, create input method + virtual keyboard,
-/// then drive the event loop until ctrl-c or compositor `Unavailable`.
-pub async fn run<H: AdapterHandler>(handler: H) -> Result<()> {
-    let (conn, event_queue, app, backend) = connect(handler)?;
-    run_event_loop(conn, event_queue, app, backend).await
-}
-
-/// Connect to the Wayland compositor, bind globals, create input method + vk.
-fn connect<H: AdapterHandler>(
-    handler: H,
-) -> Result<(
-    Connection,
-    EventQueue<WaylandAdapter<H>>,
-    WaylandAdapter<H>,
-    Option<Box<dyn FocusBackend>>,
-)> {
+pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::WaylandHandle<H>> {
     let conn = Connection::connect_to_env().context("connect to Wayland display")?;
 
     let (globals, mut event_queue) =
@@ -567,10 +504,6 @@ fn connect<H: AdapterHandler>(
         .context("bind zwp_virtual_keyboard_manager_v1")?;
     app.state.vk_manager = Some(vk_manager.clone());
 
-    // Focus backend: wlr-foreign-toplevel-management. Bound BEFORE the initial
-    // roundtrip so toplevel events emitted at bind time populate state.toplevels
-    // before any IM activate frame fires. X11 bridge augments XWayland detection
-    // when $DISPLAY is set.
     let backend: Option<Box<dyn FocusBackend>> =
         match globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ()) {
             Ok(m) => {
@@ -597,6 +530,20 @@ fn connect<H: AdapterHandler>(
     let vk = vk_manager.create_virtual_keyboard(&seat, &qh, ());
     tracing::info!("input method and virtual keyboard created");
 
+    // Pre-upload daklak synthetic keymap to vk
+    if let Some(km) = &app.state.daklak_keymap {
+        vk.keymap(1, km.fd.as_fd(), km.size);
+        app.state.keymap_init = true;
+        tracing::info!(
+            size = km.size,
+            "vk.keymap → daklak synthetic keymap (pre-uploaded at connect)"
+        );
+    } else {
+        tracing::warn!(
+            "daklak keymap unavailable at connect; vk awaits compositor keymap passthrough via IM grab"
+        );
+    }
+
     app.state.im = Some(im);
     app.state.grab = Some(grab);
     app.state.vk = Some(vk);
@@ -604,83 +551,15 @@ fn connect<H: AdapterHandler>(
 
     event_queue.roundtrip(&mut app).context("second roundtrip")?;
 
-    Ok((conn, event_queue, app, backend))
-}
-
-async fn run_event_loop<H: AdapterHandler>(
-    _conn: Connection,
-    mut event_queue: EventQueue<WaylandAdapter<H>>,
-    mut app: WaylandAdapter<H>,
-    mut focus_backend: Option<Box<dyn FocusBackend>>,
-) -> Result<()> {
-    use tokio::signal;
-
     let raw = event_queue.as_fd().as_raw_fd();
-    let wl_fd = AsyncFd::with_interest(WlRawFd(raw), Interest::READABLE)
+    let wl_fd = AsyncFd::with_interest(crate::wayland_handle::WlRawFd(raw), Interest::READABLE)
         .context("AsyncFd on Wayland socket")?;
 
-    if let Some(b) = focus_backend.as_ref() {
-        tracing::debug!(backend = b.name(), "focus backend active");
-    }
-
-    loop {
-        // Flush queued outgoing requests
-        event_queue.flush().ok();
-
-        let read_guard = event_queue.prepare_read();
-
-        tokio::select! {
-            biased;
-
-            // Ctrl-C / SIGTERM
-            _ = signal::ctrl_c() => {
-                tracing::info!("shutdown signal received");
-                drop(read_guard);
-                break;
-            }
-
-            // Wayland socket readable
-            ready = wl_fd.readable() => {
-                let mut guard = ready.context("AsyncFd poll")?;
-                guard.clear_ready();
-                if let Some(rg) = read_guard {
-                    rg.read().ok();
-                }
-                event_queue.dispatch_pending(&mut app)
-                    .context("Wayland dispatch_pending")?;
-
-                if app.state.should_exit {
-                    tracing::info!("compositor sent Unavailable — exiting");
-                    break;
-                }
-            }
-
-            // Focus backend event (sway poller today; wlr+x11 later).
-            Some(ev) = async {
-                match focus_backend.as_mut() {
-                    Some(b) => b.next_event().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                drop(read_guard);
-                tracing::debug!(?ev, "focus backend: focused app changed");
-                let mut ctx = AdapterCtx { state: &mut app.state };
-                app.handler.on_focus_changed(&mut ctx, ev.app_id, ev.is_xwayland);
-            }
-        }
-    }
-
-    // Clean up Wayland objects
-    if let Some(grab) = app.state.grab.take() {
-        grab.release();
-    }
-    if let Some(im) = app.state.im.take() {
-        im.destroy();
-    }
-    if let Some(vk) = app.state.vk.take() {
-        vk.destroy();
-    }
-    event_queue.flush().ok();
-
-    Ok(())
+    Ok(crate::wayland_handle::WaylandHandle {
+        conn,
+        event_queue,
+        app,
+        wl_fd,
+        focus_backend: backend,
+    })
 }

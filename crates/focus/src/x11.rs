@@ -1,12 +1,3 @@
-//! X11 bridge for XWayland detection.
-//!
-//! When `$DISPLAY` is set, XWayland is running and exposes its toplevels via
-//! an X server we can connect to as a plain X client. This module enumerates
-//! those toplevels and keeps the set live via `SubstructureNotify` +
-//! `PropertyNotify` events on the root window. The wlr focus dispatch (or a
-//! composite layer) consults `matches(app_id, title)` per focus change to
-//! decide whether the focused Wayland toplevel is XWayland-backed.
-
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -58,9 +49,6 @@ impl X11Bridge {
         let root = screen.root;
         let inner: Arc<RwLock<HashMap<Window, X11Window>>> = Arc::new(RwLock::new(HashMap::new()));
 
-        // Subscribe to substructure + property events on the root window so we
-        // see CreateNotify/DestroyNotify for new toplevels and PropertyNotify
-        // for property changes on existing ones.
         conn.change_window_attributes(
             root,
             &ChangeWindowAttributesAux::new()
@@ -70,12 +58,10 @@ impl X11Bridge {
         .check()
         .context("subscribe root events")?;
 
-        // Build initial snapshot.
         let tree = conn.query_tree(root)?.reply()?;
         {
             let mut guard = inner.write().unwrap();
             for win in tree.children {
-                // Also listen for property changes on each child.
                 let _ = conn.change_window_attributes(
                     win,
                     &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
@@ -87,9 +73,6 @@ impl X11Bridge {
         }
         let _ = conn.flush();
 
-        // Detached OS thread (not tokio's blocking pool): `wait_for_event`
-        // blocks indefinitely; tokio runtime shutdown waits on its blocking
-        // pool threads, so using `spawn_blocking` here would deadlock Ctrl-C.
         let inner_for_thread = inner.clone();
         std::thread::Builder::new()
             .name("daklak-x11-bridge".into())
@@ -129,7 +112,6 @@ impl X11Bridge {
 
 fn fetch_window(conn: &RustConnection, win: Window) -> Option<X11Window> {
     let mut entry = X11Window::default();
-    // WM_CLASS — STRING, "instance\0class\0"
     if let Ok(cookie) = conn.get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
     {
         if let Ok(r) = cookie.reply() {
@@ -148,7 +130,6 @@ fn fetch_window(conn: &RustConnection, win: Window) -> Option<X11Window> {
             }
         }
     }
-    // _NET_WM_NAME — UTF8_STRING (interned)
     if let Ok(name) = intern_atom(conn, b"_NET_WM_NAME") {
         if let Ok(cookie) = conn.get_property(false, win, name, AtomEnum::ANY, 0, 1024) {
             if let Ok(r) = cookie.reply() {
@@ -160,7 +141,6 @@ fn fetch_window(conn: &RustConnection, win: Window) -> Option<X11Window> {
             }
         }
     }
-    // _NET_WM_PID — CARDINAL
     if let Ok(pid_atom) = intern_atom(conn, b"_NET_WM_PID") {
         if let Ok(cookie) =
             conn.get_property(false, win, pid_atom, AtomEnum::CARDINAL, 0, 1)
@@ -202,8 +182,6 @@ fn run_event_loop(
         };
         match event {
             XEvent::CreateNotify(ev) if ev.parent == root => {
-                // Listen for property changes on the new window, then fetch
-                // initial properties (may be empty if not yet set).
                 let _ = conn.change_window_attributes(
                     ev.window,
                     &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),

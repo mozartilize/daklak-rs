@@ -92,145 +92,15 @@ impl OutputSink for AdapterSink<'_> {
     }
 
     fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
-        let Some(spec) = crate::keymap::char_to_emit(c) else {
-            tracing::trace!(tier = 4, char = %c, "vk_commit_char: char not in synthetic keymap");
-            return false;
-        };
-        let dance = plan_mod_dance(self.raw_mods.0, spec.mods);
-        let (_, lat, lock, group) = self.raw_mods;
-
-        // Path A (XWayland tail-char-drop fix). If the user is currently
-        // holding a key whose keycode equals the one we're about to press,
-        // X's input thread still has that keycode in the DOWN state and
-        // will silently no-op our synthetic press as a duplicate. Emit a
-        // synthetic release first to transition X to UP, then proceed.
-        // When the user eventually releases physically, our daemon forwards
-        // that release through `on_key_released` → XWayland sees a release
-        // for an already-up key, which is harmless (no-op in X).
-        if self.held_user_kc == Some(spec.keycode) {
-            tracing::debug!(
-                tier = 4,
-                keycode = spec.keycode,
-                char = %c,
-                "vk_commit_char: prelude release for still-held user key (Path A)"
-            );
-            self.vk.key(time, spec.keycode, 0);
-        }
-
-        if let Some((emit_mask, _)) = dance {
-            // OR in the level-selecting bits on top of whatever the user
-            // is physically holding. Compositor merges seat keyboards
-            // so XWayland's wl_keyboard.modifiers reflects the union —
-            // x clients see Shift / AltGr / Shift+AltGr as appropriate
-            // and translate the keycode at the right xkb level.
-            self.vk.modifiers(emit_mask, lat, lock, group);
-            *self.synthetic_mods_pending = self.synthetic_mods_pending.saturating_add(1);
-            *self.synthetic_mods_emitted_at = Some(Instant::now());
-        }
-        self.vk.key(time, spec.keycode, 1);
-        self.vk.key(time, spec.keycode, 0);
-        if let Some((_, restore_mask)) = dance {
-            // Restore the user's physical mods so the next forwarded key
-            // (or next char in a multi-char commit) gets the right state.
-            self.vk.modifiers(restore_mask, lat, lock, group);
-            *self.synthetic_mods_pending = self.synthetic_mods_pending.saturating_add(1);
-            *self.synthetic_mods_emitted_at = Some(Instant::now());
-        }
-        tracing::trace!(
-            tier = 4,
-            char = %c,
-            keycode = spec.keycode,
-            dep_mods = format!("{:#x}", self.raw_mods.0),
-            spec_mods = format!("{:#x}", spec.mods),
-            danced = dance.is_some(),
-            "vk_commit_char emitted"
-        );
-        true
+        crate::keymap::emit_char(
+            self.vk,
+            self.synthetic_mods_pending,
+            self.synthetic_mods_emitted_at,
+            self.raw_mods,
+            self.held_user_kc,
+            time,
+            c,
+        )
     }
 }
 
-/// Plan the modifier dance for one `vk_commit_char` invocation.
-///
-/// - `dep` is the user's currently-depressed modifier mask (from the latest
-///   `grab.Modifiers` event).
-/// - `spec_mods` is the level-selecting mask the synthetic keymap demands
-///   for the target char (e.g. Shift for L2, AltGr for L3, Shift+AltGr for L4).
-///
-/// Returns `Some((emit_mask, restore_mask))` if a dance is needed (we have to
-/// override the modifier state for the emit, then restore the user's physical
-/// mask). Returns `None` if the char sits at L1 of its key — no override
-/// needed.
-fn plan_mod_dance(dep: u32, spec_mods: u32) -> Option<(u32, u32)> {
-    if spec_mods == 0 {
-        None
-    } else {
-        Some((dep | spec_mods, dep))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SHIFT: u32 = 0x01;
-    const CTRL: u32 = 0x04;
-    const ALT: u32 = 0x08;
-    const ALTGR: u32 = 0x80; // Mod5 — synthetic keymap uses for L3
-    const SHIFT_ALTGR: u32 = SHIFT | ALTGR;
-
-    #[test]
-    fn no_dance_when_spec_mods_zero() {
-        assert_eq!(plan_mod_dance(0, 0), None);
-        assert_eq!(plan_mod_dance(SHIFT, 0), None);
-        assert_eq!(plan_mod_dance(CTRL | ALT, 0), None);
-    }
-
-    #[test]
-    fn dance_l2_shift_with_no_user_mods() {
-        assert_eq!(plan_mod_dance(0, SHIFT), Some((SHIFT, 0)));
-    }
-
-    #[test]
-    fn dance_l3_altgr_with_no_user_mods() {
-        assert_eq!(plan_mod_dance(0, ALTGR), Some((ALTGR, 0)));
-    }
-
-    #[test]
-    fn dance_l4_shift_altgr_with_no_user_mods() {
-        assert_eq!(plan_mod_dance(0, SHIFT_ALTGR), Some((SHIFT_ALTGR, 0)));
-    }
-
-    #[test]
-    fn dance_or_combines_user_shift_with_spec_altgr() {
-        assert_eq!(plan_mod_dance(SHIFT, ALTGR), Some((SHIFT_ALTGR, SHIFT)));
-    }
-
-    #[test]
-    fn dance_preserves_ctrl_in_emit_and_restore() {
-        assert_eq!(
-            plan_mod_dance(CTRL, SHIFT_ALTGR),
-            Some((CTRL | SHIFT_ALTGR, CTRL))
-        );
-    }
-
-    #[test]
-    fn dance_ctrl_shift_held_with_spec_altgr() {
-        assert_eq!(
-            plan_mod_dance(CTRL | SHIFT, ALTGR),
-            Some((CTRL | SHIFT | ALTGR, CTRL | SHIFT))
-        );
-    }
-
-    #[test]
-    fn dance_alt_held_with_spec_shift() {
-        assert_eq!(plan_mod_dance(ALT, SHIFT), Some((ALT | SHIFT, ALT)));
-    }
-
-    #[test]
-    fn dance_user_already_holding_spec_mods_still_dances() {
-        assert_eq!(
-            plan_mod_dance(SHIFT_ALTGR, SHIFT_ALTGR),
-            Some((SHIFT_ALTGR, SHIFT_ALTGR))
-        );
-    }
-}

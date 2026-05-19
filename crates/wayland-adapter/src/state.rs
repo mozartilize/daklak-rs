@@ -13,6 +13,7 @@ use crate::focus::x11::X11Bridge;
 use crate::focus::FocusEvent;
 use crate::frame::DoneFrame;
 use crate::keymap::{self, DaklakKeymap};
+use viet_ime_keymap::xkb::XkbState;
 use wayland_protocols_misc::{
     zwp_input_method_v2::client::{
         zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
@@ -25,7 +26,6 @@ use wayland_protocols_misc::{
     },
 };
 use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
-use crate::xkb::XkbState;
 
 /// Window in which to drop daklak's own uinput round-trips. ~3× Tier 3
 /// grab-dance budget (~9ms) keeps clear of any human keystroke interval.

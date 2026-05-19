@@ -2,7 +2,7 @@ use std::os::fd::OwnedFd;
 
 use anyhow::{Context, Result};
 use xkbcommon::xkb::{
-    Context as XkbContext, Keycode, Keymap, State, CONTEXT_NO_FLAGS,
+    Context as XkbContext, Keycode, Keymap, Keysym, State, CONTEXT_NO_FLAGS,
     KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1,
 };
 
@@ -53,6 +53,13 @@ impl XkbState {
             .update_mask(mods_depressed, mods_latched, mods_locked, group, 0, 0);
     }
 
+    /// Build from an already-compiled keymap. Used by the evdev-only path
+    /// where there's no compositor to send a keymap fd.
+    pub fn from_keymap(keymap: xkbcommon::xkb::Keymap) -> Self {
+        let state = xkbcommon::xkb::State::new(&keymap);
+        Self { keymap, state }
+    }
+
     /// Translate a hardware evdev keycode to the char it produces with the
     /// current modifier state, or `None` for non-printable keys.
     ///
@@ -65,5 +72,24 @@ impl XkbState {
             return None;
         }
         char::from_u32(utf32)
+    }
+
+    /// Reverse lookup: find an evdev keycode that produces the given character
+    /// under the current modifier state. Used by the evdev-only path to emit
+    /// composed strings via uinput.
+    pub fn char_to_keycode(&self, ch: char) -> Option<u32> {
+        let target_sym = xkbcommon::xkb::utf32_to_keysym(ch as u32);
+        if target_sym == Keysym::NoSymbol {
+            return None;
+        }
+        // Scan the full keymap range (8..256+8) for a matching keysym.
+        for evdev_code in 8..256 {
+            let xkb_keycode = Keycode::new(evdev_code + 8);
+            let sym = self.state.key_get_one_sym(xkb_keycode);
+            if sym == target_sym {
+                return Some(evdev_code);
+            }
+        }
+        None
     }
 }

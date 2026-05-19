@@ -1,0 +1,13 @@
+xkb_keymap {
+    xkb_keycodes "probe" { include "evdev+aliases(qwerty)" };
+    xkb_types    "probe" { include "complete" };
+    xkb_compat   "probe" { include "complete" };
+    xkb_symbols  "probe" {
+        include "pc+us+inet(evdev)"
+        // AC01 = evdev kc 30. Real-kb's pc+us maps this to "a".
+        // Probe overrides to Greek_alpha so the result is unambiguous:
+        //   xev keysym = Greek_alpha (α, 0x07e1) → per-device keymap honored.
+        //   xev keysym = a           (0x0061)   → seat-scoped keymap wins.
+        override key <AC01> { [ Greek_alpha, Greek_ALPHA ] };
+    };
+};

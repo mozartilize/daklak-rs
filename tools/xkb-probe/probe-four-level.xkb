@@ -1,0 +1,22 @@
+xkb_keymap {
+    xkb_keycodes "probe4" { include "evdev+aliases(qwerty)" };
+    xkb_types    "probe4" { include "complete" };
+    xkb_compat   "probe4" { include "complete" };
+    xkb_symbols  "probe4" {
+        include "pc+us+inet(evdev)"
+        // FOUR_LEVEL on AC01 (kc 30). Distinct keysyms per level so
+        // xev shows exactly which level XWayland resolved:
+        //   L1 = à (agrave,  U+00E0)
+        //   L2 = À (Agrave,  U+00C0)
+        //   L3 = á (aacute,  U+00E1)
+        //   L4 = Á (Aacute,  U+00C1)
+        key <AC01> {
+            type[Group1] = "FOUR_LEVEL",
+            [ agrave, Agrave, aacute, Aacute ]
+        };
+        // Force RALT → Mod5 so AltGr selects L3/L4 (mirrors daklak's
+        // production keymap, see crates/keymap/src/lib.rs:279).
+        key <RALT> { type[Group1] = "ONE_LEVEL", [ ISO_Level3_Shift ] };
+        modifier_map Mod5 { <RALT> };
+    };
+};
