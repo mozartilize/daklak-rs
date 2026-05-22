@@ -3,20 +3,32 @@ use std::time::Instant;
 
 use viet_ime_edit_strategy::{KeyState, OutputSink};
 
+use wayland_protocols::wp::input_method::zv1::client::zwp_input_method_context_v1::ZwpInputMethodContextV1;
 use wayland_protocols_misc::{
     zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2,
     zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
 };
 use viet_ime_edit_strategy::uinput_device::UinputDevice;
 
+/// Which set of Wayland proxies to use for text-commit + key-emission.
+/// V2 = wlroots path (separate im + vk), V1 = KWin/Mutter path (single context).
+pub(crate) enum SinkTarget<'a> {
+    V2 {
+        im: &'a ZwpInputMethodV2,
+        vk: &'a ZwpVirtualKeyboardV1,
+    },
+    V1 {
+        ctx: &'a ZwpInputMethodContextV1,
+    },
+}
+
 /// Bridges `edit_strategy::OutputSink` to live Wayland proxy calls.
 ///
 /// Constructed via `AdapterCtx::with_sink` — borrows proxy references from
-/// `AdapterState`. Borrow checker allows this because `im`, `vk`, `uinput`,
-/// and `pending_self_emits` are distinct fields.
+/// `AdapterState`. The `target` field selects between v2 (wlroots) and v1
+/// (KWin) backend.
 pub struct AdapterSink<'a> {
-    pub(crate) im: &'a ZwpInputMethodV2,
-    pub(crate) vk: &'a ZwpVirtualKeyboardV1,
+    pub(crate) target: SinkTarget<'a>,
     pub(crate) uinput: Option<&'a mut UinputDevice>,
     /// Queue daklak's own uinput emissions go into so the grab handler can
     /// match and drop their round-trips. AdapterState owns it.
@@ -50,15 +62,32 @@ pub struct AdapterSink<'a> {
 
 impl OutputSink for AdapterSink<'_> {
     fn delete_surrounding_text(&mut self, before: u32, after: u32) {
-        self.im.delete_surrounding_text(before, after);
+        match &self.target {
+            SinkTarget::V2 { im, .. } => im.delete_surrounding_text(before, after),
+            // v1 delete_surrounding_text takes (index: i32, length: u32).
+            // index is relative to cursor (negative = before cursor),
+            // length is total bytes to delete.
+            SinkTarget::V1 { ctx } => {
+                let index = -(before as i32);
+                let length = before + after;
+                ctx.delete_surrounding_text(index, length);
+            }
+        }
     }
 
     fn commit_string(&mut self, text: &str) {
-        self.im.commit_string(text.to_owned());
+        match &self.target {
+            SinkTarget::V2 { im, .. } => im.commit_string(text.to_owned()),
+            SinkTarget::V1 { ctx } => ctx.commit_string(self.serial, text.to_owned()),
+        }
     }
 
     fn commit(&mut self, serial: u32) {
-        self.im.commit(serial);
+        match &self.target {
+            SinkTarget::V2 { im, .. } => im.commit(serial),
+            // v1 has no batching — commit is a no-op.
+            SinkTarget::V1 { .. } => {}
+        }
     }
 
     fn vk_key(&mut self, time: u32, key_code: u32, state: KeyState) {
@@ -66,19 +95,23 @@ impl OutputSink for AdapterSink<'_> {
             KeyState::Pressed => 1,
             KeyState::Released => 0,
         };
-        self.vk.key(time, key_code, value);
+        match &self.target {
+            SinkTarget::V2 { vk, .. } => vk.key(time, key_code, value),
+            SinkTarget::V1 { ctx } => ctx.key(self.serial, time, key_code, value),
+        }
     }
 
     fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        self.vk.modifiers(depressed, latched, locked, group);
+        match &self.target {
+            SinkTarget::V2 { vk, .. } => vk.modifiers(depressed, latched, locked, group),
+            SinkTarget::V1 { ctx } => {
+                ctx.modifiers(self.serial, depressed, latched, locked, group)
+            }
+        }
     }
 
     fn uinput_key(&mut self, key_code: u16, value: i32) {
         if let Some(u) = &mut self.uinput {
-            // Only record for self-emit suppression if the kernel actually
-            // accepted the event. /dev/uinput failures (perm revoke, device
-            // disappearance, compositor input reset) used to enqueue
-            // phantoms here, swallowing the next real Backspace.
             match u.emit(key_code, value) {
                 Ok(()) => {
                     self.pending_self_emits
@@ -92,15 +125,24 @@ impl OutputSink for AdapterSink<'_> {
     }
 
     fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
-        crate::keymap::emit_char(
-            self.vk,
-            self.synthetic_mods_pending,
-            self.synthetic_mods_emitted_at,
-            self.raw_mods,
-            self.held_user_kc,
-            time,
-            c,
-        )
+        match &self.target {
+            SinkTarget::V2 { vk, .. } => crate::keymap::emit_char(
+                vk,
+                self.synthetic_mods_pending,
+                self.synthetic_mods_emitted_at,
+                self.raw_mods,
+                self.held_user_kc,
+                time,
+                c,
+            ),
+            // VkOnly (Tier 4) is gated off on v1 (KWin). This path is
+            // unreachable during normal operation — return false so the
+            // caller falls back to commit_string.
+            SinkTarget::V1 { .. } => {
+                tracing::trace!("vk_commit_char called on v1 (unexpected — VkOnly disabled on KWin)");
+                false
+            }
+        }
     }
 }
 

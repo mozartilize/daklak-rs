@@ -1,29 +1,46 @@
-//! KDE Plasma window-management focus backend — stub.
+//! KDE Plasma window-management focus backend.
 //!
-//! `org_kde_plasma_window_management` exposes `app_id_changed`,
-//! `title_changed`, `state_changed`, plus a `pid` field. XML at
-//! invent.kde.org/libraries/plasma-wayland-protocols is wayland-scanner
-//! compatible (confirmed). XWayland detection still routed through
-//! `focus::x11::X11Bridge` (XWayland sets `$DISPLAY` regardless of
-//! compositor).
-//!
-//! Implementation deferred: vendor XML into `crates/wayland-adapter/protocols/`,
-//! add `build.rs` scanner entry, write Dispatch impls mirroring `wlr.rs`.
-//! Compose with the same `FocusBackend` trait + `X11Bridge` as wlr.
+//! Uses `org_kde_plasma_window_management` to track focused window changes.
+//! Dispatch (in `dispatch.rs`) accumulates per-window state and on each state
+//! change pushes a `FocusEvent` through the channel this backend exposes.
+
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_window::OrgKdePlasmaWindow;
 
 use super::{FocusBackend, FocusEvent};
 
+/// Per-window state accumulated from plasma window management events.
+/// Unlike wlr-foreign-toplevel, there is no batched `Done` event — each
+/// field is updated immediately as the corresponding event fires.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PlasmaToplevelEntry {
+    #[allow(dead_code)]
+    pub uuid: String,
+    pub app_id: Option<String>,
+    pub title: Option<String>,
+    pub activated: bool,
+    pub pid: Option<u32>,
+    /// Proxy handle for the window object.
+    pub handle: Option<OrgKdePlasmaWindow>,
+}
+
 pub struct KdePlasmaBackend {
     rx: mpsc::UnboundedReceiver<FocusEvent>,
+    current: Arc<Mutex<Option<FocusEvent>>>,
 }
 
 impl KdePlasmaBackend {
-    pub fn spawn() -> Option<Self> {
-        tracing::warn!("KDE Plasma backend not yet implemented");
-        None
+    /// Build the backend + sender. Caller installs `tx` into
+    /// `AdapterState::focus_tx` and shares `current` via
+    /// `AdapterState::focus_current` so dispatch handlers can update both.
+    pub(crate) fn new(
+        current: Arc<Mutex<Option<FocusEvent>>>,
+    ) -> (Self, mpsc::UnboundedSender<FocusEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { rx, current }, tx)
     }
 }
 
@@ -34,7 +51,7 @@ impl FocusBackend for KdePlasmaBackend {
     }
 
     fn current(&self) -> Option<FocusEvent> {
-        None
+        self.current.lock().ok().and_then(|g| g.clone())
     }
 
     fn name(&self) -> &'static str {

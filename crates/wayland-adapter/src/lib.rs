@@ -25,6 +25,7 @@ pub mod wayland_handle;
 pub use viet_ime_keymap::xkb;
 
 mod dispatch;
+mod dispatch_v1;
 mod sink;
 mod state;
 
@@ -39,19 +40,39 @@ use wayland_client::{
     globals::registry_queue_init, protocol::wl_seat::WlSeat, Connection, QueueHandle,
 };
 
-use crate::focus::{wlr::WlrForeignToplevelBackend, x11::X11Bridge, FocusBackend};
+use crate::focus::{x11::X11Bridge, FocusBackend};
 
+#[cfg(feature = "kde")]
+use crate::focus::kde::KdePlasmaBackend;
+use wayland_protocols::wp::input_method::zv1::client::zwp_input_method_v1::ZwpInputMethodV1;
 use wayland_protocols_misc::{
     zwp_input_method_v2::client::zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
     zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
 };
 use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
+#[cfg(feature = "kde")]
+use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_window_management::OrgKdePlasmaWindowManagement;
+
+use crate::focus::wlr::WlrForeignToplevelBackend;
 
 pub use crate::sink::AdapterSink;
 pub use crate::state::AdapterState;
 pub use viet_ime_edit_strategy::{BackspaceMethod, KeyState, ModifierState, OutputSink};
 
 // ── Public types ─────────────────────────────────────────────────────────────
+
+/// Which input-method protocol the connected compositor speaks.
+/// Set during `connect()` and surfaced via `AdapterCtx::im_backend()`.
+/// The daemon matches on this to adjust tier routing (e.g. VkOnly is
+/// unavailable on v1 because there's no separate vk keyboard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImBackend {
+    /// `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` — wlroots path.
+    V2Wlroots,
+    /// `zwp_input_method_v1` (KWin/Mutter) — no vk, v1 context is the
+    /// key-emission path.
+    V1Kde,
+}
 
 /// Frame snapshot delivered to the handler at each Done event.
 #[derive(Debug, Clone)]
@@ -141,6 +162,10 @@ impl<'a> AdapterCtx<'a> {
         self.state.modifiers
     }
 
+    pub fn im_backend(&self) -> ImBackend {
+        self.state.im_backend
+    }
+
     pub fn last_forwarded_key(&self) -> Option<(u32, Instant)> {
         self.state.last_forwarded_key
     }
@@ -149,12 +174,22 @@ impl<'a> AdapterCtx<'a> {
         self.state.last_forwarded_release
     }
 
-    /// Forward a raw press through vk and stamp last_forwarded_key.
-    /// Used by daemon when a key bypasses composition (no active window,
-    /// xkb has no char for it, nav key, etc.).
+    /// Forward a raw press through vk (or v1 context) and stamp
+    /// last_forwarded_key. Used by daemon when a key bypasses composition
+    /// (no active window, xkb has no char for it, nav key, etc.).
     pub fn forward_press(&mut self, time: u32, key: u32) {
-        if let Some(vk) = &self.state.vk {
-            vk.key(time, key, 1);
+        let serial = self.state.serial;
+        match self.state.im_backend {
+            ImBackend::V2Wlroots => {
+                if let Some(vk) = &self.state.vk {
+                    vk.key(time, key, 1);
+                }
+            }
+            ImBackend::V1Kde => {
+                if let Some(ctx) = &self.state.im_ctx_v1 {
+                    ctx.key(serial, time, key, 1);
+                }
+            }
         }
         self.state.last_forwarded_key = Some((key, Instant::now()));
     }
@@ -162,8 +197,18 @@ impl<'a> AdapterCtx<'a> {
     /// Forward a raw press WITHOUT stamping last_forwarded_key. Used by the
     /// modifier-shortcut path — those keys don't participate in Path A.
     pub fn vk_key_press_unstamped(&mut self, time: u32, key: u32) {
-        if let Some(vk) = &self.state.vk {
-            vk.key(time, key, 1);
+        let serial = self.state.serial;
+        match self.state.im_backend {
+            ImBackend::V2Wlroots => {
+                if let Some(vk) = &self.state.vk {
+                    vk.key(time, key, 1);
+                }
+            }
+            ImBackend::V1Kde => {
+                if let Some(ctx) = &self.state.im_ctx_v1 {
+                    ctx.key(serial, time, key, 1);
+                }
+            }
         }
     }
 
@@ -179,18 +224,29 @@ impl<'a> AdapterCtx<'a> {
     ) where
         F: FnOnce(&mut AdapterSink<'_>),
     {
-        let im = match &self.state.im {
-            Some(x) => x,
-            None => return,
-        };
-        let vk = match &self.state.vk {
-            Some(x) => x,
-            None => return,
-        };
         let serial = self.state.serial;
+        let target = match self.state.im_backend {
+            ImBackend::V2Wlroots => {
+                let im = match &self.state.im {
+                    Some(x) => x,
+                    None => return,
+                };
+                let vk = match &self.state.vk {
+                    Some(x) => x,
+                    None => return,
+                };
+                crate::sink::SinkTarget::V2 { im, vk }
+            }
+            ImBackend::V1Kde => {
+                let ctx = match &self.state.im_ctx_v1 {
+                    Some(x) => x,
+                    None => return,
+                };
+                crate::sink::SinkTarget::V1 { ctx }
+            }
+        };
         let mut sink = AdapterSink {
-            im,
-            vk,
+            target,
             uinput: self.state.uinput.as_mut(),
             pending_self_emits: &mut self.state.pending_self_emits,
             synthetic_mods_pending: &mut self.state.synthetic_mods_pending,
@@ -212,15 +268,29 @@ pub struct WaylandAdapter<H: AdapterHandler> {
 }
 
 impl<H: AdapterHandler> WaylandAdapter<H> {
+    fn vk_or_ctx_key(&self, time: u32, key: u32, value: u32) {
+        let serial = self.state.serial;
+        match self.state.im_backend {
+            ImBackend::V2Wlroots => {
+                if let Some(vk) = &self.state.vk {
+                    vk.key(time, key, value);
+                }
+            }
+            ImBackend::V1Kde => {
+                if let Some(ctx) = &self.state.im_ctx_v1 {
+                    ctx.key(serial, time, key, value);
+                }
+            }
+        }
+    }
+
     pub(crate) fn dispatch_key_release(&mut self, time: u32, key: u32) {
         tracing::trace!(key, "dispatch_key_release: IM grab delivered release");
         if self.state.suppress_self_emit(key, 0) {
             tracing::trace!(key, value = 0, "self-emit suppressed (IM grab roundtrip)");
             return;
         }
-        if let Some(vk) = &self.state.vk {
-            vk.key(time, key, 0);
-        }
+        self.vk_or_ctx_key(time, key, 0);
         self.state.last_forwarded_release = Some((key, Instant::now()));
         let mut ctx = AdapterCtx { state: &mut self.state };
         self.handler.on_key_released(&mut ctx, time, key);
@@ -243,9 +313,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         match decision {
             KeyDecision::Consumed => {}
             KeyDecision::ForwardRaw => {
-                if let Some(vk) = &self.state.vk {
-                    vk.key(time, key, 1);
-                }
+                self.vk_or_ctx_key(time, key, 1);
                 self.state.last_forwarded_key = Some((key, Instant::now()));
             }
             KeyDecision::Apply {
@@ -415,8 +483,18 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         self.state.modifiers = m;
         self.state.raw_mods = (mods_depressed, mods_latched, mods_locked, group);
 
-        if let Some(vk) = &self.state.vk {
-            vk.modifiers(mods_depressed, mods_latched, mods_locked, group);
+        let serial = self.state.serial;
+        match self.state.im_backend {
+            ImBackend::V2Wlroots => {
+                if let Some(vk) = &self.state.vk {
+                    vk.modifiers(mods_depressed, mods_latched, mods_locked, group);
+                }
+            }
+            ImBackend::V1Kde => {
+                if let Some(ctx) = &self.state.im_ctx_v1 {
+                    ctx.modifiers(serial, mods_depressed, mods_latched, mods_locked, group);
+                }
+            }
         }
 
         let mut ctx = AdapterCtx { state: &mut self.state };
@@ -478,8 +556,26 @@ fn log_duplicate_tail_diagnostic(
 pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::WaylandHandle<H>> {
     let conn = Connection::connect_to_env().context("connect to Wayland display")?;
 
+    if std::env::var("WAYLAND_SOCKET").is_ok() {
+        tracing::info!("connected via WAYLAND_SOCKET (likely launched by KWin)");
+    }
+
     let (globals, mut event_queue) =
         registry_queue_init::<WaylandAdapter<H>>(&conn).context("registry_queue_init")?;
+
+    // Diagnostic: dump every advertised global so we can see what the
+    // compositor exposes on this connection. Critical for kwin probing
+    // since kwin restricts IM globals to the privileged --inputmethod fd.
+    {
+        let list = globals.contents();
+        let snapshot = list.with_list(|gs| {
+            gs.iter()
+                .map(|g| format!("  {} v{} (name={})", g.interface, g.version, g.name))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        tracing::info!("compositor registry globals:\n{snapshot}");
+    }
 
     let qh = event_queue.handle();
     let state = AdapterState::new();
@@ -494,60 +590,111 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
         .context("bind wl_seat")?;
     app.state.seat = Some(seat.clone());
 
-    let im_manager = globals
-        .bind::<ZwpInputMethodManagerV2, _, _>(&qh, 1..=1, ())
-        .context("bind zwp_input_method_manager_v2 — requires wlroots compositor")?;
-    app.state.im_manager = Some(im_manager.clone());
+    // ── Compositor backend detection: v2 (wlroots) or v1 (KWin/Mutter) ─────
+    let (im_backend, backend) =
+        if let Ok(v2) = globals.bind::<ZwpInputMethodManagerV2, _, _>(&qh, 1..=1, ()) {
+            // ── v2 (wlroots) path ────────────────────────────────────────────────
+            app.state.im_manager = Some(v2.clone());
 
-    let vk_manager = globals
-        .bind::<ZwpVirtualKeyboardManagerV1, _, _>(&qh, 1..=1, ())
-        .context("bind zwp_virtual_keyboard_manager_v1")?;
-    app.state.vk_manager = Some(vk_manager.clone());
+            let vk_manager = globals
+                .bind::<ZwpVirtualKeyboardManagerV1, _, _>(&qh, 1..=1, ())
+                .context("bind zwp_virtual_keyboard_manager_v1")?;
+            app.state.vk_manager = Some(vk_manager.clone());
 
-    let backend: Option<Box<dyn FocusBackend>> =
-        match globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ()) {
-            Ok(m) => {
-                app.state.ftl_manager = Some(m);
-                app.state.x11_bridge = X11Bridge::spawn();
-                let (b, tx) =
-                    WlrForeignToplevelBackend::new(app.state.focus_current.clone());
-                app.state.focus_tx = Some(tx);
-                tracing::info!("focus backend: wlr-foreign-toplevel-management v3");
-                Some(Box::new(b))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "wlr-foreign-toplevel unavailable ({e:#}); focus tracking disabled"
+            let backend: Option<Box<dyn FocusBackend>> =
+                match globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ()) {
+                    Ok(m) => {
+                        app.state.ftl_manager = Some(m);
+                        app.state.x11_bridge = X11Bridge::spawn();
+                        let (b, tx) =
+                            WlrForeignToplevelBackend::new(app.state.focus_current.clone());
+                        app.state.focus_tx = Some(tx);
+                        tracing::info!("focus backend: wlr-foreign-toplevel-management v3");
+                        Some(Box::new(b))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "wlr-foreign-toplevel unavailable ({e:#}); focus tracking disabled"
+                        );
+                        None
+                    }
+                };
+
+            event_queue.roundtrip(&mut app).context("initial roundtrip")?;
+
+            let im = v2.get_input_method(&seat, &qh, ());
+            let grab = im.grab_keyboard(&qh, ());
+            let vk = vk_manager.create_virtual_keyboard(&seat, &qh, ());
+            tracing::info!("input method and virtual keyboard created (v2/wlroots)");
+
+            // Pre-upload daklak synthetic keymap to vk
+            if let Some(km) = &app.state.daklak_keymap {
+                vk.keymap(1, km.fd.as_fd(), km.size);
+                app.state.keymap_init = true;
+                tracing::info!(
+                    size = km.size,
+                    "vk.keymap → daklak synthetic keymap (pre-uploaded at connect)"
                 );
-                None
+            } else {
+                tracing::warn!(
+                    "daklak keymap unavailable at connect; vk awaits compositor keymap passthrough via IM grab"
+                );
             }
+
+            app.state.im = Some(im);
+            app.state.grab = Some(grab);
+            app.state.vk = Some(vk);
+            app.state.conn = Some(conn.clone());
+
+            (ImBackend::V2Wlroots, backend)
+
+        } else if let Ok(v1) = globals.bind::<ZwpInputMethodV1, _, _>(&qh, 1..=1, ()) {
+            // ── v1 (KWin/Mutter) path ────────────────────────────────────────────
+            app.state.im_v1 = Some(v1.clone());
+            app.state.conn = Some(conn.clone());
+
+            #[cfg(feature = "kde")]
+            let backend: Option<Box<dyn FocusBackend>> = {
+                match globals
+                    .bind::<OrgKdePlasmaWindowManagement, _, _>(&qh, 1..=18, ())
+                {
+                    Ok(m) => {
+                        app.state.plasma_manager = Some(m.clone());
+                        app.state.x11_bridge = X11Bridge::spawn();
+                        let (b, tx) = KdePlasmaBackend::new(
+                            app.state.focus_current.clone(),
+                        );
+                        app.state.focus_tx = Some(tx);
+                        tracing::info!("focus backend: org_kde_plasma_window_management v20");
+                        Some(Box::new(b))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "org_kde_plasma_window_management unavailable ({e:#}); focus tracking disabled"
+                        );
+                        None
+                    }
+                }
+            };
+
+            #[cfg(not(feature = "kde"))]
+            let backend: Option<Box<dyn FocusBackend>> = {
+                tracing::warn!("KDE feature not compiled; focus tracking disabled");
+                None
+            };
+
+            event_queue.roundtrip(&mut app).context("initial roundtrip")?;
+
+            tracing::info!("input method v1 bound (KWin/Mutter)");
+            (ImBackend::V1Kde, backend)
+
+        } else {
+            anyhow::bail!(
+                "neither zwp_input_method_v2 nor zwp_input_method_v1 exposed by compositor"
+            );
         };
 
-    event_queue.roundtrip(&mut app).context("initial roundtrip")?;
-
-    let im = im_manager.get_input_method(&seat, &qh, ());
-    let grab = im.grab_keyboard(&qh, ());
-    let vk = vk_manager.create_virtual_keyboard(&seat, &qh, ());
-    tracing::info!("input method and virtual keyboard created");
-
-    // Pre-upload daklak synthetic keymap to vk
-    if let Some(km) = &app.state.daklak_keymap {
-        vk.keymap(1, km.fd.as_fd(), km.size);
-        app.state.keymap_init = true;
-        tracing::info!(
-            size = km.size,
-            "vk.keymap → daklak synthetic keymap (pre-uploaded at connect)"
-        );
-    } else {
-        tracing::warn!(
-            "daklak keymap unavailable at connect; vk awaits compositor keymap passthrough via IM grab"
-        );
-    }
-
-    app.state.im = Some(im);
-    app.state.grab = Some(grab);
-    app.state.vk = Some(vk);
-    app.state.conn = Some(conn.clone());
+    app.state.im_backend = im_backend;
 
     event_queue.roundtrip(&mut app).context("second roundtrip")?;
 

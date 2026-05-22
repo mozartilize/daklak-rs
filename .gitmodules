@@ -4,3 +4,6 @@
 [submodule "vendors/kime"]
 	path = vendors/kime
 	url = https://github.com/Riey/kime
+[submodule "vendors/fcitx5"]
+	path = vendors/fcitx5
+	url = https://github.com/fcitx/fcitx5

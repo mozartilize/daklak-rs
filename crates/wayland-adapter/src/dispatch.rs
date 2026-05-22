@@ -27,6 +27,14 @@ use crate::focus::wlr::ToplevelEntry;
 use crate::focus::FocusEvent;
 use crate::{AdapterHandler, WaylandAdapter};
 
+#[cfg(feature = "kde")]
+use crate::focus::kde::PlasmaToplevelEntry;
+#[cfg(feature = "kde")]
+use wayland_protocols_plasma::plasma_window_management::client::{
+    org_kde_plasma_window_management::{self, OrgKdePlasmaWindowManagement},
+    org_kde_plasma_window::{self, OrgKdePlasmaWindow},
+};
+
 // ── No-op dispatches ─────────────────────────────────────────────────────────
 
 delegate_noop!(@<H: AdapterHandler> WaylandAdapter<H>: ignore ZwpInputMethodManagerV2);
@@ -349,6 +357,139 @@ impl<H: AdapterHandler> Dispatch<ZwlrForeignToplevelHandleV1, ()> for WaylandAda
                 handle.destroy();
             }
             _ => {}
+        }
+    }
+}
+
+// ── KDE Plasma window-management dispatch ─────────────────────────────────
+
+#[cfg(feature = "kde")]
+impl<H: AdapterHandler> Dispatch<OrgKdePlasmaWindowManagement, ()> for WaylandAdapter<H> {
+    fn event(
+        state: &mut Self,
+        manager: &OrgKdePlasmaWindowManagement,
+        event: org_kde_plasma_window_management::Event,
+        _data: &(),
+        _conn: &wayland_client::Connection,
+        qh: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            org_kde_plasma_window_management::Event::WindowWithUuid { id: _, uuid } => {
+                let window = manager.get_window_by_uuid(uuid.to_string(), qh, ());
+                tracing::trace!(id = ?window.id(), uuid, "plasma: window with uuid");
+                state.state.plasma_toplevels.insert(
+                    window.id(),
+                    PlasmaToplevelEntry {
+                        uuid: uuid.clone(),
+                        handle: Some(window),
+                        ..Default::default()
+                    },
+                );
+            }
+            org_kde_plasma_window_management::Event::Window { id: _ } => {
+                // Deprecated — use WindowWithUuid instead
+            }
+            org_kde_plasma_window_management::Event::ShowDesktopChanged { .. } => {}
+            org_kde_plasma_window_management::Event::StackingOrderChanged { .. } => {}
+            org_kde_plasma_window_management::Event::StackingOrderUuidChanged { .. } => {}
+            org_kde_plasma_window_management::Event::StackingOrderChanged2 => {}
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "kde")]
+impl<H: AdapterHandler> Dispatch<OrgKdePlasmaWindow, ()> for WaylandAdapter<H> {
+    fn event(
+        state: &mut Self,
+        handle: &OrgKdePlasmaWindow,
+        event: org_kde_plasma_window::Event,
+        _data: &(),
+        _conn: &wayland_client::Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+    ) {
+        let id = handle.id();
+        if let Some(entry) = state.state.plasma_toplevels.get_mut(&id) {
+            entry.handle = Some(handle.clone());
+        }
+        match event {
+            org_kde_plasma_window::Event::AppIdChanged { app_id } => {
+                if let Some(e) = state.state.plasma_toplevels.get_mut(&id) {
+                    e.app_id = Some(app_id);
+                }
+            }
+            org_kde_plasma_window::Event::TitleChanged { title } => {
+                if let Some(e) = state.state.plasma_toplevels.get_mut(&id) {
+                    e.title = Some(title);
+                }
+            }
+            org_kde_plasma_window::Event::StateChanged { flags } => {
+                let active = (flags & 0x1) != 0;
+                if let Some(e) = state.state.plasma_toplevels.get_mut(&id) {
+                    e.activated = active;
+                }
+            }
+            org_kde_plasma_window::Event::PidChanged { pid } => {
+                if let Some(e) = state.state.plasma_toplevels.get_mut(&id) {
+                    e.pid = Some(pid);
+                }
+            }
+            org_kde_plasma_window::Event::Unmapped => {
+                tracing::trace!(id = ?id, "plasma: window unmapped");
+                state.state.plasma_toplevels.remove(&id);
+                if state.state.active_toplevel.as_ref() == Some(&id) {
+                    state.state.active_toplevel = None;
+                    let ev = FocusEvent::default();
+                    if let Ok(mut g) = state.state.focus_current.lock() {
+                        *g = Some(ev.clone());
+                    }
+                    if let Some(tx) = state.state.focus_tx.as_ref() {
+                        let _ = tx.send(ev);
+                    }
+                }
+                handle.destroy();
+            }
+            _ => {}
+        }
+
+        let old_active = state.state.active_toplevel.clone();
+        let new_active = state
+            .state
+            .plasma_toplevels
+            .iter()
+            .find(|(_, e)| e.activated)
+            .map(|(k, _)| k.clone());
+        let active_changed = new_active != old_active;
+        if active_changed {
+            state.state.active_toplevel = new_active.clone();
+            let ev = match new_active
+                .as_ref()
+                .and_then(|k| state.state.plasma_toplevels.get(k))
+            {
+                Some(e) => {
+                    let app_id = e
+                        .app_id
+                        .as_ref()
+                        .filter(|s| !s.trim().is_empty())
+                        .cloned();
+                    let title = e.title.as_deref();
+                    let is_xwayland = state
+                        .state
+                        .x11_bridge
+                        .as_ref()
+                        .map(|b| b.matches(app_id.as_deref(), title))
+                        .unwrap_or(false);
+                    FocusEvent { app_id, is_xwayland }
+                }
+                None => FocusEvent::default(),
+            };
+            if let Ok(mut g) = state.state.focus_current.lock() {
+                *g = Some(ev.clone());
+            }
+            if let Some(tx) = state.state.focus_tx.as_ref() {
+                tracing::trace!(?ev, "plasma: sending focus event");
+                let _ = tx.send(ev);
+            }
         }
     }
 }

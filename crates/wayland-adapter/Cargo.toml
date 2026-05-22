@@ -6,9 +6,9 @@ license = "GPL-3.0-or-later"
 
 [features]
 default = []
-# Enables the KDE Plasma window-management focus backend. Stub today;
-# protocol XML vendoring + scanner wiring lands in a follow-up PR.
-kde = []
+# Enables the KDE Plasma window-management focus backend + v1 IM dispatch.
+# wlroots-only builds can omit this to keep dependencies slim.
+kde = ["dep:wayland-protocols-plasma"]
 
 [dependencies]
 viet-ime-edit-strategy = { path = "../edit-strategy" }
@@ -17,8 +17,10 @@ viet-ime-keymap = { workspace = true }
 
 wayland-client = { workspace = true }
 wayland-backend = { workspace = true }
+wayland-protocols = { workspace = true }
 wayland-protocols-misc = { workspace = true }
 wayland-protocols-wlr = { workspace = true }
+wayland-protocols-plasma = { version = "0.3", features = ["client"], optional = true }
 
 tokio = { workspace = true }
 tracing = { workspace = true }

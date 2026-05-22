@@ -25,7 +25,16 @@ use wayland_protocols_misc::{
         zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
     },
 };
+use wayland_protocols::wp::input_method::zv1::client::{
+    zwp_input_method_v1::ZwpInputMethodV1,
+    zwp_input_method_context_v1::ZwpInputMethodContextV1,
+};
 use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
+
+#[cfg(feature = "kde")]
+use crate::focus::kde::PlasmaToplevelEntry;
+#[cfg(feature = "kde")]
+use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_window_management::OrgKdePlasmaWindowManagement;
 
 /// Window in which to drop daklak's own uinput round-trips. ~3× Tier 3
 /// grab-dance budget (~9ms) keeps clear of any human keystroke interval.
@@ -66,6 +75,10 @@ pub struct AdapterState {
     // Pending double-buffered frame (applied at Done)
     pub pending_frame: DoneFrame,
 
+    // v1-only: set on SurroundingText/ContentType, consumed on CommitState.
+    // Prevents apply_done_frame spam when KWin sends events in batches.
+    pub pending_commit: bool,
+
     // uinput device for Tier 3 — None if /dev/uinput is not accessible
     pub uinput: Option<UinputDevice>,
 
@@ -91,6 +104,19 @@ pub struct AdapterState {
 
     pub should_exit: bool,
 
+    // ── Compositor backend selection ─────────────────────────────────────────
+    /// Which IM protocol is active. Set during `connect()`.
+    pub im_backend: crate::ImBackend,
+    /// v1 IM global (only on KWin/Mutter). `None` on wlroots.
+    pub im_v1: Option<ZwpInputMethodV1>,
+    /// v1 context proxy — short-lived, one per text-input session.
+    /// Replaced on each `activate` event and dropped on `deactivate`.
+    pub im_ctx_v1: Option<ZwpInputMethodContextV1>,
+    /// wl_keyboard obtained via `grab_keyboard()` on the v1 context.
+    /// Delivers keymap / key / modifiers events in v1, mirroring v2's
+    /// `ZwpInputMethodKeyboardGrabV2`.
+    pub v1_keyboard: Option<wayland_client::protocol::wl_keyboard::WlKeyboard>,
+
     // ── wlr-foreign-toplevel-management focus tracking ───────────────────────
     /// Manager proxy, bound when the compositor exports the global.
     pub ftl_manager: Option<ZwlrForeignToplevelManagerV1>,
@@ -108,6 +134,12 @@ pub struct AdapterState {
     /// X11 bridge for XWayland detection. `Some` when `$DISPLAY` is set and
     /// the x11rb connection succeeded.
     pub(crate) x11_bridge: Option<X11Bridge>,
+
+    // ── KDE Plasma window-management focus tracking ─────────────────────────
+    #[cfg(feature = "kde")]
+    pub(crate) plasma_toplevels: HashMap<ObjectId, PlasmaToplevelEntry>,
+    #[cfg(feature = "kde")]
+    pub(crate) plasma_manager: Option<OrgKdePlasmaWindowManagement>,
 }
 
 impl AdapterState {
@@ -150,6 +182,7 @@ impl AdapterState {
                 }
             },
             serial: 0,
+            pending_commit: false,
             modifiers: ModifierState::empty(),
             raw_mods: (0, 0, 0, 0),
             pending_frame: DoneFrame::default(),
@@ -160,12 +193,20 @@ impl AdapterState {
             last_forwarded_key: None,
             last_forwarded_release: None,
             should_exit: false,
+            im_backend: crate::ImBackend::V2Wlroots,
+            im_v1: None,
+            im_ctx_v1: None,
+            v1_keyboard: None,
             ftl_manager: None,
             toplevels: HashMap::new(),
             active_toplevel: None,
             focus_tx: None,
             focus_current: Arc::new(Mutex::new(None)),
             x11_bridge: None,
+            #[cfg(feature = "kde")]
+            plasma_toplevels: HashMap::new(),
+            #[cfg(feature = "kde")]
+            plasma_manager: None,
         }
     }
 

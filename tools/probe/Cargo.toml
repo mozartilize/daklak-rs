@@ -16,6 +16,10 @@ path = "src/bin/vk_xkb_probe.rs"
 name = "vk_xkb_probe_eight"
 path = "src/bin/vk_xkb_probe_eight.rs"
 
+[[bin]]
+name = "im_v1_probe"
+path = "src/bin/im_v1_probe.rs"
+
 [dependencies]
 wayland-backend = { workspace = true }
 wayland-client = { workspace = true }
@@ -23,4 +27,3 @@ wayland-protocols = { workspace = true }
 wayland-protocols-wlr = { workspace = true }
 wayland-scanner = "0.31"
 libc = "0.2"
-

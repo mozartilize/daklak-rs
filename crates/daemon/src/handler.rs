@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use viet_ime_edit_strategy::{
     detect_method, BackspaceMethod, CapabilityProbe, ModifierState, SurroundingFrame,
 };
-use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, FrameSnapshot, KeyDecision};
+use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, FrameSnapshot, ImBackend, KeyDecision};
 
 use crate::config::Config;
 use crate::window::WindowState;
@@ -78,6 +78,28 @@ pub struct Daemon {
     /// engine state.
     pub last_input_char: Option<char>,
 
+    // ── Surrounding-text diff tracking (v1 IM / KWin path) ──────────────
+    /// Previous surrounding_text from the last on_done_frame. Used to
+    /// detect character insertions by diff, so we can drive the engine
+    /// without intercepting physical key events.
+    pub prev_text: String,
+    /// Byte cursor position matching prev_text.
+    pub prev_cursor: u32,
+    /// v1/KWin path: after daklak emits delete+commit, kate sends a flurry
+    /// of intermediate SurroundingText echoes (pre-delete, post-delete,
+    /// post-commit). Time-based gating dropped fast user keystrokes that
+    /// arrived in that window. Instead, track the EXPECTED post-apply
+    /// (text, cursor) — skip frames until that target is matched (echo
+    /// resync) OR text grows past the target (user typed ahead, resync to
+    /// target and process the user diff against it).
+    pub pending_apply_target: Option<(String, u32)>,
+    /// v1/KWin path: original Telex chars typed in the current word
+    /// (ASCII). Reset on word boundary. Used to seed the engine on every
+    /// keystroke so multi-char tone rules see the full raw context
+    /// (engine forgets internal state after returning a transform, so
+    /// `tieengs`'s sắc tone only fires when fed `tieeng` not `tiêng`).
+    pub raw_word: String,
+
 }
 
 impl Daemon {
@@ -118,6 +140,10 @@ impl Daemon {
             terminal_override,
             focused_app_id: None,
             last_input_char: None,
+            prev_text: String::new(),
+            prev_cursor: 0,
+            pending_apply_target: None,
+            raw_word: String::new(),
         }
     }
 
@@ -140,7 +166,7 @@ impl Daemon {
 }
 
 impl AdapterHandler for Daemon {
-    fn on_done_frame(&mut self, _ctx: &mut AdapterCtx<'_>, frame: &FrameSnapshot) {
+    fn on_done_frame(&mut self, ctx: &mut AdapterCtx<'_>, frame: &FrameSnapshot) {
         if frame.activate && self.synthetic_active {
             tracing::info!(
                 "real Activate received while synthetic session active → drop synthetic"
@@ -161,8 +187,16 @@ impl AdapterHandler for Daemon {
             self.current_active = true;
             self.focused_app_id = app_id;
             self.last_input_char = None;
+            self.raw_word.clear();
+            self.pending_apply_target = None;
 
-            let method = self.detect_capability(frame);
+            let mut method = self.detect_capability(frame);
+            // VkOnly (Tier 4) requires a separate vk keyboard, which v1
+            // (KWin/Mutter) does not expose. Fall through to Tier 3 uinput.
+            if method == BackspaceMethod::VkOnly && ctx.im_backend() == ImBackend::V1Kde {
+                tracing::info!("VkOnly gated off on KWin (no vk) → falling back to UInput");
+                method = BackspaceMethod::UInput;
+            }
             tracing::info!("capability detected: {:?}", method);
             let ws = WindowState::new(self.config.method.to_engine(), method);
             self.window = Some(ws);
@@ -178,23 +212,216 @@ impl AdapterHandler for Daemon {
         }
 
         // Re-sync shadow on every surrounding_text frame. Re-seed engine
-        // ONLY on activate or when there's no recent daemon action (= user
-        // moved the cursor by clicking).
+        // ONLY on activate or genuine cursor jump (user clicked elsewhere).
+        // A 1-char insertion at the cursor is an ordinary keystroke — the
+        // engine's running state already tracks it, re-seeding would clobber
+        // that state with the post-insertion word and double-count the new
+        // char when process_key() fires.
         if let Some((text, cursor)) = frame.surrounding_text.as_ref() {
+            tracing::trace!(
+                text = %text,
+                text_len = text.len(),
+                cursor = *cursor,
+                prev_text = %self.prev_text,
+                prev_cursor = self.prev_cursor,
+                raw_word = %self.raw_word,
+                pending = self.pending_apply_target.is_some(),
+                "on_done_frame surrounding_text"
+            );
+
+            // ── Pending-apply gate (v1/KWin echo handling) ──
+            // After daklak emits delete+commit, kate sends a flurry of
+            // intermediate SurroundingText echoes. Skip them until the
+            // expected post-apply text appears, OR text overshoots the
+            // target (user typed past it — resync and process the diff).
+            if let Some((target_text, target_cursor)) = self.pending_apply_target.clone() {
+                if text == &target_text && *cursor == target_cursor {
+                    // Echo caught up. Resync prev_*, clear pending, skip
+                    // this frame so no diff fires on the echo itself.
+                    self.prev_text = target_text;
+                    self.prev_cursor = target_cursor;
+                    self.pending_apply_target = None;
+                    return;
+                } else if text.len() > target_text.len() {
+                    // User typed past the target before the echo caught up.
+                    // Resync prev_* to the target and fall through — the
+                    // diff below will correctly detect the user's char.
+                    self.prev_text = target_text;
+                    self.prev_cursor = target_cursor;
+                    self.pending_apply_target = None;
+                } else {
+                    // Intermediate echo (e.g. post-delete, pre-commit). Skip.
+                    return;
+                }
+            }
+
+            // Duplicate-frame guard. KWin re-emits the same SurroundingText
+            // 2-3 times per keystroke. We've already processed this state —
+            // running through the diff/reseed logic again wipes raw_word
+            // and burns engine context. Skip if nothing changed.
+            if !activate && !deactivate
+                && text == &self.prev_text
+                && *cursor == self.prev_cursor
+            {
+                return;
+            }
+
+            // Detect a 1-char insertion at the prior cursor (= keystroke).
+            // Holds for end-of-text typing AND mid-text typing.
+            let prev_cur = self.prev_cursor as usize;
+            let one_char_typed = !activate
+                && !deactivate
+                && detect_one_char_insertion(
+                    &self.prev_text,
+                    self.prev_cursor,
+                    text,
+                    *cursor,
+                );
+
+            let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
+            let should_reseed = activate || (!one_char_typed && !recent_action);
+            // Re-init raw_word from the current word at cursor.
+            // Only valid when the word is ASCII-only (we can't reconstruct
+            // the raw Telex for an already-composed Vietnamese word).
+            // Otherwise clear — will rebuild as user types.
+            let reseed_word: Option<String> = if should_reseed {
+                let word = current_word_before_cursor(text, *cursor);
+                if word_qualifies_for_reseed(word) {
+                    Some(word.to_owned())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             if let Some(w) = self.window.as_mut() {
                 w.strategy.on_surrounding_text(text, *cursor);
-
-                let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
-                let should_reseed = activate || !recent_action;
                 if should_reseed {
-                    let word = current_word_before_cursor(text, *cursor);
                     w.engine.reset();
-                    if !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase()) {
+                    if let Some(word) = &reseed_word {
                         tracing::debug!(word, "re-seed engine (activate or cursor jump)");
                         w.engine.feed_context(word);
                     }
                 }
             }
+            if should_reseed {
+                if let Some(word) = reseed_word {
+                    self.raw_word = word;
+                } else {
+                    self.raw_word.clear();
+                }
+            }
+
+            // ── Surrounding-text diff: detect keystrokes from text changes ──
+            // v1 IM (KWin) does not deliver keyboard events through the grab
+            // (KWin 6.6.5 bug/design). Instead of intercepting evdev keys, we
+            // react to text changes: each SurroundingText update that grew by
+            // exactly 1 char at the cursor is a keystroke. Feed the char to
+            // the engine; if it produces a transformation, apply via
+            // delete_surrounding_text + commit_string.
+            //
+            // Echoes are handled by the pending_apply_target gate above —
+            // no time-based gating needed here.
+            // v2/wlroots delivers keys through the IM grab → `on_key_pressed`
+            // already drove the engine for this char. Running the diff path
+            // again would double-feed `raw_word` and re-reset the engine
+            // with a doubled prefix (gedit-on-sway regression: text_input_v3
+            // echoes SurroundingText AND the IM grab fires). Only v1/KWin
+            // needs the surrounding-text-diff path — KWin doesn't deliver
+            // keys through the grab.
+            let surrounding_diff_enabled = ctx.im_backend() == ImBackend::V1Kde;
+            if one_char_typed && surrounding_diff_enabled {
+                let suffix = &text[prev_cur..(*cursor as usize)];
+                if let Some(ch) = suffix.chars().next() {
+                    tracing::trace!(
+                        ch = %ch,
+                        prev = %self.prev_text,
+                        text = %text,
+                        "surrounding diff: char inserted"
+                    );
+                    // Pass `true`: shadow already includes `ch` (kate
+                    // inserted it before we observed via SurroundingText).
+                    let decision = self.handle_char_inner(0, ch, true);
+                    match decision {
+                        KeyDecision::Apply {
+                            method: BackspaceMethod::SurroundingText,
+                            backspaces,
+                            commit,
+                        } => {
+                            self.last_action_at = Instant::now();
+                            // v1/KWin: kate already has the just-typed `ch`
+                            // (user typed it; we observed via SurroundingText).
+                            // Engine's `backspaces` is a CHAR count (per
+                            // edit-strategy lib.rs:120) that assumes daklak
+                            // forwarded prior chars (v2/wlroots model). Add
+                            // 1 char for the just-typed `ch` so delete
+                            // removes it before commit replaces it. Unit
+                            // stays chars throughout — strategy converts to
+                            // bytes via shadow.pop_chars().
+                            let bs_v1 = backspaces + 1;
+                            // Compute expected post-apply (text, cursor) for
+                            // the pending_apply_target gate. Walk back
+                            // `bs_v1` chars from cursor to find the byte
+                            // index of deletion start (cursor is in bytes
+                            // per text-input spec, but bs_v1 is in chars,
+                            // so we can't just subtract).
+                            let cur = *cursor as usize;
+                            let del_start = {
+                                let prefix = &text[..cur];
+                                let bytes_back: usize = prefix
+                                    .chars()
+                                    .rev()
+                                    .take(bs_v1)
+                                    .map(|c| c.len_utf8())
+                                    .sum();
+                                cur.saturating_sub(bytes_back)
+                            };
+                            let mut target = String::with_capacity(
+                                text.len() - (cur - del_start) + commit.len(),
+                            );
+                            target.push_str(&text[..del_start]);
+                            target.push_str(&commit);
+                            target.push_str(&text[cur..]);
+                            let target_cursor = (del_start + commit.len()) as u32;
+                            self.pending_apply_target =
+                                Some((target, target_cursor));
+                            let raw_mods = ctx.raw_mods();
+                            self.apply_pending(
+                                ctx, 0,
+                                BackspaceMethod::SurroundingText,
+                                bs_v1,
+                                &commit,
+                                raw_mods, None,
+                            );
+                            // After composing, the engine's internal state
+                            // already reflects the post-transform string
+                            // (engine produced commit="ê" knowing it). DON'T
+                            // reset — the next tone-mark keystroke needs
+                            // that vowel context (`tiê` + 'n','g','s' → 'ế'
+                            // for sắc tone). The original reset+re-seed
+                            // gated `feed_context` on ASCII-only, which
+                            // wiped engine state without re-seeding when
+                            // shadow contained Vietnamese chars (ê, ơ, ư,
+                            // â, ...). Trust the engine.
+                            tracing::trace!(
+                                shadow = %self.window.as_ref()
+                                    .map(|w| w.strategy.shadow.text().to_owned())
+                                    .unwrap_or_default(),
+                                "engine state preserved post-apply"
+                            );
+                        }
+                        _ => {
+                            // ForwardRaw or Consumed — client already has
+                            // the character, nothing to send.
+                        }
+                    }
+                }
+            }
+            self.prev_text = text.clone();
+            self.prev_cursor = *cursor;
+        } else if !activate && !deactivate {
+            self.prev_text.clear();
+            self.prev_cursor = 0;
         }
     }
 
@@ -279,7 +506,7 @@ impl AdapterHandler for Daemon {
 
     fn on_focus_changed(
         &mut self,
-        _ctx: &mut AdapterCtx<'_>,
+        ctx: &mut AdapterCtx<'_>,
         app_id: Option<String>,
         is_xwayland: bool,
     ) {
@@ -307,7 +534,8 @@ impl AdapterHandler for Daemon {
             self.config.auto_vk_only_for_xwayland && is_xwayland && app_id.is_some();
         let vk_only_matched =
             !in_force_uinput && (in_force_vk_only || auto_xwayland_vk_only);
-        let matched = vk_only_matched;
+        let vk_available = ctx.im_backend() != ImBackend::V1Kde;
+        let matched = vk_only_matched && vk_available;
 
         if matched && !self.current_active {
             let id = app_id.clone().unwrap_or_default();
@@ -419,24 +647,64 @@ impl Daemon {
     }
 
     pub fn handle_char(&mut self, _key: u32, ch: char) -> KeyDecision {
+        self.handle_char_inner(_key, ch, true)
+    }
+
+    /// `shadow_already_has_ch`: pass `true` when the caller is the v1/KWin
+    /// surrounding-text path — kate already inserted the char, so shadow
+    /// reflects post-insertion text. The word-boundary seed must skip the
+    /// trailing char (else process_key double-feeds). Pass `false` for the
+    /// v2/wlroots key-grab path: the IM grab intercepts the key before the
+    /// client sees it, shadow does NOT contain the char yet.
+    pub fn handle_char_inner(
+        &mut self,
+        _key: u32,
+        ch: char,
+        shadow_already_has_ch: bool,
+    ) -> KeyDecision {
         let prev_was_separator = matches!(
             self.last_input_char,
             Some(c) if !c.is_ascii_alphabetic()
         );
         self.last_input_char = Some(ch);
 
+        // v1/KWin path: maintain raw_word and use it as the engine seed on
+        // EVERY keystroke. Engine forgets vowel-cluster context after
+        // returning a transform (e.g. after `ee → ê` engine no longer
+        // recognizes `iê` as a vowel cluster when 's' tone arrives later).
+        // Feeding the original raw ASCII chars sidesteps that.
+        if shadow_already_has_ch {
+            // Word boundary: reset raw_word.
+            if !ch.is_ascii_alphabetic() {
+                self.raw_word.clear();
+            }
+            if let Some(w) = self.window.as_mut() {
+                let prefix = self.raw_word.clone();
+                w.engine.reset();
+                if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphabetic()) {
+                    tracing::debug!(prefix, "seed engine from raw_word (v1 path)");
+                    w.engine.feed_context(&prefix);
+                }
+            }
+            // Append `ch` AFTER seeding (engine's process_key adds it).
+            if ch.is_ascii_alphabetic() {
+                self.raw_word.push(ch);
+            }
+        } else if let Some(w) = self.window.as_mut() {
+            // v2/wlroots path: original shadow-based seed.
+            if w.engine.at_word_beginning() && !prev_was_separator {
+                let shadow_text = w.strategy.shadow.text().to_owned();
+                let raw_word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
+                if !raw_word.is_empty() && raw_word.chars().all(|c| c.is_ascii_lowercase()) {
+                    tracing::debug!(word = raw_word, "seed engine from shadow at word boundary");
+                    w.engine.feed_context(raw_word);
+                }
+            }
+        }
+
         let Some(w) = self.window.as_mut() else {
             return KeyDecision::ForwardRaw;
         };
-
-        if w.engine.at_word_beginning() && !prev_was_separator {
-            let shadow_text = w.strategy.shadow.text().to_owned();
-            let word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
-            if !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase()) {
-                tracing::debug!(word, "seed engine from shadow at word boundary");
-                w.engine.feed_context(word);
-            }
-        }
 
         let r = w.engine.process_key(ch);
 
@@ -463,6 +731,43 @@ impl Daemon {
             KeyDecision::ForwardRaw
         }
     }
+}
+
+/// Whether `word` is suitable to re-seed the engine + `raw_word` from on
+/// a cursor jump.
+///
+/// Must accept ASCII letters of either case — Telex composes `DD→Đ`,
+/// `AA→Â`, `OO→Ô`, so capitals are valid raw input. A previous version
+/// gated on `is_ascii_lowercase` which silently dropped capitals,
+/// breaking the `DD→Đ` transform when the cursor entered a new word
+/// starting with a capital letter (e.g. `Đường\nD` then `D` again).
+///
+/// Must reject:
+/// - empty strings (no context to seed)
+/// - words containing non-ASCII (already-composed Vietnamese — we can't
+///   reconstruct the raw Telex from the composed form)
+/// - words containing digits, punctuation, etc. (not Telex input)
+pub fn word_qualifies_for_reseed(word: &str) -> bool {
+    !word.is_empty() && word.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// Detects whether the transition from (`prev_text`, `prev_cursor`) to
+/// (`text`, `cursor`) is exactly one character inserted at `prev_cursor`.
+/// Handles end-of-text typing AND mid-text typing.
+pub fn detect_one_char_insertion(
+    prev_text: &str,
+    prev_cursor: u32,
+    text: &str,
+    cursor: u32,
+) -> bool {
+    let prev_cur = prev_cursor as usize;
+    prev_cur <= prev_text.len()
+        && cursor > prev_cursor
+        && cursor == prev_cursor + 1
+        && text.len() > prev_text.len()
+        && text.len() == prev_text.len() + 1
+        && text.get(..prev_cur) == prev_text.get(..prev_cur)
+        && text.get((cursor as usize)..) == prev_text.get(prev_cur..)
 }
 
 #[cfg(test)]
@@ -541,5 +846,152 @@ mod tests {
     fn seed_gate_skips_word_with_digit() {
         let word = "abc1";
         assert!(!word.chars().all(|c| c.is_ascii_lowercase()));
+    }
+
+    // ── detect_one_char_insertion ──────────────────────────────────────
+
+    use super::detect_one_char_insertion as oci;
+
+    #[test]
+    fn oci_empty_to_first_char() {
+        assert!(oci("", 0, "t", 1));
+    }
+
+    #[test]
+    fn oci_append_ascii() {
+        assert!(oci("ti", 2, "tie", 3));
+    }
+
+    #[test]
+    fn oci_append_after_vietnamese() {
+        // shadow "tiê" (4 bytes, 3 chars). cursor at byte 4. Type 'n' →
+        // "tiên" (5 bytes), cursor at byte 5. Must detect as keystroke.
+        assert!(oci("tiê", 4, "tiên", 5));
+    }
+
+    #[test]
+    fn oci_mid_text_insert() {
+        // "abcd" cursor=2 ("ab|cd"). Type 'X' → "abXcd" cursor=3.
+        assert!(oci("abcd", 2, "abXcd", 3));
+    }
+
+    #[test]
+    fn oci_multi_char_paste_rejected() {
+        assert!(!oci("ab", 2, "abcde", 5));
+    }
+
+    #[test]
+    fn oci_backspace_rejected() {
+        assert!(!oci("abc", 3, "ab", 2));
+    }
+
+    #[test]
+    fn oci_same_text_rejected() {
+        // Duplicate frame: text and cursor unchanged.
+        assert!(!oci("abc", 3, "abc", 3));
+    }
+
+    #[test]
+    fn oci_cursor_jump_rejected() {
+        // Same text, cursor moved (user clicked elsewhere).
+        assert!(!oci("abcde", 5, "abcde", 2));
+    }
+
+    #[test]
+    fn oci_replace_with_same_length_rejected() {
+        // ê (2 bytes) replaced with two ASCII: same byte count, no growth.
+        assert!(!oci("tiê", 4, "tiab", 4));
+    }
+
+    #[test]
+    fn oci_cursor_mismatch_rejected() {
+        // text grew by 1 byte but cursor jumped by 2 (impossible for single
+        // keystroke insert at cursor).
+        assert!(!oci("ab", 2, "abc", 3) == false);
+        // also: cursor at 0 in larger text (not at insertion point).
+        assert!(!oci("ab", 2, "abc", 1));
+    }
+
+    #[test]
+    fn oci_post_apply_echo_rejected() {
+        // After daklak's `bs=2 commit="ê"` on "tiee" cursor=4:
+        // kate text becomes "tiê" cursor=4. text shrank by 0 in chars but
+        // -1 byte (4→4 bytes? actually tiê=4 bytes, tiee=4 bytes, same len).
+        // Should NOT be one_char_typed.
+        assert!(!oci("tiee", 4, "tiê", 4));
+    }
+
+    #[test]
+    fn oci_duong_line_break_to_capital_d() {
+        // Regression: gedit on Enter resets surrounding text. User had
+        // "đường" then pressed Enter and typed 'D'. text="D" cursor=1 vs
+        // prev_text="đường" prev_cursor=9. Cursor went DOWN — must NOT be
+        // detected as a 1-char keystroke (would feed 'D' into engine
+        // without resetting raw_word).
+        assert!(!oci("đường", 9, "D", 1));
+    }
+
+    #[test]
+    fn oci_second_capital_d_on_new_line() {
+        // After cursor jump above, prev_text becomes "D" prev_cursor=1.
+        // User types second 'D' → text="DD" cursor=2. MUST be detected as
+        // 1-char keystroke so handle_char fires and `DD→Đ` rule runs.
+        assert!(oci("D", 1, "DD", 2));
+    }
+
+    // ── word_qualifies_for_reseed ──────────────────────────────────────
+
+    use super::word_qualifies_for_reseed as wqr;
+
+    #[test]
+    fn wqr_capital_d_accepted() {
+        // The Đường-line-2 regression: word="D" must seed raw_word so the
+        // next 'D' keystroke can fire the DD→Đ Telex rule.
+        assert!(wqr("D"));
+    }
+
+    #[test]
+    fn wqr_double_capital_d_accepted() {
+        assert!(wqr("DD"));
+    }
+
+    #[test]
+    fn wqr_capital_aa_accepted() {
+        // AA→Â Telex rule needs the same capital handling.
+        assert!(wqr("AA"));
+    }
+
+    #[test]
+    fn wqr_mixed_case_accepted() {
+        // "Folder" is alphabetic; engine just won't transform — harmless.
+        assert!(wqr("Folder"));
+    }
+
+    #[test]
+    fn wqr_lowercase_accepted() {
+        assert!(wqr("phow"));
+    }
+
+    #[test]
+    fn wqr_empty_rejected() {
+        assert!(!wqr(""));
+    }
+
+    #[test]
+    fn wqr_vietnamese_rejected() {
+        // Already-composed Vietnamese: can't reconstruct raw Telex.
+        assert!(!wqr("đường"));
+        assert!(!wqr("tiếng"));
+        assert!(!wqr("mộng"));
+    }
+
+    #[test]
+    fn wqr_digit_rejected() {
+        assert!(!wqr("abc1"));
+    }
+
+    #[test]
+    fn wqr_punctuation_rejected() {
+        assert!(!wqr("hello,"));
     }
 }
