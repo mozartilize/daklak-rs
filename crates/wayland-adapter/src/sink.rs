@@ -4,6 +4,7 @@ use std::time::Instant;
 use viet_ime_edit_strategy::uinput_device::UinputDevice;
 use viet_ime_edit_strategy::{KeyState, OutputSink};
 use viet_ime_key_emitter::KeyEmitter;
+use viet_ime_keymap::xkb::XkbState;
 
 use wayland_protocols::wp::input_method::zv1::client::zwp_input_method_context_v1::ZwpInputMethodContextV1;
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2;
@@ -76,11 +77,15 @@ pub struct AdapterSink<'a> {
     /// for firefox's broken v3 path (` ơr`→`ở`); other v3 clients honor
     /// bytes per spec.
     pub(crate) chars_for_delete: bool,
-    /// Wayland connection — used by `commit_via_keysym` to flush
-    /// between per-char keysym emissions on V1Kde, breaking the
-    /// foot/KWin xkb-keymap recompile race that drops the trailing
-    /// char of a multi-char commit (`việc`→`việ`).
+    /// Wayland connection — used by `commit_via_keysym` to flush after
+    /// the batch of emissions so they reach the compositor in one round.
     pub(crate) conn: Option<&'a wayland_client::Connection>,
+    /// xkb state for char→keycode reverse lookup. Used by
+    /// `commit_via_keysym` to emit standard ASCII chars via `ctx.key()`
+    /// (layout-aware) instead of `ctx.keysym()` which would go through
+    /// KWin's forwardKeySym + kc 247 temp keymap and trigger foot's xkb
+    /// recompile race.
+    pub(crate) xkb: Option<&'a XkbState>,
 }
 
 impl OutputSink for AdapterSink<'_> {
@@ -186,40 +191,60 @@ impl OutputSink for AdapterSink<'_> {
         // wl_keyboard_key_state: 1=Pressed, 0=Released.
         const PRESSED: u32 = 1;
         const RELEASED: u32 = 0;
-        let chars: Vec<char> = text.chars().collect();
-        let multichar = chars.len() > 1;
-        for c in chars.iter() {
-            let c = *c;
+
+        // Collect consecutive ASCII chars into buf and flush them as a
+        // single ctx.commit_string(). This goes through text-input-v3,
+        // which has NO dedup (unlike ctx.key() / ctx.keysym() → MAPPED
+        // forwardKeySym, both of which hit KWin's KeyboardInterface::
+        // updateKey pressedKeys check). When the physical keycode for
+        // an ASCII char in the commit is still held by the user (e.g. 'g'
+        // while typing "ếng"), KWin drops the synthetic press because that
+        // keycode is already in pressedKeys from the forwarded physical
+        // press. commit_string() via text-input-v3 bypasses this
+        // deduplication entirely.
+        let mut ascii_buf = String::new();
+        let flush_ascii = |buf: &mut String, ctx: &ZwpInputMethodContextV1, serial: u32| {
+            if !buf.is_empty() {
+                ctx.commit_string(serial, std::mem::take(buf));
+            }
+        };
+
+        for c in text.chars() {
+            let is_unmapped = match self.xkb {
+                Some(xkb) => xkb.char_to_keycode(c).is_none(),
+                None => true,
+            };
+            if !is_unmapped {
+                ascii_buf.push(c);
+                continue;
+            }
+
+            // Vietnamese (unmapped) char — flush pending ASCII first so
+            // commit_string arrives before the keysym's keymap dance.
+            flush_ascii(&mut ascii_buf, ctx, serial);
+
             let sym = xkbcommon::xkb::utf32_to_keysym(c as u32);
-            // utf32_to_keysym returns KEY_NoSymbol (0) when out of range —
-            // bail to commit_string for the whole string.
             if sym.raw() == 0 {
                 tracing::debug!(c = %c, "commit_via_keysym: no keysym for char, falling back");
                 return false;
             }
-            // Modifiers=0 — daklak emits at the raw unicode codepoint;
-            // KWin's forwardKeySym handles unmapped syms via custom keymap
-            // (kc 247) regardless of modifier state.
+            // Per-char keysym barrier: KWin's forwardKeySym installs a
+            // per-sym temp keymap (kc 247) for unmapped keysyms → foot
+            // recompiles xkb. Flush + sleep so foot finishes before the
+            // next char or forwarded physical key arrives.
             ctx.keysym(serial, time, sym.raw(), PRESSED, 0);
             ctx.keysym(serial, time, sym.raw(), RELEASED, 0);
-            tracing::trace!(c = %c, sym = sym.raw(), "keysym emit");
-
-            // Per-keysym barrier (only when commit is multi-char):
-            // KWin's `forwardKeySym` installs a per-sym temp keymap
-            // (kc 247). When two keysyms fire within microseconds,
-            // foot's xkb recompile pipeline collapses the second
-            // install — the trailing char silently drops
-            // (`việc`→`việ`, `tiếng `→`tiến`). Flush + sleep AFTER
-            // EVERY keysym (not just between) so each char's keymap
-            // dance fully settles at foot before the next event
-            // (whether daklak's next keysym, or the user's next
-            // forwarded key like space) arrives.
-            if multichar {
-                if let Some(conn) = self.conn {
-                    let _ = conn.flush();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(40));
+            if let Some(conn) = self.conn {
+                let _ = conn.flush();
             }
+            tracing::trace!(c = %c, sym = sym.raw(), "commit_via_keysym: keysym emit + barrier (unmapped)");
+        }
+
+        // Flush any trailing ASCII.
+        flush_ascii(&mut ascii_buf, ctx, serial);
+
+        if let Some(conn) = self.conn {
+            let _ = conn.flush();
         }
         true
     }

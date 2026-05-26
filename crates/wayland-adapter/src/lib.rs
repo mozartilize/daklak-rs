@@ -238,6 +238,7 @@ impl<'a> AdapterCtx<'a> {
                     held_user_kc,
                     chars_for_delete,
                     conn,
+                    xkb: self.state.xkb.as_ref(),
                 };
                 f(&mut sink);
             }
@@ -260,6 +261,7 @@ impl<'a> AdapterCtx<'a> {
                     held_user_kc,
                     chars_for_delete,
                     conn,
+                    xkb: self.state.xkb.as_ref(),
                 };
                 f(&mut sink);
             }
