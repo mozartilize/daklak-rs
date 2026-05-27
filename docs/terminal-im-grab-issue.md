@@ -19,7 +19,7 @@ Capability detection routes editable widgets (gedit, Kate, Firefox address bar, 
 
 - Wayland compositor: Sway / wlroots-based (also reproduced on KDE Plasma per prior reports)
 - Apps tested: foot, ghostty, chromium, gedit, thunar
-- Daemon: daklak `viet-ime` (Rust, GPL-3.0)
+- Daemon: `daklak` (Rust, GPL-3.0)
 
 ## Observed terminal behaviors
 

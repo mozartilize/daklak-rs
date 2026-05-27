@@ -1,0 +1,2 @@
+option('kde', type: 'boolean', value: false, description: 'Enable KDE Plasma Wayland support')
+option('evdev_grab', type: 'boolean', value: false, description: 'Install udev rule for /dev/uinput access (needed for evdev grab mode)')
