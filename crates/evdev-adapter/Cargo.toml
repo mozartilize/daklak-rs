@@ -7,6 +7,7 @@ license = "GPL-3.0-or-later"
 [dependencies]
 viet-ime-edit-strategy = { path = "../edit-strategy" }
 viet-ime-keymap = { workspace = true }
+viet-ime-key-emitter = { workspace = true }
 
 anyhow = { workspace = true }
 evdev = { workspace = true, features = ["tokio", "stream-trait"] }

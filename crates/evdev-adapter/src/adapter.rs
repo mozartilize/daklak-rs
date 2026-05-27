@@ -23,7 +23,7 @@ use viet_ime_edit_strategy::KeyDecision;
 use viet_ime_keymap as keymap;
 use viet_ime_keymap::xkb::XkbState;
 
-use crate::output_backend::{OutputBackend, UinputBackend};
+use viet_ime_key_emitter::{KeyEmitter, UinputEmitter};
 
 /// Trait the daemon implements so the evdev adapter can drive composition
 /// without depending on the daemon's concrete `Daemon` struct.
@@ -70,9 +70,9 @@ const XKB_MOD5_BIT: u32 = 1 << 7; // AltGr / Level3
 
 pub struct EvdevAdapter {
     streams: SelectAll<EventStream>,
-    /// Output delivery sink (uinput today, libei eventually).
+    /// Output delivery sink (uinput today).
     /// Owns its own lifecycle — keymap activation, device teardown.
-    output: Box<dyn OutputBackend>,
+    output: Box<dyn KeyEmitter + Send>,
     xkb: XkbState,
     mod_mask: u32,
     /// Modifier mask currently visible to the compositor. Tracks
@@ -179,8 +179,8 @@ impl EvdevAdapter {
             bail!("evdev: no keyboards grabbed — evdev-only mode cannot run");
         }
 
-        let output: Box<dyn OutputBackend> = Box::new(
-            UinputBackend::open().context("output: uinput backend open failed")?,
+        let output: Box<dyn KeyEmitter + Send> = Box::new(
+            UinputEmitter::open().context("output: uinput backend open failed")?,
         );
         let xkb = build_us_xkb().context("xkb: failed to build us keymap")?;
 
@@ -202,14 +202,11 @@ impl EvdevAdapter {
     }
 
     fn passthrough(&mut self, code: u32, value: i32) {
-        match self.output.emit_key(code as u16, value) {
-            Ok(()) => {
-                tracing::trace!(code, value, "output.emit_key ok");
-            }
-            Err(e) => {
-                tracing::warn!(code, value, error = %e, "output.emit_key FAILED");
-            }
-        }
+        // `time` is ignored by `UinputEmitter` (kernel stamps its own).
+        // The trait's `emit_key` swallows errors internally — at this layer
+        // we surface a single trace line per attempt.
+        self.output.emit_key(0, code, value as u32);
+        tracing::trace!(code, value, "output.emit_key dispatched");
     }
 
     /// Adjust uinput-emitted Shift / AltGr (Level3) / HENK (Level5) state
