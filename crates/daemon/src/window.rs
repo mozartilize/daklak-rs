@@ -28,20 +28,21 @@ pub struct WindowState {
     pub prev_text: String,
     /// Byte cursor position matching prev_text.
     pub prev_cursor: u32,
-    /// v1/KWin path: after daklak emits delete+commit, kate sends a flurry
-    /// of intermediate SurroundingText echoes (pre-delete, post-delete,
-    /// post-commit). Time-based gating dropped fast user keystrokes that
-    /// arrived in that window. Instead, track the EXPECTED post-apply
-    /// (text, cursor) — skip frames until that target is matched (echo
-    /// resync) OR text grows past the target (user typed ahead, resync to
-    /// target and process the user diff against it).
-    pub pending_apply_target: Option<(String, u32)>,
+    /// Byte anchor position matching prev_text.
+    pub prev_anchor: u32,
     /// v1/KWin path: original Telex chars typed in the current word
     /// (ASCII). Reset on word boundary. Used to seed the engine on every
     /// keystroke so multi-char tone rules see the full raw context
     /// (engine forgets internal state after returning a transform, so
     /// `tieengs`'s sắc tone only fires when fed `tieeng` not `tiêng`).
     pub raw_word: String,
+    /// v1/KWin path: number of raw_word entries that produced each visible
+    /// screen char in the current word. Invariant: sum(raw_word_screen_widths)
+    /// == raw_word.len(). Used by handle_backspace to pop the correct number
+    /// of raw keystrokes when a single screen char was produced by multiple
+    /// raw chars (e.g. Telex 'u'+'s' → 'ú': width=2, so BS over 'ú' must
+    /// pop both 'u' and 's' from raw_word, not just one).
+    pub raw_word_screen_widths: Vec<u8>,
 
     /// When true, `delete_surrounding_text` on the V1Kde sink emits a
     /// CHAR count rather than the spec-compliant byte count. Set at
@@ -54,17 +55,22 @@ pub struct WindowState {
 }
 
 impl WindowState {
-    pub fn new(input_method: InputMethod, backspace_method: BackspaceMethod) -> Self {
+    pub fn new(
+        input_method: InputMethod,
+        backspace_method: BackspaceMethod,
+        bracket_shortcuts: bool,
+    ) -> Self {
         Self {
-            engine: EngineState::new(input_method),
+            engine: EngineState::new_with_options(input_method, bracket_shortcuts),
             strategy: Strategy::new(backspace_method),
             method: backspace_method,
             last_keystroke_at: Instant::now(),
             last_input_char: None,
             prev_text: String::new(),
             prev_cursor: 0,
-            pending_apply_target: None,
+            prev_anchor: 0,
             raw_word: String::new(),
+            raw_word_screen_widths: Vec::new(),
             chars_for_delete: false,
         }
     }
@@ -73,15 +79,16 @@ impl WindowState {
     /// modifier shortcut / external cursor movement. Wipes everything
     /// that tracks an in-progress word: engine, shadow, raw_word,
     /// last_input_char, and the v1 surrounding-text diff bookkeeping
-    /// (prev_text, prev_cursor, pending_apply_target).
+    /// (prev_text, prev_cursor).
     pub fn full_reset(&mut self) {
         self.engine.reset();
         self.strategy.reset_shadow();
         self.last_input_char = None;
         self.raw_word.clear();
+        self.raw_word_screen_widths.clear();
         self.prev_text.clear();
         self.prev_cursor = 0;
-        self.pending_apply_target = None;
+        self.prev_anchor = 0;
     }
 
     /// Check 2-second idle heuristic. Returns true (and resets engine) if

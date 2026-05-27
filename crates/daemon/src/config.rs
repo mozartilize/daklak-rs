@@ -92,6 +92,12 @@ pub struct Config {
     /// `DAKLAK_ENABLE_EVDEV_GRAB` (truthy heuristic).
     #[serde(default)]
     pub enable_evdev_grab: bool,
+
+    /// Telex-only: enable `[`/`]`/`{`/`}` shortcuts for `ơ`/`ư`/`Ơ`/`Ư`.
+    /// Default false so terminal bindings like tmux Ctrl+B+[ are preserved.
+    /// Env override `DAKLAK_BRACKET_SHORTCUTS` (truthy heuristic).
+    #[serde(default)]
+    pub bracket_shortcuts: bool,
 }
 
 fn default_enable_wayland() -> bool {
@@ -108,6 +114,7 @@ impl Default for Config {
             auto_vk_only_for_xwayland: false,
             force_chars_delete_apps: default_force_chars_delete_apps(),
             enable_evdev_grab: false,
+            bracket_shortcuts: false,
         }
     }
 }
@@ -169,6 +176,13 @@ impl Config {
 
         if let Ok(v) = std::env::var("DAKLAK_ENABLE_EVDEV_GRAB") {
             cfg.enable_evdev_grab = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Ok(v) = std::env::var("DAKLAK_BRACKET_SHORTCUTS") {
+            cfg.bracket_shortcuts = matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );

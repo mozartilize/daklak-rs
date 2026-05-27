@@ -4,7 +4,27 @@
 //! to commit and the count of preceding chars to delete. Hides the internal
 //! state machine of vnkey-engine.
 
+use vnkey_engine::input::{KeyEvType, TELEX_MAPPING, VNE_COUNT};
 use vnkey_engine::{Engine, InputMethod as VnkeyIm};
+
+fn telex_key_map(bracket_shortcuts: bool) -> [i32; 256] {
+    let mut key_map = [KeyEvType::Normal as i32; 256];
+    for entry in TELEX_MAPPING {
+        if !bracket_shortcuts && matches!(entry.key, b'[' | b']' | b'{' | b'}') {
+            continue;
+        }
+        key_map[entry.key as usize] = entry.action;
+        if entry.action < VNE_COUNT {
+            let ch = entry.key;
+            if ch.is_ascii_lowercase() {
+                key_map[ch.to_ascii_uppercase() as usize] = entry.action;
+            } else if ch.is_ascii_uppercase() {
+                key_map[ch.to_ascii_lowercase() as usize] = entry.action;
+            }
+        }
+    }
+    key_map
+}
 
 /// Vietnamese input method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +65,16 @@ pub struct EngineState {
 
 impl EngineState {
     pub fn new(method: InputMethod) -> Self {
+        Self::new_with_options(method, false)
+    }
+
+    pub fn new_with_options(method: InputMethod, bracket_shortcuts: bool) -> Self {
         let mut engine = Engine::new();
         engine.set_input_method(method.to_vnkey());
+        if method == InputMethod::Telex && !bracket_shortcuts {
+            let key_map = telex_key_map(false);
+            engine.input.set_user_key_map(&key_map);
+        }
         engine.set_viet_mode(true);
         Self { engine }
     }
@@ -293,6 +321,25 @@ mod tests {
         assert_eq!(type_str(&mut eng, "aa,"), "â,");
     }
 
+    #[test]
+    fn telex_bracket_shortcuts_disabled_by_default() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        let r = eng.process_key('[');
+        assert!(
+            !r.consumed,
+            "default config should not consume '[' as Telex ơ shortcut"
+        );
+    }
+
+    #[test]
+    fn telex_bracket_shortcuts_enabled_when_opted_in() {
+        let mut eng = EngineState::new_with_options(InputMethod::Telex, true);
+        let r = eng.process_key('[');
+        assert!(r.consumed, "opt-in should consume '[' as Telex ơ shortcut");
+        assert_eq!(r.backspaces, 0);
+        assert_eq!(r.commit, "ơ");
+    }
+
     // ===== Reset =====
 
     #[test]
@@ -372,6 +419,29 @@ mod tests {
     }
 
     // ===== Switching methods =====
+
+    // ===== Regression: auto-restore after "work" → "push" =====
+    //
+    // After "work" triggers auto-escape (typing 'k' after 'r' tone on 'o'),
+    // the engine should still properly auto-restore "push" when 's' acts
+    // as a tone on 'u'. The 's' is Tone1 (sắc) in Telex, so it will
+    // temporarily produce "pú". But 'h' should trigger auto-restore back
+    // to "push".
+
+    #[test]
+    fn telex_work_space_push() {
+        // In Telex, 's' is Tone1 (sắc), so "push" produces "púh"
+        // at the engine level.  Auto-restore does NOT fire because
+        // 'h' is correctly accepted as a CVC final consonant in
+        // Vietnamese phonology.  The daklak handler must keep
+        // raw_word in sync on backspace so re-seeding doesn't
+        // double-count deleted characters.
+        let mut eng = EngineState::new(InputMethod::Telex);
+        let mut buf = type_str(&mut eng, "work");
+        assert_eq!(buf, "work", "auto-restore should revert 'work'");
+        buf = type_str(&mut eng, " push");
+        assert_eq!(buf, " púh", "'push' in Telex = 'púh' — s is Tone1");
+    }
 
     #[test]
     fn vni_and_telex_isolated() {

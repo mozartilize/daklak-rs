@@ -179,8 +179,8 @@ impl Strategy {
 
     /// Observe a surrounding_text frame from the compositor. Resets shadow on
     /// cursor delta (plan0.md priority-1 invalidation).
-    pub fn on_surrounding_text(&mut self, text: &str, cursor: u32) {
-        self.shadow.observe_surrounding(text, cursor);
+    pub fn on_surrounding_text(&mut self, text: &str, cursor: u32, anchor: u32) {
+        self.shadow.observe_surrounding(text, cursor, anchor);
     }
 
     /// Reset shadow on focus loss or navigation key.
@@ -493,7 +493,7 @@ mod tests {
         // Shadow is synced to compositor's text[..cursor] — that's how
         // Tier 1 gets correct byte counts for delete_surrounding_text.
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
-        s.on_surrounding_text("cha", 3);
+        s.on_surrounding_text("cha", 3, 3);
         assert_eq!(s.shadow.text(), "cha");
     }
 
@@ -503,11 +503,35 @@ mod tests {
         // Engine returns bs=1 commit="ầ". Tier 1 should delete the â
         // (2 bytes / 1 char) and commit "ầ".
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
-        s.on_surrounding_text("châ", 4); // "châ" = 4 bytes
+        s.on_surrounding_text("châ", 4, 4); // "châ" = 4 bytes
         let mut sink = MockSink::default();
         s.apply(1, "ầ", 1, 0, &mut sink);
         assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 1, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("ầ".to_owned()));
+    }
+
+    #[test]
+    fn tier1_delete_includes_selected_after_cursor() {
+        // Chromium may keep an active selection (anchor > cursor) on first
+        // focused word. delete_surrounding_text must cover that selected
+        // range or the client rejects it and we get duplicated syllables.
+        //
+        // Field finding (2026-05): this is easiest to repro in Chromium
+        // omnibox when Google search provider inline-autocomplete injects a
+        // history suggestion tail (e.g. `translate.google.com` ->
+        // surrounding_text like "translate" with cursor=3, anchor=9). With
+        // DuckDuckGo as default provider, the same history entry may not
+        // trigger this selection shape, and the bug disappears.
+        //
+        // Current status: we keep this selection-aware Tier1 behavior, but a
+        // complete fix is still unresolved for the Chromium + provider-
+        // specific autocomplete path.
+        let mut s = Strategy::new(BackspaceMethod::SurroundingText);
+        s.on_surrounding_text("translate", 3, 9);
+        let mut sink = MockSink::default();
+        s.apply(1, "â", 1, 0, &mut sink);
+        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(1, 1, 6, 6));
+        assert_eq!(sink.calls[1], Call::CommitString("â".to_owned()));
     }
 
     #[test]

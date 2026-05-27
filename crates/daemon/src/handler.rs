@@ -112,7 +112,7 @@ impl Daemon {
     fn detect_capability(&self, frame: &FrameSnapshot) -> BackspaceMethod {
         let probe = CapabilityProbe {
             purpose: frame.purpose,
-            surrounding_text_seen: frame.surrounding_text.as_ref().map(|(text, cursor)| {
+            surrounding_text_seen: frame.surrounding_text.as_ref().map(|(text, cursor, _anchor)| {
                 SurroundingFrame {
                     text: text.clone(),
                     cursor: *cursor,
@@ -156,7 +156,11 @@ impl AdapterHandler for Daemon {
                 method = BackspaceMethod::UInput;
             }
             tracing::info!("capability detected: {:?}", method);
-            let mut ws = WindowState::new(self.config.method.to_engine(), method);
+            let mut ws = WindowState::new(
+                self.config.method.to_engine(),
+                method,
+                self.config.bracket_shortcuts,
+            );
             ws.chars_for_delete = self
                 .focused_app_id
                 .as_deref()
@@ -196,7 +200,7 @@ impl AdapterHandler for Daemon {
         // engine's running state already tracks it, re-seeding would clobber
         // that state with the post-insertion word and double-count the new
         // char when process_key() fires.
-        if let Some((text, cursor)) = frame.surrounding_text.as_ref() {
+        if let Some((text, cursor, anchor)) = frame.surrounding_text.as_ref() {
             tracing::trace!(
                 text = %text,
                 text_len = text.len(),
@@ -204,35 +208,8 @@ impl AdapterHandler for Daemon {
                 prev_text = %w.prev_text,
                 prev_cursor = w.prev_cursor,
                 raw_word = %w.raw_word,
-                pending = w.pending_apply_target.is_some(),
                 "on_done_frame surrounding_text"
             );
-
-            // ── Pending-apply gate (v1/KWin echo handling) ──
-            // After daklak emits delete+commit, kate sends a flurry of
-            // intermediate SurroundingText echoes. Skip them until the
-            // expected post-apply text appears, OR text overshoots the
-            // target (user typed past it — resync and process the diff).
-            if let Some((target_text, target_cursor)) = w.pending_apply_target.clone() {
-                if text == &target_text && *cursor == target_cursor {
-                    // Echo caught up. Resync prev_*, clear pending, skip
-                    // this frame so no diff fires on the echo itself.
-                    w.prev_text = target_text;
-                    w.prev_cursor = target_cursor;
-                    w.pending_apply_target = None;
-                    return;
-                } else if text.len() > target_text.len() {
-                    // User typed past the target before the echo caught up.
-                    // Resync prev_* to the target and fall through — the
-                    // diff below will correctly detect the user's char.
-                    w.prev_text = target_text;
-                    w.prev_cursor = target_cursor;
-                    w.pending_apply_target = None;
-                } else {
-                    // Intermediate echo (e.g. post-delete, pre-commit). Skip.
-                    return;
-                }
-            }
 
             // Duplicate-frame guard. KWin re-emits the same SurroundingText
             // 2-3 times per keystroke. We've already processed this state —
@@ -241,13 +218,13 @@ impl AdapterHandler for Daemon {
             if !activate && !deactivate
                 && text == &w.prev_text
                 && *cursor == w.prev_cursor
+                && *anchor == w.prev_anchor
             {
                 return;
             }
 
             // Detect a 1-char insertion at the prior cursor (= keystroke).
             // Holds for end-of-text typing AND mid-text typing.
-            let prev_cur = w.prev_cursor as usize;
             let one_char_typed = !activate
                 && !deactivate
                 && detect_one_char_insertion(
@@ -273,7 +250,7 @@ impl AdapterHandler for Daemon {
             } else {
                 None
             };
-            w.strategy.on_surrounding_text(text, *cursor);
+            w.strategy.on_surrounding_text(text, *cursor, *anchor);
             if should_reseed {
                 w.engine.reset();
                 if let Some(word) = &reseed_word {
@@ -281,123 +258,21 @@ impl AdapterHandler for Daemon {
                     w.engine.feed_context(word);
                 }
                 if let Some(word) = reseed_word {
+                    w.raw_word_screen_widths = vec![1u8; word.len()];
                     w.raw_word = word;
                 } else {
                     w.raw_word.clear();
+                    w.raw_word_screen_widths.clear();
                 }
             }
 
-            // Surrounding-text diff path was a workaround under the
-            // assumption that v1 IM grab doesn't deliver keys (nested-kwin
-            // observation). On host KDE the grab delivers via
-            // dispatch_key_press, so both paths fire and engine
-            // double-processes each char. Grab is authoritative on every
-            // compositor that implements v1 IM correctly.
-            let surrounding_diff_enabled = false;
-            if one_char_typed && surrounding_diff_enabled {
-                let suffix = &text[prev_cur..(*cursor as usize)];
-                if let Some(ch) = suffix.chars().next() {
-                    tracing::trace!(
-                        ch = %ch,
-                        prev = %w.prev_text,
-                        text = %text,
-                        "surrounding diff: char inserted"
-                    );
-                    // Compute the apply target while we still hold the
-                    // text/cursor refs; drop the window borrow before
-                    // calling self.handle_char_inner (it re-borrows).
-                    let cur = *cursor as usize;
-                    let text_owned = text.clone();
-                    // End the `w` borrow so handle_char_inner can re-borrow `self`.
-                    let _ = w;
-                    // Pass `true`: shadow already includes `ch` (kate
-                    // inserted it before we observed via SurroundingText).
-                    let decision = self.handle_char_inner(0, ch, true);
-                    match decision {
-                        KeyDecision::Apply {
-                            method: BackspaceMethod::SurroundingText,
-                            backspaces,
-                            commit,
-                        } => {
-                            self.last_action_at = Instant::now();
-                            // v1/KWin: kate already has the just-typed `ch`
-                            // (user typed it; we observed via SurroundingText).
-                            // Engine's `backspaces` is a CHAR count (per
-                            // edit-strategy lib.rs:120) that assumes daklak
-                            // forwarded prior chars (v2/wlroots model). Add
-                            // 1 char for the just-typed `ch` so delete
-                            // removes it before commit replaces it. Unit
-                            // stays chars throughout — strategy converts to
-                            // bytes via shadow.pop_chars().
-                            let bs_v1 = backspaces + 1;
-                            // Compute expected post-apply (text, cursor) for
-                            // the pending_apply_target gate. Walk back
-                            // `bs_v1` chars from cursor to find the byte
-                            // index of deletion start (cursor is in bytes
-                            // per text-input spec, but bs_v1 is in chars,
-                            // so we can't just subtract).
-                            let del_start = {
-                                let prefix = &text_owned[..cur];
-                                let bytes_back: usize = prefix
-                                    .chars()
-                                    .rev()
-                                    .take(bs_v1)
-                                    .map(|c| c.len_utf8())
-                                    .sum();
-                                cur.saturating_sub(bytes_back)
-                            };
-                            let mut target = String::with_capacity(
-                                text_owned.len() - (cur - del_start) + commit.len(),
-                            );
-                            target.push_str(&text_owned[..del_start]);
-                            target.push_str(&commit);
-                            target.push_str(&text_owned[cur..]);
-                            let target_cursor = (del_start + commit.len()) as u32;
-                            if let Some(w) = self.window.as_mut() {
-                                w.pending_apply_target = Some((target, target_cursor));
-                            }
-                            let raw_mods = ctx.raw_mods();
-                            self.apply_pending(
-                                ctx, 0,
-                                BackspaceMethod::SurroundingText,
-                                bs_v1,
-                                &commit,
-                                raw_mods, None,
-                            );
-                            // After composing, the engine's internal state
-                            // already reflects the post-transform string
-                            // (engine produced commit="ê" knowing it). DON'T
-                            // reset — the next tone-mark keystroke needs
-                            // that vowel context (`tiê` + 'n','g','s' → 'ế'
-                            // for sắc tone). The original reset+re-seed
-                            // gated `feed_context` on ASCII-only, which
-                            // wiped engine state without re-seeding when
-                            // shadow contained Vietnamese chars (ê, ơ, ư,
-                            // â, ...). Trust the engine.
-                            tracing::trace!(
-                                shadow = %self.window.as_ref()
-                                    .map(|w| w.strategy.shadow.text().to_owned())
-                                    .unwrap_or_default(),
-                                "engine state preserved post-apply"
-                            );
-                        }
-                        _ => {
-                            // ForwardRaw or Consumed — client already has
-                            // the character, nothing to send.
-                        }
-                    }
-                    if let Some(w) = self.window.as_mut() {
-                        w.prev_text = text_owned;
-                        w.prev_cursor = *cursor;
-                    }
-                    return;
-                }
-            }
             w.prev_text = text.clone();
             w.prev_cursor = *cursor;
+            w.prev_anchor = *anchor;
         } else if !activate && !deactivate {
             w.prev_text.clear();
             w.prev_cursor = 0;
+            w.prev_anchor = 0;
         }
     }
 
@@ -525,7 +400,11 @@ impl AdapterHandler for Daemon {
             self.current_active = true;
             self.synthetic_active = true;
             self.focused_app_id = app_id;
-            let ws = WindowState::new(self.config.method.to_engine(), BackspaceMethod::VkOnly);
+            let ws = WindowState::new(
+                self.config.method.to_engine(),
+                BackspaceMethod::VkOnly,
+                self.config.bracket_shortcuts,
+            );
             self.window = Some(ws);
             if let Some(w) = self.window.as_mut() {
                 w.strategy.set_modifiers(self.modifiers);
@@ -592,7 +471,11 @@ impl Daemon {
     /// window with VkOnly routing so `handle_char` and `handle_backspace`
     /// work without a Wayland compositor.
     pub fn activate_evdev(&mut self) {
-        let ws = WindowState::new(self.config.method.to_engine(), BackspaceMethod::VkOnly);
+        let ws = WindowState::new(
+            self.config.method.to_engine(),
+            BackspaceMethod::VkOnly,
+            self.config.bracket_shortcuts,
+        );
         self.current_active = true;
         self.synthetic_active = true;
         self.window = Some(ws);
@@ -607,6 +490,33 @@ impl Daemon {
         };
         let r = w.engine.process_backspace();
         tracing::debug!(consumed = r.consumed, bs = r.backspaces, "engine.process_backspace");
+
+        // v1/KWin path: raw_word tracks raw keystrokes so backspace must
+        // pop the raw entries that produced the deleted screen char.
+        // raw_word_screen_widths[last] tells us how many raw chars to remove
+        // (e.g. Telex 'u'+'s' produced 'ú' → width=2 → BS over 'ú' pops
+        // both 's' and 'u', leaving raw_word consistent with the screen).
+        let popped_width = w.raw_word_screen_widths.pop();
+        {
+            let width = popped_width.unwrap_or(1) as usize;
+            for _ in 0..width {
+                w.raw_word.pop();
+            }
+        }
+
+        // If the engine restored chars (e.g. tone-undo: 'ú' → 'u', or
+        // vowel-undo: 'ê' → 'ee'), push them back into raw_word so the
+        // next keystroke seeds the engine with correct context.  Only do
+        // this when we were actively tracking (popped_width.is_some()),
+        // i.e. the v1 path — in v2 raw_word_screen_widths is always empty.
+        if popped_width.is_some() && !r.commit.is_empty() {
+            for ch in r.commit.chars() {
+                if ch.is_ascii_alphabetic() {
+                    w.raw_word.push(ch);
+                    w.raw_word_screen_widths.push(1);
+                }
+            }
+        }
 
         if r.consumed {
             w.last_keystroke_at = Instant::now();
@@ -658,6 +568,7 @@ impl Daemon {
             // Word boundary: reset raw_word.
             if !ch.is_ascii_alphabetic() {
                 w.raw_word.clear();
+                w.raw_word_screen_widths.clear();
             }
             let prefix = w.raw_word.clone();
             w.engine.reset();
@@ -693,6 +604,33 @@ impl Daemon {
             shadow = %w.strategy.shadow.text(),
             "engine.process_key"
         );
+
+        // v1/KWin path: maintain raw_word_screen_widths in sync with raw_word.
+        // raw_word_screen_widths[i] = how many raw chars produced screen char i.
+        // Invariant: sum(raw_word_screen_widths) == raw_word.len().
+        if shadow_already_has_ch && ch.is_ascii_alphabetic() {
+            if r.consumed {
+                // Engine deleted r.backspaces screen chars and emitted r.commit.
+                // Pop r.backspaces widths (sum = s); the new raw chars for all
+                // commit screen chars together cost s + 1 (the current ch).
+                let s: usize = (0..r.backspaces)
+                    .map(|_| w.raw_word_screen_widths.pop().unwrap_or(1) as usize)
+                    .sum();
+                let total = s + 1; // raw chars to distribute across commit chars
+                let m = r.commit.chars().count().max(1);
+                // Push 1 for the first m-1 commit chars; all remaining raw
+                // chars go to the last one (ensures sum == total == raw_word
+                // growth since last clear).
+                for _ in 0..m.saturating_sub(1) {
+                    w.raw_word_screen_widths.push(1);
+                }
+                let last_width = total.saturating_sub(m.saturating_sub(1)).max(1) as u8;
+                w.raw_word_screen_widths.push(last_width);
+            } else {
+                // ForwardRaw: one raw char → one screen char.
+                w.raw_word_screen_widths.push(1);
+            }
+        }
 
         if r.consumed {
             let method = w.method;
@@ -970,6 +908,90 @@ mod tests {
         assert!(!wqr("hello,"));
     }
 
+    mod surrounding_anchor_regression {
+        use super::super::Daemon;
+        use crate::config::Config;
+        use crate::window::WindowState;
+        use viet_ime_edit_strategy::{BackspaceMethod, KeyState, OutputSink};
+        use viet_ime_engine::InputMethod;
+        use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, AdapterState, FrameSnapshot};
+
+        #[derive(Default)]
+        struct DeleteCaptureSink {
+            deletes: Vec<(u32, u32, u32, u32)>,
+        }
+
+        impl OutputSink for DeleteCaptureSink {
+            fn delete_surrounding_text(
+                &mut self,
+                before_bytes: u32,
+                before_chars: u32,
+                after_bytes: u32,
+                after_chars: u32,
+            ) {
+                self.deletes
+                    .push((before_bytes, before_chars, after_bytes, after_chars));
+            }
+
+            fn commit_string(&mut self, _text: &str) {}
+            fn commit(&mut self, _serial: u32) {}
+            fn vk_key(&mut self, _time: u32, _key_code: u32, _state: KeyState) {}
+            fn vk_modifiers(&mut self, _depressed: u32, _latched: u32, _locked: u32, _group: u32) {}
+            fn uinput_key(&mut self, _key_code: u16, _value: i32) {}
+            fn vk_commit_char(&mut self, _time: u32, _c: char) -> bool {
+                false
+            }
+        }
+
+        fn frame(text: &str, cursor: u32, anchor: u32) -> FrameSnapshot {
+            FrameSnapshot {
+                activate: false,
+                deactivate: false,
+                surrounding_text: Some((text.to_owned(), cursor, anchor)),
+                purpose: 0,
+                app_id: None,
+                is_xwayland: false,
+            }
+        }
+
+        #[test]
+        fn anchor_only_surrounding_update_must_not_be_dropped() {
+            // Regression capture: Chromium omnibox + Google search provider
+            // can inline-autocomplete from history (e.g. suggest
+            // `translate.google.com`) and report surrounding_text like
+            // "translate" with an active tail selection (cursor=3,
+            // anchor=9). We must not drop anchor-only updates, or Tier1
+            // delete won't include selection-after and Chromium rejects it.
+            //
+            // Note: this appears provider-dependent in practice (DuckDuckGo
+            // often avoids this selection shape). Root cause on the Chromium
+            // side is still unresolved; this test documents current behavior.
+            let mut daemon = Daemon::new(Config::default());
+            daemon.current_active = true;
+            daemon.window = Some(WindowState::new(
+                InputMethod::Telex,
+                BackspaceMethod::SurroundingText,
+                false,
+            ));
+
+            let mut state = AdapterState::new();
+            let mut ctx = AdapterCtx { state: &mut state };
+
+            daemon.on_done_frame(&mut ctx, &frame("translate", 3, 3));
+            daemon.on_done_frame(&mut ctx, &frame("translate", 3, 9));
+
+            let mut sink = DeleteCaptureSink::default();
+            let w = daemon.window.as_mut().expect("window state exists");
+            w.strategy.apply(1, "â", 1, 0, &mut sink);
+
+            assert_eq!(
+                sink.deletes,
+                vec![(1, 1, 6, 6)],
+                "anchor-only frame change must update selection span for Tier1 delete"
+            );
+        }
+    }
+
     // ── Ctrl+BS / NAV reset: raw_word lives on Daemon, must be cleared
     //    alongside WindowState. Bug is v1/KWin only — v2/wlroots path
     //    (shadow_already_has_ch=false) never reads or writes raw_word.
@@ -987,6 +1009,7 @@ mod tests {
             d.window = Some(WindowState::new(
                 InputMethod::Telex,
                 BackspaceMethod::SurroundingText,
+                false,
             ));
             d
         }
@@ -1060,6 +1083,69 @@ mod tests {
             }
             d.window = None;
             assert_eq!(raw_word(&d), "");
+        }
+
+        /// Regression: "work púh" + BS×2 + retype "ush" must produce "púh"
+        /// again, not "uúh". Root cause: after Telex 's' (tone mark) produces
+        /// bs=1 commit='ú', raw_word held "pus" for screen "pú". BS×1 popped
+        /// only 'h', BS×2 popped only 's' (not 'u'), leaving raw_word="pu"
+        /// for screen "p". Engine re-seeded with "pu" instead of "p".
+        #[test]
+        fn v1_bs_after_tone_pops_correct_raw_width() {
+            // Type "push" in v1 path:
+            //   'p' → ForwardRaw                raw_word="p",    widths=[1]
+            //   'u' → ForwardRaw                raw_word="pu",   widths=[1,1]
+            //   's' → Consumed (bs=1 commit='ú') raw_word="pus",  widths=[1,2]
+            //   'h' → ForwardRaw                raw_word="push", widths=[1,2,1]
+            let mut d = v1_daemon();
+            d.handle_char_inner(0, 'p', true);
+            d.handle_char_inner(0, 'u', true);
+            d.handle_char_inner(0, 's', true);
+            d.handle_char_inner(0, 'h', true);
+            assert_eq!(raw_word(&d), "push");
+
+            // BS×2: deletes screen chars 'h' then 'ú'.
+            // BS#1: pop width=1 → pop 1 raw ('h')   → raw_word="pus"
+            // BS#2: pop width=2 → pop 2 raw ('s','u') → raw_word="p"
+            d.handle_backspace();
+            d.handle_backspace();
+
+            assert_eq!(
+                raw_word(&d),
+                "p",
+                "after BS×2 over 'h' and 'ú' (raw 'u'+'s'), raw_word must be 'p' not 'pu'"
+            );
+        }
+
+        /// After the correct BS, retyping "ush" must seed with "p" not "pu",
+        /// so 's' fires bs=1 commit='ú' (not bs=2 commit='úu').
+        #[test]
+        fn v1_retype_after_bs_over_tone_char_seeds_correctly() {
+            let mut d = v1_daemon();
+            d.handle_char_inner(0, 'p', true);
+            d.handle_char_inner(0, 'u', true);
+            d.handle_char_inner(0, 's', true); // 'ú'
+            d.handle_char_inner(0, 'h', true);
+            d.handle_backspace(); // delete 'h'
+            d.handle_backspace(); // delete 'ú' (pops both 'u' and 's')
+
+            // Re-type 'u': engine seeded with "p" → process_key('u') → ForwardRaw
+            let r_u = d.handle_char_inner(0, 'u', true);
+            // 'u' after bare 'p' is ForwardRaw (no vowel-modify rule here)
+            assert!(
+                matches!(r_u, viet_ime_wayland_adapter::KeyDecision::ForwardRaw),
+                "re-typed 'u' must be ForwardRaw (seed was 'p', not 'pu')"
+            );
+
+            // Re-type 's': engine seeded with "pu" → process_key('s') → bs=1 commit='ú'
+            let r_s = d.handle_char_inner(0, 's', true);
+            match r_s {
+                viet_ime_wayland_adapter::KeyDecision::Apply { backspaces, ref commit, .. } => {
+                    assert_eq!(backspaces, 1, "'s' must produce exactly 1 backspace");
+                    assert_eq!(commit, "ú", "'s' after 'pu' must commit 'ú'");
+                }
+                _other => panic!("expected Apply for 's', got something else"),
+            }
         }
     }
 }

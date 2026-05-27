@@ -15,8 +15,8 @@ pub fn apply(
     serial: u32,
     sink: &mut impl OutputSink,
 ) {
-    let (before_bytes, before_chars) = shadow.pop_chars(backspaces);
-    sink.delete_surrounding_text(before_bytes, before_chars, 0, 0);
+    let (before_bytes, before_chars, after_bytes, after_chars) = shadow.pop_delete_span(backspaces);
+    sink.delete_surrounding_text(before_bytes, before_chars, after_bytes, after_chars);
     sink.commit_string(commit);
     sink.commit(serial);
     shadow.append(commit);

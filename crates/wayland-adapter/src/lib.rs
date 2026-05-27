@@ -79,7 +79,7 @@ pub enum ImBackend {
 pub struct FrameSnapshot {
     pub activate: bool,
     pub deactivate: bool,
-    pub surrounding_text: Option<(String, u32)>,
+    pub surrounding_text: Option<(String, u32, u32)>,
     pub purpose: u32,
     /// Focused app_id at this Done frame's activate. Read from the cached
     /// `FocusBackend` snapshot (no IPC fork). `Some` only when `activate`
@@ -415,7 +415,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             .pending_frame
             .surrounding_text
             .as_ref()
-            .map(|st| (st.text.clone(), st.cursor));
+            .map(|st| (st.text.clone(), st.cursor, st.anchor));
 
         let (app_id, is_xwayland) = if activate {
             match self.state.focus_current.lock().ok().and_then(|g| g.clone()) {
