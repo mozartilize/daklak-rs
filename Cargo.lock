@@ -742,6 +742,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "viet-ime-key-emitter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tracing",
+ "viet-ime-edit-strategy",
+ "viet-ime-keymap",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-misc",
+ "xkbcommon",
+]
+
+[[package]]
 name = "viet-ime-keymap"
 version = "0.1.0"
 dependencies = [

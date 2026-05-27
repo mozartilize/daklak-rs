@@ -7,6 +7,7 @@ members = [
     "crates/edit-strategy",
     "crates/focus",
     "crates/keymap",
+    "crates/key-emitter",
     "crates/daemon",
     "crates/wayland-adapter",
     "crates/evdev-adapter",
@@ -19,6 +20,7 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 vnkey-engine = { path = "vendors/vnkey/vnkey-engine" }
 viet-ime-keymap = { path = "crates/keymap" }
+viet-ime-key-emitter = { path = "crates/key-emitter" }
 tokio = { version = "1", features = ["full"] }
 wayland-backend = "0.3"
 wayland-client = "0.31"

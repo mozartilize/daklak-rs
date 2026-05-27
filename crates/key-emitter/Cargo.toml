@@ -1,0 +1,18 @@
+[package]
+name = "viet-ime-key-emitter"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+viet-ime-keymap = { workspace = true }
+viet-ime-edit-strategy = { path = "../edit-strategy" }
+
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true }
+wayland-protocols-misc = { workspace = true }
+
+xkbcommon = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"
