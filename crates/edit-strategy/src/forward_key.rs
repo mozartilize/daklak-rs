@@ -7,9 +7,6 @@ pub const KEY_BACKSPACE: u32 = 14;
 /// `zwp_virtual_keyboard_v1` + `commit_string` (Tier 2 —
 /// BackspaceMethod::ForwardKey).
 ///
-/// Wayland message queues are FIFO within a single connection (plan0.md:240-251),
-/// so the app sees N×BS events before the commit_string — no sleep needed.
-///
 /// Precondition: the daemon must have called `vk.keymap(...)` once before any
 /// `vk_key()` calls (kime pattern: state.rs:620-626). Stage 3 owns that.
 pub fn apply(
@@ -26,8 +23,14 @@ pub fn apply(
         sink.vk_key(time, KEY_BACKSPACE, KeyState::Pressed);
         sink.vk_key(time, KEY_BACKSPACE, KeyState::Released);
     }
-    sink.commit_string(commit);
-    sink.commit(serial);
+    // Prefer per-char keysym emission on V1Kde — real wl_keyboard.key
+    // events via KWin's forwardKeySym + temporary-keymap synthesis.
+    // Terminals like foot ignore commit_string but honor wl_keyboard.
+    // Other backends return false → fall through to commit_string.
+    if !sink.commit_via_keysym(serial, time, commit) {
+        sink.commit_string(commit);
+        sink.commit(serial);
+    }
 
     // Shadow tracks char-level view (used by cursor-delta detection).
     // We don't know what the app deleted — pop by char count.

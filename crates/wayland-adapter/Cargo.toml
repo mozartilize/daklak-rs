@@ -14,6 +14,7 @@ kde = ["dep:wayland-protocols-plasma"]
 viet-ime-edit-strategy = { path = "../edit-strategy" }
 viet-ime-focus = { path = "../focus" }
 viet-ime-keymap = { workspace = true }
+viet-ime-key-emitter = { workspace = true }
 
 wayland-client = { workspace = true }
 wayland-backend = { workspace = true }

@@ -30,18 +30,25 @@ impl ShadowBuffer {
         self.text.push_str(text);
     }
 
-    /// Pop `n` chars from the end of the shadow. Returns the number of UTF-8
-    /// bytes removed — that is the value to pass as `before_length` in
-    /// `delete_surrounding_text`.
-    pub fn pop_chars(&mut self, n: usize) -> u32 {
+    /// Pop `n` chars from the end of the shadow. Returns `(bytes, chars)`
+    /// — the byte count is what wlroots v2/v3 IM (and most v3 clients on
+    /// KWin) want for `delete_surrounding_text(before_length)`; the char
+    /// count is what firefox specifically wants on its KWin v1↔v3 path
+    /// (see `force_chars_delete_apps` config). `chars` may be less than
+    /// the requested `n` if the shadow runs out.
+    pub fn pop_chars(&mut self, n: usize) -> (u32, u32) {
         let mut byte_count: u32 = 0;
+        let mut char_count: u32 = 0;
         for _ in 0..n {
             match self.text.pop() {
-                Some(ch) => byte_count += ch.len_utf8() as u32,
+                Some(ch) => {
+                    byte_count += ch.len_utf8() as u32;
+                    char_count += 1;
+                }
                 None => break,
             }
         }
-        byte_count
+        (byte_count, char_count)
     }
 
     pub fn clear(&mut self) {
@@ -103,8 +110,7 @@ mod tests {
     fn pop_ascii_char() {
         let mut buf = ShadowBuffer::new();
         buf.append("a");
-        let bytes = buf.pop_chars(1);
-        assert_eq!(bytes, 1);
+        assert_eq!(buf.pop_chars(1), (1, 1));
         assert_eq!(buf.text(), "");
     }
 
@@ -112,8 +118,7 @@ mod tests {
     fn pop_multibyte_char() {
         let mut buf = ShadowBuffer::new();
         buf.append("â"); // U+00E2, 2 bytes in UTF-8
-        let bytes = buf.pop_chars(1);
-        assert_eq!(bytes, 2);
+        assert_eq!(buf.pop_chars(1), (2, 1));
         assert_eq!(buf.text(), "");
     }
 
@@ -121,8 +126,7 @@ mod tests {
     fn pop_three_byte_char() {
         let mut buf = ShadowBuffer::new();
         buf.append("ầ"); // U+1EA7, 3 bytes in UTF-8
-        let bytes = buf.pop_chars(1);
-        assert_eq!(bytes, 3);
+        assert_eq!(buf.pop_chars(1), (3, 1));
         assert_eq!(buf.text(), "");
     }
 
@@ -130,8 +134,7 @@ mod tests {
     fn pop_partial_mixed() {
         let mut buf = ShadowBuffer::new();
         buf.append("trâ"); // t=1, r=1, â=2 → total 4 bytes; pop 1 char = 2 bytes
-        let bytes = buf.pop_chars(1);
-        assert_eq!(bytes, 2);
+        assert_eq!(buf.pop_chars(1), (2, 1));
         assert_eq!(buf.text(), "tr");
     }
 
@@ -139,8 +142,7 @@ mod tests {
     fn pop_more_than_available() {
         let mut buf = ShadowBuffer::new();
         buf.append("a");
-        let bytes = buf.pop_chars(5); // only 1 available
-        assert_eq!(bytes, 1);
+        assert_eq!(buf.pop_chars(5), (1, 1)); // only 1 available
         assert_eq!(buf.text(), "");
     }
 

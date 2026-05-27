@@ -84,7 +84,19 @@ impl ModifierState {
 /// request or one uinput emit. The order matters and is fixed by Strategy.
 pub trait OutputSink {
     // Tier 1
-    fn delete_surrounding_text(&mut self, before: u32, after: u32);
+    /// Delete text around the cursor. `before_bytes`/`after_bytes` are
+    /// UTF-8 byte counts (what wlroots v2/v3 IM and all spec-compliant
+    /// v3 clients want); `before_chars`/`after_chars` are Unicode scalar
+    /// counts (what firefox's v3 client wants on its KWin v1↔v3 path —
+    /// see `force_chars_delete_apps` config). The sink picks whichever
+    /// unit its backend + the per-window app match dictates.
+    fn delete_surrounding_text(
+        &mut self,
+        before_bytes: u32,
+        before_chars: u32,
+        after_bytes: u32,
+        after_chars: u32,
+    );
     // All tiers
     fn commit_string(&mut self, text: &str);
     fn commit(&mut self, serial: u32);
@@ -97,6 +109,21 @@ pub trait OutputSink {
     /// Vietnamese keymap. Returns `false` if `c` isn't in the keymap
     /// inventory (caller should fall back).
     fn vk_commit_char(&mut self, time: u32, c: char) -> bool;
+
+    /// Emit `text` as a sequence of `(press, release)` keysym pairs.
+    /// Only implemented on V1Kde via `zwp_input_method_context_v1::keysym`,
+    /// which KWin synthesises into real `wl_keyboard.key` events (using a
+    /// temporary keymap with `unmappedKeyCode=247` for Unicode keysyms
+    /// that don't exist in the system layout). This is the only path that
+    /// delivers Vietnamese precomposed chars to **terminal** clients on
+    /// KWin: terminals don't honor `commit_string` (text-input-v3 →
+    /// editable widget) but do honor `wl_keyboard.key` (→ PTY UTF-8).
+    ///
+    /// Returns `true` if emitted; `false` if the backend has no keysym
+    /// path (caller falls back to `commit_string` + `commit`).
+    fn commit_via_keysym(&mut self, _serial: u32, _time: u32, _text: &str) -> bool {
+        false
+    }
 }
 
 /// Per-window edit state. The daemon owns one `Strategy` per
@@ -187,7 +214,7 @@ mod tests {
 
     #[derive(Debug, PartialEq)]
     enum Call {
-        DeleteSurroundingText(u32, u32),
+        DeleteSurroundingText(u32, u32, u32, u32),
         CommitString(String),
         Commit(u32),
         VkKey(u32, u32, KeyState),
@@ -197,8 +224,19 @@ mod tests {
     }
 
     impl OutputSink for MockSink {
-        fn delete_surrounding_text(&mut self, before: u32, after: u32) {
-            self.calls.push(Call::DeleteSurroundingText(before, after));
+        fn delete_surrounding_text(
+            &mut self,
+            before_bytes: u32,
+            before_chars: u32,
+            after_bytes: u32,
+            after_chars: u32,
+        ) {
+            self.calls.push(Call::DeleteSurroundingText(
+                before_bytes,
+                before_chars,
+                after_bytes,
+                after_chars,
+            ));
         }
         fn commit_string(&mut self, text: &str) {
             self.calls.push(Call::CommitString(text.to_owned()));
@@ -230,7 +268,7 @@ mod tests {
         let mut sink = MockSink::default();
         s.apply(1, "â", 1, 0, &mut sink);
         assert_eq!(sink.calls, vec![
-            Call::DeleteSurroundingText(1, 0), // "a" = 1 byte
+            Call::DeleteSurroundingText(1, 1, 0, 0), // "a" = 1 byte = 1 char
             Call::CommitString("â".to_owned()),
             Call::Commit(1),
         ]);
@@ -239,12 +277,12 @@ mod tests {
 
     #[test]
     fn tier1_multibyte_delete() {
-        // shadow = "â" (2 bytes), pop 1 char → delete 2 bytes, commit "ầ"
+        // shadow = "â" (2 bytes, 1 char), pop 1 char → delete 2 bytes / 1 char.
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("â");
         let mut sink = MockSink::default();
         s.apply(1, "ầ", 1, 0, &mut sink);
-        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 0));
+        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 1, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("ầ".to_owned()));
         assert_eq!(s.shadow.text(), "ầ");
     }
@@ -254,12 +292,12 @@ mod tests {
         // Retroactive editing scenario from docs/protocol-behavior.md:
         // shadow seeded with "phơ" after feed_context + one keypress.
         // Engine returns bs=1 (the "ơ"), commit="ở".
-        // "ph" = 2 bytes, "ơ" = 2 bytes, pop 1 char (ơ) → before_bytes=2.
+        // "ph" = 2 bytes, "ơ" = 2 bytes, pop 1 char (ơ) → (2 bytes, 1 char).
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("phơ");
         let mut sink = MockSink::default();
         s.apply(1, "ở", 1, 0, &mut sink);
-        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 0));
+        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 1, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("ở".to_owned()));
         assert_eq!(s.shadow.text(), "phở");
     }
@@ -267,12 +305,12 @@ mod tests {
     #[test]
     fn tier1_multi_char_delete() {
         // shadow = "tieê", apply bs=4 → pops 4 chars
-        // t=1, i=1, e=1, ê=2 → total 5 bytes
+        // t=1, i=1, e=1, ê=2 → total 5 bytes / 4 chars
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("tieê");
         let mut sink = MockSink::default();
         s.apply(4, "tiến", 1, 0, &mut sink);
-        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(5, 0));
+        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(5, 4, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("tiến".to_owned()));
     }
 
@@ -455,20 +493,20 @@ mod tests {
         // Shadow is synced to compositor's text[..cursor] — that's how
         // Tier 1 gets correct byte counts for delete_surrounding_text.
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
-        s.on_surrounding_text("tra", 3);
-        assert_eq!(s.shadow.text(), "tra");
+        s.on_surrounding_text("cha", 3);
+        assert_eq!(s.shadow.text(), "cha");
     }
 
     #[test]
     fn tier1_uses_surrounding_text_bytes() {
-        // Daemon receives surrounding_text "trâ" cursor=4 from compositor.
-        // Engine returns bs=1 commit="ầ". Tier 1 should delete the â (2 bytes)
-        // and commit "ầ".
+        // Daemon receives surrounding_text "châ" cursor=4 from compositor.
+        // Engine returns bs=1 commit="ầ". Tier 1 should delete the â
+        // (2 bytes / 1 char) and commit "ầ".
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
-        s.on_surrounding_text("trâ", 4); // "trâ" = 4 bytes
+        s.on_surrounding_text("châ", 4); // "châ" = 4 bytes
         let mut sink = MockSink::default();
         s.apply(1, "ầ", 1, 0, &mut sink);
-        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 0));
+        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 1, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("ầ".to_owned()));
     }
 

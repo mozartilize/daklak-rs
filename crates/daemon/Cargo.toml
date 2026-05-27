@@ -11,6 +11,7 @@ path = "src/main.rs"
 [features]
 default = ["wayland"]
 wayland = []
+kde = ["viet-ime-wayland-adapter/kde"]
 
 [dependencies]
 viet-ime-engine = { path = "../engine" }
@@ -19,6 +20,7 @@ viet-ime-focus = { path = "../focus" }
 viet-ime-keymap = { workspace = true }
 viet-ime-wayland-adapter = { path = "../wayland-adapter" }
 viet-ime-evdev-adapter = { path = "../evdev-adapter" }
+viet-ime-key-emitter = { workspace = true }
 
 tokio = { workspace = true }
 tracing = { workspace = true }

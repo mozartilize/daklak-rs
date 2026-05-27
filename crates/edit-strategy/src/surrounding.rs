@@ -3,9 +3,11 @@ use crate::{OutputSink, ShadowBuffer};
 /// Execute a delete+commit via `delete_surrounding_text` + `commit_string`
 /// (Tier 1 — BackspaceMethod::SurroundingText).
 ///
-/// Byte accounting: `delete_surrounding_text` takes bytes, not char counts
-/// (zwp-input-method-unstable-v2.xml:262-281). `shadow.pop_chars(n)` returns
-/// the UTF-8 byte count of the chars removed — that is what we pass.
+/// Pass both byte and char counts: per the v2/v3 spec
+/// (zwp-input-method-unstable-v2.xml:262-281) `before_length` is bytes,
+/// but firefox's v3 client on the KWin v1↔v3 path interprets it as
+/// chars. The sink picks the right unit based on
+/// `force_chars_delete_apps`.
 pub fn apply(
     shadow: &mut ShadowBuffer,
     backspaces: usize,
@@ -13,8 +15,8 @@ pub fn apply(
     serial: u32,
     sink: &mut impl OutputSink,
 ) {
-    let before_bytes = shadow.pop_chars(backspaces);
-    sink.delete_surrounding_text(before_bytes, 0);
+    let (before_bytes, before_chars) = shadow.pop_chars(backspaces);
+    sink.delete_surrounding_text(before_bytes, before_chars, 0, 0);
     sink.commit_string(commit);
     sink.commit(serial);
     shadow.append(commit);

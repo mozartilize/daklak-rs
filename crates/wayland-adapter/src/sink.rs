@@ -1,34 +1,46 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use viet_ime_edit_strategy::uinput_device::UinputDevice;
 use viet_ime_edit_strategy::{KeyState, OutputSink};
+use viet_ime_key_emitter::KeyEmitter;
 
 use wayland_protocols::wp::input_method::zv1::client::zwp_input_method_context_v1::ZwpInputMethodContextV1;
-use wayland_protocols_misc::{
-    zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2,
-    zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
-};
-use viet_ime_edit_strategy::uinput_device::UinputDevice;
+use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2;
 
-/// Which set of Wayland proxies to use for text-commit + key-emission.
-/// V2 = wlroots path (separate im + vk), V1 = KWin/Mutter path (single context).
-pub(crate) enum SinkTarget<'a> {
+/// Backend selection for the text-input-v3-shaped operations (the ones
+/// `KeyEmitter` doesn't cover): `commit_string`, `commit(serial)`,
+/// `delete_surrounding_text`. Key emission is delegated to `dyn KeyEmitter`.
+pub(crate) enum TextOpsTarget<'a> {
     V2 {
         im: &'a ZwpInputMethodV2,
-        vk: &'a ZwpVirtualKeyboardV1,
     },
     V1 {
         ctx: &'a ZwpInputMethodContextV1,
+        serial: u32,
     },
 }
 
 /// Bridges `edit_strategy::OutputSink` to live Wayland proxy calls.
 ///
 /// Constructed via `AdapterCtx::with_sink` — borrows proxy references from
-/// `AdapterState`. The `target` field selects between v2 (wlroots) and v1
-/// (KWin) backend.
+/// `AdapterState`.
+///
+/// - `text_ops` selects v2 (wlroots) vs v1 (KWin) for text-input-v3-shaped
+///   events (`commit_string`, `delete_surrounding_text`, `commit(serial)`).
+/// - `forward_emitter` emits **standard keycodes** against the
+///   compositor's existing keymap. Drives `vk_key` (Tier 2 BS, nav) and
+///   `forward_press` (user-typed letters daklak passes through).
+///   `vk_v1` on KWin / `vk_v2` everywhere else.
+/// - `synth_keymap_emitter` emits **daklak's synthesised keymap slots**
+///   (Vietnamese precomposed chars at evdev kc ≤ 191). Drives
+///   `vk_commit_char` (Tier 4 VkOnly). Only `vk_v2` qualifies — v1 has
+///   no `vk_commit_char` parity.
+///   `None` on backends where Tier 4 is unsupported (KWin v1).
 pub struct AdapterSink<'a> {
-    pub(crate) target: SinkTarget<'a>,
+    pub(crate) text_ops: TextOpsTarget<'a>,
+    pub(crate) forward_emitter: &'a mut dyn KeyEmitter,
+    pub(crate) synth_keymap_emitter: Option<&'a mut dyn KeyEmitter>,
     pub(crate) uinput: Option<&'a mut UinputDevice>,
     /// Queue daklak's own uinput emissions go into so the grab handler can
     /// match and drop their round-trips. AdapterState owns it.
@@ -43,7 +55,6 @@ pub struct AdapterSink<'a> {
     /// `on_modifiers` as a TTL safety net (force-reset the counter if no
     /// echo arrives within 50ms, in case the compositor coalesced events).
     pub(crate) synthetic_mods_emitted_at: &'a mut Option<Instant>,
-    pub(crate) serial: u32,
     /// Snapshot of the user's physical modifier state at the time of the
     /// daemon action. `vk_commit_char` may temporarily override these to
     /// address xkb level 2/3/4 of the daklak custom keymap, then restores.
@@ -58,16 +69,40 @@ pub struct AdapterSink<'a> {
     /// release for that keycode before the normal press/release pair,
     /// transitioning X's state to UP first.
     pub(crate) held_user_kc: Option<u32>,
+    /// Per-window override: when true, the V1Kde `delete_surrounding_text`
+    /// emits a CHAR count rather than the spec-compliant byte count.
+    /// Set from `WindowState::chars_for_delete` (which the daemon
+    /// populates from `force_chars_delete_apps` at activate). Required
+    /// for firefox's broken v3 path (` ơr`→`ở`); other v3 clients honor
+    /// bytes per spec.
+    pub(crate) chars_for_delete: bool,
+    /// Wayland connection — used by `commit_via_keysym` to flush
+    /// between per-char keysym emissions on V1Kde, breaking the
+    /// foot/KWin xkb-keymap recompile race that drops the trailing
+    /// char of a multi-char commit (`việc`→`việ`).
+    pub(crate) conn: Option<&'a wayland_client::Connection>,
 }
 
 impl OutputSink for AdapterSink<'_> {
-    fn delete_surrounding_text(&mut self, before: u32, after: u32) {
-        match &self.target {
-            SinkTarget::V2 { im, .. } => im.delete_surrounding_text(before, after),
-            // v1 delete_surrounding_text takes (index: i32, length: u32).
-            // index is relative to cursor (negative = before cursor),
-            // length is total bytes to delete.
-            SinkTarget::V1 { ctx } => {
+    fn delete_surrounding_text(
+        &mut self,
+        before_bytes: u32,
+        before_chars: u32,
+        after_bytes: u32,
+        after_chars: u32,
+    ) {
+        match &self.text_ops {
+            // v2/wlroots: spec is bytes.
+            TextOpsTarget::V2 { im } => im.delete_surrounding_text(before_bytes, after_bytes),
+            // v1: spec is bytes (text-input-unstable-v1.xml), but
+            // firefox's v3 client on KWin's bridge expects chars —
+            // gated per-window via chars_for_delete.
+            TextOpsTarget::V1 { ctx, .. } => {
+                let (before, after) = if self.chars_for_delete {
+                    (before_chars, after_chars)
+                } else {
+                    (before_bytes, after_bytes)
+                };
                 let index = -(before as i32);
                 let length = before + after;
                 ctx.delete_surrounding_text(index, length);
@@ -76,17 +111,17 @@ impl OutputSink for AdapterSink<'_> {
     }
 
     fn commit_string(&mut self, text: &str) {
-        match &self.target {
-            SinkTarget::V2 { im, .. } => im.commit_string(text.to_owned()),
-            SinkTarget::V1 { ctx } => ctx.commit_string(self.serial, text.to_owned()),
+        match &self.text_ops {
+            TextOpsTarget::V2 { im } => im.commit_string(text.to_owned()),
+            TextOpsTarget::V1 { ctx, serial } => ctx.commit_string(*serial, text.to_owned()),
         }
     }
 
     fn commit(&mut self, serial: u32) {
-        match &self.target {
-            SinkTarget::V2 { im, .. } => im.commit(serial),
+        match &self.text_ops {
+            TextOpsTarget::V2 { im } => im.commit(serial),
             // v1 has no batching — commit is a no-op.
-            SinkTarget::V1 { .. } => {}
+            TextOpsTarget::V1 { .. } => {}
         }
     }
 
@@ -95,19 +130,16 @@ impl OutputSink for AdapterSink<'_> {
             KeyState::Pressed => 1,
             KeyState::Released => 0,
         };
-        match &self.target {
-            SinkTarget::V2 { vk, .. } => vk.key(time, key_code, value),
-            SinkTarget::V1 { ctx } => ctx.key(self.serial, time, key_code, value),
-        }
+        // Standard keycode (BS / nav / forward) → forward_emitter.
+        self.forward_emitter.emit_key(time, key_code, value);
     }
 
     fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        match &self.target {
-            SinkTarget::V2 { vk, .. } => vk.modifiers(depressed, latched, locked, group),
-            SinkTarget::V1 { ctx } => {
-                ctx.modifiers(self.serial, depressed, latched, locked, group)
-            }
-        }
+        // Modifier echo around forwards / Tier 3 mod-guard → forward_emitter.
+        // Tier 4's modifier dance runs inside emit_char on synth_keymap_emitter
+        // and is wired directly there.
+        self.forward_emitter
+            .emit_modifiers(depressed, latched, locked, group);
     }
 
     fn uinput_key(&mut self, key_code: u16, value: i32) {
@@ -125,24 +157,70 @@ impl OutputSink for AdapterSink<'_> {
     }
 
     fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
-        match &self.target {
-            SinkTarget::V2 { vk, .. } => crate::keymap::emit_char(
-                vk,
-                self.synthetic_mods_pending,
-                self.synthetic_mods_emitted_at,
-                self.raw_mods,
-                self.held_user_kc,
-                time,
-                c,
-            ),
-            // VkOnly (Tier 4) is gated off on v1 (KWin). This path is
-            // unreachable during normal operation — return false so the
-            // caller falls back to commit_string.
-            SinkTarget::V1 { .. } => {
-                tracing::trace!("vk_commit_char called on v1 (unexpected — VkOnly disabled on KWin)");
-                false
+        // Tier 4 (VkOnly) needs daklak's synthesised keymap. Only the
+        // synth_keymap_emitter knows how to drive it — KWin v1 leaves
+        // this slot `None` and the caller falls back to `commit_string`.
+        let Some(emitter) = self.synth_keymap_emitter.as_deref_mut() else {
+            tracing::trace!(
+                "vk_commit_char: no synth_keymap_emitter available (Tier 4 unsupported on this backend)"
+            );
+            return false;
+        };
+        viet_ime_key_emitter::emit_char(
+            emitter,
+            self.synthetic_mods_pending,
+            self.synthetic_mods_emitted_at,
+            self.raw_mods,
+            self.held_user_kc,
+            time,
+            c,
+        )
+    }
+
+    fn commit_via_keysym(&mut self, serial: u32, time: u32, text: &str) -> bool {
+        // Only V1Kde implements this; V2 has no zwp_input_method_v2::keysym
+        // equivalent (it has commit_string + commit batching).
+        let TextOpsTarget::V1 { ctx, .. } = &self.text_ops else {
+            return false;
+        };
+        // wl_keyboard_key_state: 1=Pressed, 0=Released.
+        const PRESSED: u32 = 1;
+        const RELEASED: u32 = 0;
+        let chars: Vec<char> = text.chars().collect();
+        let multichar = chars.len() > 1;
+        for c in chars.iter() {
+            let c = *c;
+            let sym = xkbcommon::xkb::utf32_to_keysym(c as u32);
+            // utf32_to_keysym returns KEY_NoSymbol (0) when out of range —
+            // bail to commit_string for the whole string.
+            if sym.raw() == 0 {
+                tracing::debug!(c = %c, "commit_via_keysym: no keysym for char, falling back");
+                return false;
+            }
+            // Modifiers=0 — daklak emits at the raw unicode codepoint;
+            // KWin's forwardKeySym handles unmapped syms via custom keymap
+            // (kc 247) regardless of modifier state.
+            ctx.keysym(serial, time, sym.raw(), PRESSED, 0);
+            ctx.keysym(serial, time, sym.raw(), RELEASED, 0);
+            tracing::trace!(c = %c, sym = sym.raw(), "keysym emit");
+
+            // Per-keysym barrier (only when commit is multi-char):
+            // KWin's `forwardKeySym` installs a per-sym temp keymap
+            // (kc 247). When two keysyms fire within microseconds,
+            // foot's xkb recompile pipeline collapses the second
+            // install — the trailing char silently drops
+            // (`việc`→`việ`, `tiếng `→`tiến`). Flush + sleep AFTER
+            // EVERY keysym (not just between) so each char's keymap
+            // dance fully settles at foot before the next event
+            // (whether daklak's next keysym, or the user's next
+            // forwarded key like space) arrives.
+            if multichar {
+                if let Some(conn) = self.conn {
+                    let _ = conn.flush();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
             }
         }
+        true
     }
 }
-

@@ -38,12 +38,18 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV1, ()> for WaylandAdapter<H> {
                     kbd_id = ?keyboard.id(),
                     "im_v1: keyboard grab created"
                 );
-                // Send modifier map (matching fcitx5 — Shift, Control, Mod1, Mod4)
-                ctx.modifiers_map(
-                    "Shift\0Control\0Mod1\0Mod4".as_bytes().to_vec(),
-                );
+                // Send modifier map (matching fcitx5 — Shift, Control, Mod1, Mod4).
+                // Each name is NUL-terminated in the array; fcitx5 uses
+                // `sizeof("Shift\0Control\0Mod1\0Mod4")` = 24 (the C string's
+                // implicit trailing `\0`). Rust string literals drop the
+                // trailing NUL via `as_bytes()` — append it explicitly so
+                // KWin parses all four names. Without it KWin's v1
+                // implementation silently leaves the grab inactive.
+                let mod_map = b"Shift\0Control\0Mod1\0Mod4\0";
+                ctx.modifiers_map(mod_map.to_vec());
                 tracing::trace!(
                     ctx_id = ?ctx.id(),
+                    bytes = mod_map.len(),
                     "im_v1: modifiers_map sent"
                 );
                 state.state.im_ctx_v1 = Some(ctx);
@@ -66,8 +72,8 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV1, ()> for WaylandAdapter<H> {
                 // Deactivate has no trailing CommitState — fire immediately.
                 state.apply_done_frame();
             }
-            _ => {
-                tracing::trace!("im_v1: unhandled event");
+            other => {
+                tracing::warn!(?other, "im_v1: unhandled ZwpInputMethodV1 event");
             }
         }
     }
@@ -107,12 +113,25 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodContextV1, ()> for WaylandAdapter
             }
 
             zwp_input_method_context_v1::Event::ContentType { hint: _, purpose } => {
+                // text-input-unstable-v1 purpose enum differs from
+                // text-input-v3: v3 added `pin=9`, shifting everything
+                // 9+ by one. `edit-strategy::PURPOSE_TERMINAL=13` is v3
+                // numbering. Translate at this boundary so KWin's v1
+                // value 12 (=terminal in v1) becomes 13 (=terminal in v3).
+                //
+                //   v1 0..=8  → v3 0..=8   (normal/alpha/.../password)
+                //   v1 9 date → v3 10 date
+                //   v1 10 time → v3 11 time
+                //   v1 11 datetime → v3 12 datetime
+                //   v1 12 terminal → v3 13 terminal
+                let purpose_v3 = if purpose >= 9 { purpose + 1 } else { purpose };
                 tracing::trace!(
                     ctx_id = ?proxy.id(),
-                    purpose,
+                    purpose_v1 = purpose,
+                    purpose_v3,
                     "im_v1: ContentType"
                 );
-                state.state.pending_frame.purpose = purpose;
+                state.state.pending_frame.purpose = purpose_v3;
                 state.state.pending_commit = true;
             }
 
@@ -136,9 +155,10 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodContextV1, ()> for WaylandAdapter
 
             zwp_input_method_context_v1::Event::InvokeAction { .. } => {}
 
-            _ => {
-                tracing::trace!(
+            other => {
+                tracing::warn!(
                     ctx_id = ?proxy.id(),
+                    ?other,
                     "im_v1: unhandled context event"
                 );
             }
@@ -214,7 +234,7 @@ impl<H: AdapterHandler> Dispatch<WlKeyboard, ()> for WaylandAdapter<H> {
                 group,
                 ..
             } => {
-                tracing::trace!(
+                tracing::debug!(
                     kbd_id = ?keyboard.id(),
                     mods_depressed = format!("{:#x}", mods_depressed),
                     "v1: wl_keyboard modifiers"
@@ -237,7 +257,7 @@ impl<H: AdapterHandler> Dispatch<WlKeyboard, ()> for WaylandAdapter<H> {
             }
 
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
-                tracing::trace!(
+                tracing::debug!(
                     kbd_id = ?keyboard.id(),
                     rate,
                     delay,
@@ -245,9 +265,10 @@ impl<H: AdapterHandler> Dispatch<WlKeyboard, ()> for WaylandAdapter<H> {
                 );
             }
 
-            _ => {
-                tracing::trace!(
+            other => {
+                tracing::warn!(
                     kbd_id = ?keyboard.id(),
+                    ?other,
                     "v1: wl_keyboard UNHANDLED event"
                 );
             }

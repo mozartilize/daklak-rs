@@ -67,39 +67,6 @@ pub struct Daemon {
     /// capability probe so known-broken-on-ForwardKey terminals can
     /// auto-escalate. None outside an active session.
     pub focused_app_id: Option<String>,
-
-    /// Last printable user keystroke fed to `handle_char`. Tracks user
-    /// intent independently of the shadow buffer — the shadow can drop
-    /// just-forwarded chars when a stale surrounding_text echo arrives
-    /// before the compositor commits the new state. Used to gate the
-    /// word-boundary seed: skip seeding when the previous keystroke was
-    /// a separator (whitespace/punct/etc.), because a new word is
-    /// starting and seeding from the prior word would poison the
-    /// engine state.
-    pub last_input_char: Option<char>,
-
-    // ── Surrounding-text diff tracking (v1 IM / KWin path) ──────────────
-    /// Previous surrounding_text from the last on_done_frame. Used to
-    /// detect character insertions by diff, so we can drive the engine
-    /// without intercepting physical key events.
-    pub prev_text: String,
-    /// Byte cursor position matching prev_text.
-    pub prev_cursor: u32,
-    /// v1/KWin path: after daklak emits delete+commit, kate sends a flurry
-    /// of intermediate SurroundingText echoes (pre-delete, post-delete,
-    /// post-commit). Time-based gating dropped fast user keystrokes that
-    /// arrived in that window. Instead, track the EXPECTED post-apply
-    /// (text, cursor) — skip frames until that target is matched (echo
-    /// resync) OR text grows past the target (user typed ahead, resync to
-    /// target and process the user diff against it).
-    pub pending_apply_target: Option<(String, u32)>,
-    /// v1/KWin path: original Telex chars typed in the current word
-    /// (ASCII). Reset on word boundary. Used to seed the engine on every
-    /// keystroke so multi-char tone rules see the full raw context
-    /// (engine forgets internal state after returning a transform, so
-    /// `tieengs`'s sắc tone only fires when fed `tieeng` not `tiêng`).
-    pub raw_word: String,
-
 }
 
 impl Daemon {
@@ -139,11 +106,6 @@ impl Daemon {
             last_action_at: Instant::now() - Duration::from_secs(60),
             terminal_override,
             focused_app_id: None,
-            last_input_char: None,
-            prev_text: String::new(),
-            prev_cursor: 0,
-            pending_apply_target: None,
-            raw_word: String::new(),
         }
     }
 
@@ -175,7 +137,6 @@ impl AdapterHandler for Daemon {
             self.synthetic_active = false;
             self.window = None;
             self.focused_app_id = None;
-            self.last_input_char = None;
         }
 
         let activate = frame.activate && !self.current_active;
@@ -186,9 +147,6 @@ impl AdapterHandler for Daemon {
             tracing::info!(app_id = ?app_id, "activate");
             self.current_active = true;
             self.focused_app_id = app_id;
-            self.last_input_char = None;
-            self.raw_word.clear();
-            self.pending_apply_target = None;
 
             let mut method = self.detect_capability(frame);
             // VkOnly (Tier 4) requires a separate vk keyboard, which v1
@@ -198,7 +156,24 @@ impl AdapterHandler for Daemon {
                 method = BackspaceMethod::UInput;
             }
             tracing::info!("capability detected: {:?}", method);
-            let ws = WindowState::new(self.config.method.to_engine(), method);
+            let mut ws = WindowState::new(self.config.method.to_engine(), method);
+            ws.chars_for_delete = self
+                .focused_app_id
+                .as_deref()
+                .map(|id| {
+                    let lower = id.trim().to_ascii_lowercase();
+                    self.config
+                        .force_chars_delete_apps
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(&lower))
+                })
+                .unwrap_or(false);
+            if ws.chars_for_delete {
+                tracing::info!(
+                    app_id = ?self.focused_app_id,
+                    "force_chars_delete_apps match → v1 delete_surrounding_text will use char count"
+                );
+            }
             self.window = Some(ws);
             if let Some(w) = self.window.as_mut() {
                 w.strategy.set_modifiers(self.modifiers);
@@ -208,8 +183,12 @@ impl AdapterHandler for Daemon {
             self.current_active = false;
             self.window = None;
             self.focused_app_id = None;
-            self.last_input_char = None;
         }
+
+        // After deactivate, window is None — nothing more to do.
+        let Some(w) = self.window.as_mut() else {
+            return;
+        };
 
         // Re-sync shadow on every surrounding_text frame. Re-seed engine
         // ONLY on activate or genuine cursor jump (user clicked elsewhere).
@@ -222,10 +201,10 @@ impl AdapterHandler for Daemon {
                 text = %text,
                 text_len = text.len(),
                 cursor = *cursor,
-                prev_text = %self.prev_text,
-                prev_cursor = self.prev_cursor,
-                raw_word = %self.raw_word,
-                pending = self.pending_apply_target.is_some(),
+                prev_text = %w.prev_text,
+                prev_cursor = w.prev_cursor,
+                raw_word = %w.raw_word,
+                pending = w.pending_apply_target.is_some(),
                 "on_done_frame surrounding_text"
             );
 
@@ -234,21 +213,21 @@ impl AdapterHandler for Daemon {
             // intermediate SurroundingText echoes. Skip them until the
             // expected post-apply text appears, OR text overshoots the
             // target (user typed past it — resync and process the diff).
-            if let Some((target_text, target_cursor)) = self.pending_apply_target.clone() {
+            if let Some((target_text, target_cursor)) = w.pending_apply_target.clone() {
                 if text == &target_text && *cursor == target_cursor {
                     // Echo caught up. Resync prev_*, clear pending, skip
                     // this frame so no diff fires on the echo itself.
-                    self.prev_text = target_text;
-                    self.prev_cursor = target_cursor;
-                    self.pending_apply_target = None;
+                    w.prev_text = target_text;
+                    w.prev_cursor = target_cursor;
+                    w.pending_apply_target = None;
                     return;
                 } else if text.len() > target_text.len() {
                     // User typed past the target before the echo caught up.
                     // Resync prev_* to the target and fall through — the
                     // diff below will correctly detect the user's char.
-                    self.prev_text = target_text;
-                    self.prev_cursor = target_cursor;
-                    self.pending_apply_target = None;
+                    w.prev_text = target_text;
+                    w.prev_cursor = target_cursor;
+                    w.pending_apply_target = None;
                 } else {
                     // Intermediate echo (e.g. post-delete, pre-commit). Skip.
                     return;
@@ -260,20 +239,20 @@ impl AdapterHandler for Daemon {
             // running through the diff/reseed logic again wipes raw_word
             // and burns engine context. Skip if nothing changed.
             if !activate && !deactivate
-                && text == &self.prev_text
-                && *cursor == self.prev_cursor
+                && text == &w.prev_text
+                && *cursor == w.prev_cursor
             {
                 return;
             }
 
             // Detect a 1-char insertion at the prior cursor (= keystroke).
             // Holds for end-of-text typing AND mid-text typing.
-            let prev_cur = self.prev_cursor as usize;
+            let prev_cur = w.prev_cursor as usize;
             let one_char_typed = !activate
                 && !deactivate
                 && detect_one_char_insertion(
-                    &self.prev_text,
-                    self.prev_cursor,
+                    &w.prev_text,
+                    w.prev_cursor,
                     text,
                     *cursor,
                 );
@@ -294,51 +273,43 @@ impl AdapterHandler for Daemon {
             } else {
                 None
             };
-            if let Some(w) = self.window.as_mut() {
-                w.strategy.on_surrounding_text(text, *cursor);
-                if should_reseed {
-                    w.engine.reset();
-                    if let Some(word) = &reseed_word {
-                        tracing::debug!(word, "re-seed engine (activate or cursor jump)");
-                        w.engine.feed_context(word);
-                    }
-                }
-            }
+            w.strategy.on_surrounding_text(text, *cursor);
             if should_reseed {
+                w.engine.reset();
+                if let Some(word) = &reseed_word {
+                    tracing::debug!(word, "re-seed engine (activate or cursor jump)");
+                    w.engine.feed_context(word);
+                }
                 if let Some(word) = reseed_word {
-                    self.raw_word = word;
+                    w.raw_word = word;
                 } else {
-                    self.raw_word.clear();
+                    w.raw_word.clear();
                 }
             }
 
-            // ── Surrounding-text diff: detect keystrokes from text changes ──
-            // v1 IM (KWin) does not deliver keyboard events through the grab
-            // (KWin 6.6.5 bug/design). Instead of intercepting evdev keys, we
-            // react to text changes: each SurroundingText update that grew by
-            // exactly 1 char at the cursor is a keystroke. Feed the char to
-            // the engine; if it produces a transformation, apply via
-            // delete_surrounding_text + commit_string.
-            //
-            // Echoes are handled by the pending_apply_target gate above —
-            // no time-based gating needed here.
-            // v2/wlroots delivers keys through the IM grab → `on_key_pressed`
-            // already drove the engine for this char. Running the diff path
-            // again would double-feed `raw_word` and re-reset the engine
-            // with a doubled prefix (gedit-on-sway regression: text_input_v3
-            // echoes SurroundingText AND the IM grab fires). Only v1/KWin
-            // needs the surrounding-text-diff path — KWin doesn't deliver
-            // keys through the grab.
-            let surrounding_diff_enabled = ctx.im_backend() == ImBackend::V1Kde;
+            // Surrounding-text diff path was a workaround under the
+            // assumption that v1 IM grab doesn't deliver keys (nested-kwin
+            // observation). On host KDE the grab delivers via
+            // dispatch_key_press, so both paths fire and engine
+            // double-processes each char. Grab is authoritative on every
+            // compositor that implements v1 IM correctly.
+            let surrounding_diff_enabled = false;
             if one_char_typed && surrounding_diff_enabled {
                 let suffix = &text[prev_cur..(*cursor as usize)];
                 if let Some(ch) = suffix.chars().next() {
                     tracing::trace!(
                         ch = %ch,
-                        prev = %self.prev_text,
+                        prev = %w.prev_text,
                         text = %text,
                         "surrounding diff: char inserted"
                     );
+                    // Compute the apply target while we still hold the
+                    // text/cursor refs; drop the window borrow before
+                    // calling self.handle_char_inner (it re-borrows).
+                    let cur = *cursor as usize;
+                    let text_owned = text.clone();
+                    // End the `w` borrow so handle_char_inner can re-borrow `self`.
+                    let _ = w;
                     // Pass `true`: shadow already includes `ch` (kate
                     // inserted it before we observed via SurroundingText).
                     let decision = self.handle_char_inner(0, ch, true);
@@ -365,9 +336,8 @@ impl AdapterHandler for Daemon {
                             // index of deletion start (cursor is in bytes
                             // per text-input spec, but bs_v1 is in chars,
                             // so we can't just subtract).
-                            let cur = *cursor as usize;
                             let del_start = {
-                                let prefix = &text[..cur];
+                                let prefix = &text_owned[..cur];
                                 let bytes_back: usize = prefix
                                     .chars()
                                     .rev()
@@ -377,14 +347,15 @@ impl AdapterHandler for Daemon {
                                 cur.saturating_sub(bytes_back)
                             };
                             let mut target = String::with_capacity(
-                                text.len() - (cur - del_start) + commit.len(),
+                                text_owned.len() - (cur - del_start) + commit.len(),
                             );
-                            target.push_str(&text[..del_start]);
+                            target.push_str(&text_owned[..del_start]);
                             target.push_str(&commit);
-                            target.push_str(&text[cur..]);
+                            target.push_str(&text_owned[cur..]);
                             let target_cursor = (del_start + commit.len()) as u32;
-                            self.pending_apply_target =
-                                Some((target, target_cursor));
+                            if let Some(w) = self.window.as_mut() {
+                                w.pending_apply_target = Some((target, target_cursor));
+                            }
                             let raw_mods = ctx.raw_mods();
                             self.apply_pending(
                                 ctx, 0,
@@ -415,13 +386,18 @@ impl AdapterHandler for Daemon {
                             // the character, nothing to send.
                         }
                     }
+                    if let Some(w) = self.window.as_mut() {
+                        w.prev_text = text_owned;
+                        w.prev_cursor = *cursor;
+                    }
+                    return;
                 }
             }
-            self.prev_text = text.clone();
-            self.prev_cursor = *cursor;
+            w.prev_text = text.clone();
+            w.prev_cursor = *cursor;
         } else if !activate && !deactivate {
-            self.prev_text.clear();
-            self.prev_cursor = 0;
+            w.prev_text.clear();
+            w.prev_cursor = 0;
         }
     }
 
@@ -443,7 +419,6 @@ impl AdapterHandler for Daemon {
             if let Some(w) = self.window.as_mut() {
                 w.full_reset();
             }
-            self.last_input_char = None;
             ctx.vk_key_press_unstamped(time, key);
             return KeyDecision::Consumed;
         }
@@ -453,7 +428,6 @@ impl AdapterHandler for Daemon {
             if let Some(w) = self.window.as_mut() {
                 w.full_reset();
             }
-            self.last_input_char = None;
             ctx.vk_key_press_unstamped(time, key);
             return KeyDecision::Consumed;
         }
@@ -491,7 +465,8 @@ impl AdapterHandler for Daemon {
         let serial = ctx.serial();
         if let Some(w) = self.window.as_mut() {
             tracing::debug!(method = ?w.method, backspaces, commit, "strategy.apply");
-            ctx.with_sink(raw_mods, held_user_kc, |sink| {
+            let chars_for_delete = w.chars_for_delete;
+            ctx.with_sink(raw_mods, held_user_kc, chars_for_delete, |sink| {
                 w.strategy.apply(backspaces, commit, serial, time, sink);
             });
         }
@@ -567,12 +542,14 @@ impl AdapterHandler for Daemon {
             self.synthetic_active = false;
             self.window = None;
             self.focused_app_id = None;
-            self.last_input_char = None;
         } else if !self.synthetic_active && matched {
             tracing::trace!("focus_changed skipped: already active via IM");
         }
     }
 
+    fn window_chars_for_delete(&self) -> Option<bool> {
+        self.window.as_ref().map(|w| w.chars_for_delete)
+    }
 }
 
 impl viet_ime_evdev_adapter::EvdevHandler for Daemon {
@@ -589,11 +566,12 @@ impl viet_ime_evdev_adapter::EvdevHandler for Daemon {
         self.synthetic_active = false;
         self.window = None;
         self.focused_app_id = None;
-        self.last_input_char = None;
     }
 
     fn clear_last_input_char(&mut self) {
-        self.last_input_char = None;
+        if let Some(w) = self.window.as_mut() {
+            w.last_input_char = None;
+        }
     }
 
     fn full_reset_window(&mut self) {
@@ -662,11 +640,14 @@ impl Daemon {
         ch: char,
         shadow_already_has_ch: bool,
     ) -> KeyDecision {
+        let Some(w) = self.window.as_mut() else {
+            return KeyDecision::ForwardRaw;
+        };
         let prev_was_separator = matches!(
-            self.last_input_char,
+            w.last_input_char,
             Some(c) if !c.is_ascii_alphabetic()
         );
-        self.last_input_char = Some(ch);
+        w.last_input_char = Some(ch);
 
         // v1/KWin path: maintain raw_word and use it as the engine seed on
         // EVERY keystroke. Engine forgets vowel-cluster context after
@@ -676,21 +657,19 @@ impl Daemon {
         if shadow_already_has_ch {
             // Word boundary: reset raw_word.
             if !ch.is_ascii_alphabetic() {
-                self.raw_word.clear();
+                w.raw_word.clear();
             }
-            if let Some(w) = self.window.as_mut() {
-                let prefix = self.raw_word.clone();
-                w.engine.reset();
-                if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphabetic()) {
-                    tracing::debug!(prefix, "seed engine from raw_word (v1 path)");
-                    w.engine.feed_context(&prefix);
-                }
+            let prefix = w.raw_word.clone();
+            w.engine.reset();
+            if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphabetic()) {
+                tracing::debug!(prefix, "seed engine from raw_word (v1 path)");
+                w.engine.feed_context(&prefix);
             }
             // Append `ch` AFTER seeding (engine's process_key adds it).
             if ch.is_ascii_alphabetic() {
-                self.raw_word.push(ch);
+                w.raw_word.push(ch);
             }
-        } else if let Some(w) = self.window.as_mut() {
+        } else {
             // v2/wlroots path: original shadow-based seed.
             if w.engine.at_word_beginning() && !prev_was_separator {
                 let shadow_text = w.strategy.shadow.text().to_owned();
@@ -701,10 +680,6 @@ impl Daemon {
                 }
             }
         }
-
-        let Some(w) = self.window.as_mut() else {
-            return KeyDecision::ForwardRaw;
-        };
 
         let r = w.engine.process_key(ch);
 
@@ -993,5 +968,98 @@ mod tests {
     #[test]
     fn wqr_punctuation_rejected() {
         assert!(!wqr("hello,"));
+    }
+
+    // ── Ctrl+BS / NAV reset: raw_word lives on Daemon, must be cleared
+    //    alongside WindowState. Bug is v1/KWin only — v2/wlroots path
+    //    (shadow_already_has_ch=false) never reads or writes raw_word.
+    mod raw_word_reset {
+        use super::super::Daemon;
+        use crate::config::Config;
+        use crate::window::WindowState;
+        use viet_ime_edit_strategy::BackspaceMethod;
+        use viet_ime_engine::InputMethod;
+        use viet_ime_evdev_adapter::EvdevHandler;
+
+        fn v1_daemon() -> Daemon {
+            let mut d = Daemon::new(Config::default());
+            d.current_active = true;
+            d.window = Some(WindowState::new(
+                InputMethod::Telex,
+                BackspaceMethod::SurroundingText,
+            ));
+            d
+        }
+
+        fn raw_word(d: &Daemon) -> &str {
+            d.window
+                .as_ref()
+                .map(|w| w.raw_word.as_str())
+                .unwrap_or("")
+        }
+
+        #[test]
+        fn v1_path_builds_raw_word_from_alpha_chars() {
+            let mut d = v1_daemon();
+            for ch in "xaxax".chars() {
+                d.handle_char_inner(0, ch, true);
+            }
+            assert_eq!(raw_word(&d), "xaxax");
+        }
+
+        #[test]
+        fn full_reset_window_clears_raw_word() {
+            let mut d = v1_daemon();
+            for ch in "xaxax".chars() {
+                d.handle_char_inner(0, ch, true);
+            }
+            assert_eq!(raw_word(&d), "xaxax");
+            d.full_reset_window();
+            assert_eq!(raw_word(&d), "", "full_reset_window must clear raw_word");
+        }
+
+        #[test]
+        fn next_alpha_after_reset_does_not_carry_stale_seed() {
+            // Repro of the gedit Ctrl+BS bug: type `xaxax`, simulate the
+            // word-delete reset path, type `x`. raw_word must be just "x".
+            let mut d = v1_daemon();
+            for ch in "xaxax".chars() {
+                d.handle_char_inner(0, ch, true);
+            }
+            d.full_reset_window();
+            d.handle_char_inner(0, 'x', true);
+            assert_eq!(
+                raw_word(&d),
+                "x",
+                "post-reset keystroke must not re-seed from deleted word"
+            );
+        }
+
+        #[test]
+        fn v2_path_never_touches_raw_word() {
+            // wlroots / v2: shadow_already_has_ch=false. raw_word remains
+            // untouched — bug is v1-specific.
+            let mut d = v1_daemon();
+            for ch in "xaxax".chars() {
+                d.handle_char_inner(0, ch, false);
+            }
+            assert_eq!(
+                raw_word(&d),
+                "",
+                "v2 path must not write raw_word — bug is v1-only"
+            );
+        }
+
+        #[test]
+        fn deactivate_drops_raw_word_via_window_drop() {
+            // raw_word lives on WindowState — when window = None, it dies
+            // with the window. No explicit clear needed in deactivate.
+            let mut d = v1_daemon();
+            for ch in "xaxax".chars() {
+                d.handle_char_inner(0, ch, true);
+            }
+            d.window = None;
+            assert_eq!(raw_word(&d), "");
+        }
     }
 }

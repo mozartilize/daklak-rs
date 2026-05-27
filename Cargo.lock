@@ -695,6 +695,7 @@ dependencies = [
  "viet-ime-engine",
  "viet-ime-evdev-adapter",
  "viet-ime-focus",
+ "viet-ime-key-emitter",
  "viet-ime-keymap",
  "viet-ime-wayland-adapter",
 ]
@@ -777,6 +778,7 @@ dependencies = [
  "tracing",
  "viet-ime-edit-strategy",
  "viet-ime-focus",
+ "viet-ime-key-emitter",
  "viet-ime-keymap",
  "wayland-backend",
  "wayland-client",

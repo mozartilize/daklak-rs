@@ -231,4 +231,27 @@ impl AdapterState {
             _ => false,
         }
     }
+
+    /// Forward-path key emit. Falls through to `zwp_virtual_keyboard_v1`
+    /// (v2) or `zwp_input_method_context_v1.key` (v1). Used by
+    /// `forward_press` / `dispatch_key_release` / `KeyDecision::ForwardRaw`.
+    ///
+    /// Tier 4 (VkOnly Vietnamese precomposed chars) does NOT route here;
+    /// it goes through `with_sink → synth_keymap_emitter` which is always
+    /// vk_v2.
+    pub fn emit_forward_key(&mut self, time: u32, key: u32, value: u32) {
+        let serial = self.serial;
+        match self.im_backend {
+            crate::ImBackend::V2Wlroots => {
+                if let Some(vk) = &self.vk {
+                    vk.key(time, key, value);
+                }
+            }
+            crate::ImBackend::V1Kde => {
+                if let Some(ctx) = &self.im_ctx_v1 {
+                    ctx.key(serial, time, key, value);
+                }
+            }
+        }
+    }
 }

@@ -142,6 +142,13 @@ pub trait AdapterHandler: 'static {
         is_xwayland: bool,
     );
 
+    /// Whether the active window wants v1 `delete_surrounding_text` to
+    /// emit chars (and the adapter to insert a small post-apply sleep so
+    /// the v1↔v3 bridge can flush before the next key). `None` if no
+    /// active window.
+    fn window_chars_for_delete(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// Context handed to handler callbacks. Borrows adapter state.
@@ -178,38 +185,14 @@ impl<'a> AdapterCtx<'a> {
     /// last_forwarded_key. Used by daemon when a key bypasses composition
     /// (no active window, xkb has no char for it, nav key, etc.).
     pub fn forward_press(&mut self, time: u32, key: u32) {
-        let serial = self.state.serial;
-        match self.state.im_backend {
-            ImBackend::V2Wlroots => {
-                if let Some(vk) = &self.state.vk {
-                    vk.key(time, key, 1);
-                }
-            }
-            ImBackend::V1Kde => {
-                if let Some(ctx) = &self.state.im_ctx_v1 {
-                    ctx.key(serial, time, key, 1);
-                }
-            }
-        }
+        self.state.emit_forward_key(time, key, 1);
         self.state.last_forwarded_key = Some((key, Instant::now()));
     }
 
     /// Forward a raw press WITHOUT stamping last_forwarded_key. Used by the
     /// modifier-shortcut path — those keys don't participate in Path A.
     pub fn vk_key_press_unstamped(&mut self, time: u32, key: u32) {
-        let serial = self.state.serial;
-        match self.state.im_backend {
-            ImBackend::V2Wlroots => {
-                if let Some(vk) = &self.state.vk {
-                    vk.key(time, key, 1);
-                }
-            }
-            ImBackend::V1Kde => {
-                if let Some(ctx) = &self.state.im_ctx_v1 {
-                    ctx.key(serial, time, key, 1);
-                }
-            }
-        }
+        self.state.emit_forward_key(time, key, 1);
     }
 
     /// Construct an AdapterSink bound to live adapter proxies + the supplied
@@ -220,12 +203,14 @@ impl<'a> AdapterCtx<'a> {
         &mut self,
         raw_mods: (u32, u32, u32, u32),
         held_user_kc: Option<u32>,
+        chars_for_delete: bool,
         f: F,
     ) where
         F: FnOnce(&mut AdapterSink<'_>),
     {
         let serial = self.state.serial;
-        let target = match self.state.im_backend {
+        let conn = self.state.conn.as_ref();
+        match self.state.im_backend {
             ImBackend::V2Wlroots => {
                 let im = match &self.state.im {
                     Some(x) => x,
@@ -235,27 +220,50 @@ impl<'a> AdapterCtx<'a> {
                     Some(x) => x,
                     None => return,
                 };
-                crate::sink::SinkTarget::V2 { im, vk }
+                // synth_keymap_emitter always points at vk_v2 — only it can
+                // drive daklak's uploaded keymap. forward_emitter is vk_v2.
+                let mut vk_forward = viet_ime_key_emitter::VkV2Emitter::new(vk);
+                let mut vk_synth = viet_ime_key_emitter::VkV2Emitter::new(vk);
+                let synth_dyn: &mut dyn viet_ime_key_emitter::KeyEmitter = &mut vk_synth;
+
+                let mut sink = AdapterSink {
+                    text_ops: crate::sink::TextOpsTarget::V2 { im },
+                    forward_emitter: &mut vk_forward,
+                    synth_keymap_emitter: Some(synth_dyn),
+                    uinput: self.state.uinput.as_mut(),
+                    pending_self_emits: &mut self.state.pending_self_emits,
+                    synthetic_mods_pending: &mut self.state.synthetic_mods_pending,
+                    synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
+                    raw_mods,
+                    held_user_kc,
+                    chars_for_delete,
+                    conn,
+                };
+                f(&mut sink);
             }
             ImBackend::V1Kde => {
                 let ctx = match &self.state.im_ctx_v1 {
                     Some(x) => x,
                     None => return,
                 };
-                crate::sink::SinkTarget::V1 { ctx }
+                // V1Kde: forward_emitter is VkV1Emitter (ctx.key).
+                let mut vk_forward = viet_ime_key_emitter::VkV1Emitter::new(ctx, serial);
+                let mut sink = AdapterSink {
+                    text_ops: crate::sink::TextOpsTarget::V1 { ctx, serial },
+                    forward_emitter: &mut vk_forward,
+                    synth_keymap_emitter: None,
+                    uinput: self.state.uinput.as_mut(),
+                    pending_self_emits: &mut self.state.pending_self_emits,
+                    synthetic_mods_pending: &mut self.state.synthetic_mods_pending,
+                    synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
+                    raw_mods,
+                    held_user_kc,
+                    chars_for_delete,
+                    conn,
+                };
+                f(&mut sink);
             }
-        };
-        let mut sink = AdapterSink {
-            target,
-            uinput: self.state.uinput.as_mut(),
-            pending_self_emits: &mut self.state.pending_self_emits,
-            synthetic_mods_pending: &mut self.state.synthetic_mods_pending,
-            synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
-            serial,
-            raw_mods,
-            held_user_kc,
-        };
-        f(&mut sink);
+        }
     }
 }
 
@@ -268,36 +276,22 @@ pub struct WaylandAdapter<H: AdapterHandler> {
 }
 
 impl<H: AdapterHandler> WaylandAdapter<H> {
-    fn vk_or_ctx_key(&self, time: u32, key: u32, value: u32) {
-        let serial = self.state.serial;
-        match self.state.im_backend {
-            ImBackend::V2Wlroots => {
-                if let Some(vk) = &self.state.vk {
-                    vk.key(time, key, value);
-                }
-            }
-            ImBackend::V1Kde => {
-                if let Some(ctx) = &self.state.im_ctx_v1 {
-                    ctx.key(serial, time, key, value);
-                }
-            }
-        }
-    }
-
     pub(crate) fn dispatch_key_release(&mut self, time: u32, key: u32) {
-        tracing::trace!(key, "dispatch_key_release: IM grab delivered release");
+        tracing::info!(key, "dispatch_key_release: IM grab delivered release");
         if self.state.suppress_self_emit(key, 0) {
             tracing::trace!(key, value = 0, "self-emit suppressed (IM grab roundtrip)");
             return;
         }
-        self.vk_or_ctx_key(time, key, 0);
+        // Releases route through the same forward path as presses so the
+        // focused app sees a balanced press/release pair.
+        self.state.emit_forward_key(time, key, 0);
         self.state.last_forwarded_release = Some((key, Instant::now()));
         let mut ctx = AdapterCtx { state: &mut self.state };
         self.handler.on_key_released(&mut ctx, time, key);
     }
 
     pub(crate) fn dispatch_key_press(&mut self, time: u32, key: u32) {
-        tracing::trace!(key, "dispatch_key_press: IM grab delivered press");
+        tracing::info!(key, "dispatch_key_press: IM grab delivered press");
         if self.state.suppress_self_emit(key, 1) {
             tracing::trace!(key, value = 1, "self-emit suppressed");
             return;
@@ -313,7 +307,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         match decision {
             KeyDecision::Consumed => {}
             KeyDecision::ForwardRaw => {
-                self.vk_or_ctx_key(time, key, 1);
+                self.state.emit_forward_key(time, key, 1);
                 self.state.last_forwarded_key = Some((key, Instant::now()));
             }
             KeyDecision::Apply {
@@ -347,6 +341,10 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 }
 
                 let raw_mods = self.state.raw_mods;
+                let chars_for_delete = self
+                    .handler
+                    .window_chars_for_delete()
+                    .unwrap_or(false);
                 {
                     let mut ctx = AdapterCtx { state: &mut self.state };
                     self.handler.apply_pending(
@@ -359,6 +357,31 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                         held_user_kc,
                     );
                 }
+
+                // Firefox v1↔v3 path debounces surrounding_text echoes
+                // and batches consecutive delete+commit pairs — when two
+                // such pairs arrive in the same render frame, firefox
+                // sums the deletes and keeps only the LAST commit_string,
+                // dropping the leading char of a syllable (`mợ`→`ợ`,
+                // `tự`→`ự`). Force a wayland roundtrip after each apply
+                // so KWin has flushed our events before the next user key
+                // arrives, giving firefox a chance to echo the post-
+                // commit surrounding_text and breaking the batch.
+                if chars_for_delete {
+                    if let Some(c) = &self.state.conn {
+                        let _ = c.flush();
+                    }
+                    tokio::task::block_in_place(|| {
+                        std::thread::sleep(Duration::from_millis(30));
+                    });
+                }
+
+                // (Tail-char drop on space-after-tone on Tier 2
+                // ForwardKey + foot/KWin is handled per-keysym inside
+                // `AdapterSink::commit_via_keysym` — see that fn for
+                // the kc 247 forwardKeySym race explanation. No
+                // additional post-apply sleep needed at this boundary.
+                // See `project_tail_drop_after_tone_space.md`.)
 
                 if uinput_path {
                     if let Some(c) = &self.state.conn {

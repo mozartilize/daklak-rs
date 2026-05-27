@@ -26,7 +26,7 @@ impl MethodConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub method: MethodConfig,
@@ -69,6 +69,20 @@ pub struct Config {
     #[serde(default)]
     pub auto_vk_only_for_xwayland: bool,
 
+    /// Apps whose `app_id` (case-insensitive) make daklak emit
+    /// `delete_surrounding_text` as a CHARACTER count instead of a byte
+    /// count on the V1Kde sink. Firefox's text-input-v3 client (or the
+    /// KWin v1↔v3 bridge for it) interprets `before_length` as Unicode
+    /// scalar count rather than bytes, so daklak passing bytes
+    /// over-deletes for multi-byte vowels (` ơr`→`ở` — leading space
+    /// eaten because daklak said "2 bytes" but firefox heard "2 chars").
+    /// Other v3 clients (chromium/Qt/GTK) honor the spec and require
+    /// bytes — flipping universally breaks them. Override via
+    /// `DAKLAK_FORCE_CHARS_DELETE_APPS` env var (comma-separated).
+    /// Default: firefox / firefox-dev / navigator. No effect on v2/wlroots.
+    #[serde(default = "default_force_chars_delete_apps")]
+    pub force_chars_delete_apps: Vec<String>,
+
     /// Master switch for evdev-grab mode. When true, daklak opens
     /// `/dev/input/event*` devices and takes a kernel-level `EVIOCGRAB`
     /// at startup, acquiring all physical keyboards for exclusive use.
@@ -82,6 +96,32 @@ pub struct Config {
 
 fn default_enable_wayland() -> bool {
     true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            method: MethodConfig::default(),
+            enable_wayland: default_enable_wayland(),
+            force_uinput_apps: Vec::new(),
+            force_vk_only_apps: Vec::new(),
+            auto_vk_only_for_xwayland: false,
+            force_chars_delete_apps: default_force_chars_delete_apps(),
+            enable_evdev_grab: false,
+        }
+    }
+}
+
+fn default_force_chars_delete_apps() -> Vec<String> {
+    // Firefox's text-input-v3 (or KWin's v1↔v3 bridge for it) interprets
+    // delete_surrounding_text `before_length` as chars, not bytes — over-
+    // deletes multi-byte vowels (` ơr`→`ở`, `tự`→`ự`). Other v3 clients
+    // honor the spec (bytes). Override via DAKLAK_FORCE_CHARS_DELETE_APPS.
+    vec![
+        "firefox".to_string(),
+        "firefox-dev".to_string(),
+        // "navigator".to_string(),
+    ]
 }
 
 impl Config {
@@ -109,6 +149,10 @@ impl Config {
             cfg.force_vk_only_apps = parse_app_list(&apps);
         }
 
+        if let Ok(apps) = std::env::var("DAKLAK_FORCE_CHARS_DELETE_APPS") {
+            cfg.force_chars_delete_apps = parse_app_list(&apps);
+        }
+
         if let Ok(v) = std::env::var("DAKLAK_ENABLE_WAYLAND") {
             cfg.enable_wayland = matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -132,6 +176,7 @@ impl Config {
 
         cfg.force_uinput_apps = canonicalize_app_list(cfg.force_uinput_apps);
         cfg.force_vk_only_apps = canonicalize_app_list(cfg.force_vk_only_apps);
+        cfg.force_chars_delete_apps = canonicalize_app_list(cfg.force_chars_delete_apps);
 
         Ok(cfg)
     }
