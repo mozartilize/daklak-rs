@@ -111,7 +111,7 @@ impl Default for Config {
             enable_wayland: default_enable_wayland(),
             force_uinput_apps: Vec::new(),
             force_vk_only_apps: Vec::new(),
-            auto_vk_only_for_xwayland: false,
+            auto_vk_only_for_xwayland: true,
             force_chars_delete_apps: default_force_chars_delete_apps(),
             enable_evdev_grab: false,
             bracket_shortcuts: false,
@@ -132,15 +132,15 @@ fn default_force_chars_delete_apps() -> Vec<String> {
 }
 
 impl Config {
-    /// Load config from $XDG_CONFIG_HOME/viet-ime/config.toml, with env
+    /// Load config from $XDG_CONFIG_HOME/daklak/config.toml, with env
     /// overrides:
-    /// - `VIET_IME_METHOD={telex|vni|viqr}` overrides `method`.
+    /// - `DAKLAK_METHOD={telex|vni|viqr}` overrides `method`.
     /// - `DAKLAK_FORCE_UINPUT_APPS=app1,app2,...` replaces `force_uinput_apps`
     ///   (empty string clears the list).
     pub fn load() -> Result<Self> {
         let mut cfg = Self::load_file().unwrap_or_default();
 
-        if let Ok(m) = std::env::var("VIET_IME_METHOD") {
+        if let Ok(m) = std::env::var("DAKLAK_METHOD") {
             cfg.method = match m.to_lowercase().as_str() {
                 "vni" => MethodConfig::Vni,
                 "viqr" => MethodConfig::Viqr,
@@ -205,7 +205,7 @@ impl Config {
                     .map(|h| std::path::PathBuf::from(h).join(".config"))
             })?;
 
-        let path = config_dir.join("viet-ime").join("config.toml");
+        let path = config_dir.join("daklak").join("config.toml");
         let text = std::fs::read_to_string(path).ok()?;
         toml::from_str(&text).ok()
     }
@@ -254,6 +254,12 @@ mod tests {
             "\tkeepassxc ".to_owned(),
         ]);
         assert_eq!(r, vec!["chromium", "onlyoffice", "keepassxc"]);
+    }
+
+    #[test]
+    fn auto_vk_only_for_xwayland_defaults_enabled() {
+        let cfg = Config::default();
+        assert!(cfg.auto_vk_only_for_xwayland);
     }
 
 }

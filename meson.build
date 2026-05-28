@@ -34,12 +34,16 @@ summary({
 }, bool_yn: true, section: 'Configuration')
 
 if get_option('evdev_grab')
-  install_data('res/99-viet-ime.rules',
+  install_data('res/99-daklak.rules',
     install_dir: '/etc/udev/rules.d',
     install_mode: 'rw-r--r--',
   )
   meson.add_install_script('scripts/meson-postinst.sh')
 endif
+
+install_data('res/config.toml.example',
+  install_dir: get_option('datadir') / 'daklak',
+)
 
 if get_option('kde')
   desktop_conf = configuration_data()

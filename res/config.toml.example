@@ -1,0 +1,37 @@
+# Daklak config example.
+# Copy to $XDG_CONFIG_HOME/daklak/config.toml to use.
+
+# Input method: telex | vni | viqr
+# default: "telex"
+method = "telex"
+
+# Enable Wayland input-method path. Set false to use evdev-only mode
+# together with enable_evdev_grab = true.
+# default: true
+enable_wayland = true
+
+# Force these app_id values to Tier 3 UInput routing (case-insensitive).
+# default: []
+force_uinput_apps = []
+
+# Force these app_id values to Tier 4 VkOnly routing (case-insensitive).
+# default: []
+force_vk_only_apps = []
+
+# Treat all focused XWayland windows as VkOnly unless force_uinput_apps
+# overrides them.
+# default: true
+auto_vk_only_for_xwayland = true
+
+# Apps that should use character-count delete_surrounding_text handling
+# on the V1Kde sink.
+# default: ["firefox", "firefox-dev"]
+force_chars_delete_apps = ["firefox", "firefox-dev"]
+
+# Open and grab /dev/input/event* keyboards at startup.
+# default: false
+enable_evdev_grab = false
+
+# Telex-only: allow []{} shortcuts for o-horn/u-horn.
+# default: false
+bracket_shortcuts = false

@@ -58,6 +58,10 @@ sudo usermod -aG input $USER
 If `-Dkde=true` was used, a desktop entry is installed to `$datadir/applications/daklak.desktop`
 so KDE Plasma can auto-launch the daemon.
 
+Meson also installs a config template at `$datadir/daklak/config.toml.example`.
+Copy it to `$XDG_CONFIG_HOME/daklak/config.toml` (or `~/.config/daklak/config.toml`
+when `XDG_CONFIG_HOME` is unset), then adjust values as needed.
+
 ## Architecture
 
 Daklak has two independent input paths, selected at runtime:

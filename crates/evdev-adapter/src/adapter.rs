@@ -43,7 +43,7 @@ pub trait EvdevHandler {
     fn check_idle_reset_window(&mut self);
 }
 
-const DAKLAK_NAME: &str = "viet-ime";
+const DAKLAK_NAME: &str = "daklak";
 const KEY_BACKSPACE: u32 = 14;
 const KEY_ESC: u32 = 1;
 
@@ -450,5 +450,15 @@ impl EvdevAdapter {
         tracing::info!("evdev: grabs released");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn own_uinput_device_name_is_daklak() {
+        assert_eq!(DAKLAK_NAME, "daklak");
     }
 }

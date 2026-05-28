@@ -1,7 +1,7 @@
-# udev rule for viet-ime: grant access to /dev/uinput without requiring root.
+# udev rule for daklak: grant access to /dev/uinput without requiring root.
 #
 # Install:
-#   sudo cp res/99-viet-ime.rules /etc/udev/rules.d/
+#   sudo cp res/99-daklak.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules
 #   sudo udevadm trigger --name-match=uinput
 #   sudo usermod -aG input $USER   # then log out + back in

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 
-/// IPC server — binds $XDG_RUNTIME_DIR/viet-ime.sock.
+/// IPC server — binds $XDG_RUNTIME_DIR/daklak.sock.
 /// Stage 3: stub that accepts connections, sends a hello banner, and discards
 /// input. GTK/Qt adapters (Stages 6–7) will use this socket for real IPC.
 pub struct IpcServer {
@@ -43,12 +43,12 @@ impl Drop for IpcServer {
 
 pub async fn handle_connection(mut stream: UnixStream) {
     // Stage 3 stub: send banner, drain input
-    let _ = stream.write_all(b"viet-ime/0.1\n").await;
+    let _ = stream.write_all(b"daklak/0.1\n").await;
     let (mut r, _w) = stream.into_split();
     let _ = tokio::io::copy(&mut r, &mut tokio::io::sink()).await;
 }
 
 fn socket_path() -> Option<PathBuf> {
     let xrd = std::env::var("XDG_RUNTIME_DIR").ok()?;
-    Some(PathBuf::from(xrd).join("viet-ime.sock"))
+    Some(PathBuf::from(xrd).join("daklak.sock"))
 }

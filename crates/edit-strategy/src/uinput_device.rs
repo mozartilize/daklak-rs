@@ -26,7 +26,7 @@ pub const DAKLAK_UINPUT_VENDOR: u16 = 0xdac1;
 pub const DAKLAK_UINPUT_PRODUCT: u16 = 0xac01;
 pub const DAKLAK_UINPUT_VERSION: u16 = 0x0001;
 
-/// Thin wrapper around an evdev `VirtualDevice` for the viet-ime synthetic
+/// Thin wrapper around an evdev `VirtualDevice` for the daklak synthetic
 /// keyboard on `/dev/uinput`.
 ///
 /// Registers a **full keyboard surface** — letters, digits, punctuation,
@@ -124,7 +124,7 @@ impl UinputDevice {
             keys.insert(KeyCode::new(code));
         }
         let dev = VirtualDevice::builder()?
-            .name("viet-ime")
+            .name("daklak")
             .input_id(InputId::new(
                 BusType::BUS_USB,
                 DAKLAK_UINPUT_VENDOR,
@@ -160,13 +160,13 @@ mod tests {
     fn uinput_device_opens() {
         let dev = UinputDevice::open().expect(
             "Could not open /dev/uinput. \
-             Run: sudo chmod 666 /dev/uinput  OR  install res/99-viet-ime.rules",
+             Run: sudo chmod 666 /dev/uinput  OR  install res/99-daklak.rules",
         );
         drop(dev);
         let devices = std::fs::read_to_string("/proc/bus/input/devices").unwrap_or_default();
         assert!(
-            devices.contains("viet-ime"),
-            "viet-ime device not found in /proc/bus/input/devices after open"
+            devices.contains("daklak"),
+            "daklak device not found in /proc/bus/input/devices after open"
         );
     }
 }

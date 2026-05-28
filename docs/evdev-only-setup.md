@@ -3,7 +3,7 @@
 Daklak's evdev-only mode (`enable_wayland=false && enable_evdev_grab=true`)
 grabs every keyboard via `/dev/input/event*`, runs the engine on raw
 keycodes, and emits both pass-through ASCII and Vietnamese precomposed
-characters through a daklak-owned `viet-ime` uinput device.
+characters through a daklak-owned `daklak` uinput device.
 
 Compared to wayland mode, no `zwp_input_method_v2` is involved — works
 on any compositor (sway, scroll, KWin, Mutter, X11) as long as
@@ -95,7 +95,7 @@ Generate the keymap, then point sway at daklak's uinput device:
 
 ```
 daklak gen-keymap > /tmp/daklak.xkb
-swaymsg input "56001:44033:viet-ime" xkb_file /tmp/daklak.xkb
+swaymsg input "56001:44033:daklak" xkb_file /tmp/daklak.xkb
 ```
 
 The numeric prefix is the decimal `vendor:product` of daklak's uinput
@@ -110,11 +110,11 @@ If you want this driven automatically by daklak's lifecycle, wire it
 through a user systemd unit, e.g.:
 
 ```ini
-# ~/.config/systemd/user/viet-ime.service
+# ~/.config/systemd/user/daklak.service
 [Service]
 ExecStartPre=/bin/sh -c 'daklak gen-keymap > %t/daklak.xkb'
 ExecStart=daklak
-ExecStartPost=/bin/sh -c 'swaymsg input "56001:44033:viet-ime" xkb_file %t/daklak.xkb'
+ExecStartPost=/bin/sh -c 'swaymsg input "56001:44033:daklak" xkb_file %t/daklak.xkb'
 ```
 
 (`%t` expands to `$XDG_RUNTIME_DIR` under user units. The ordering
@@ -160,7 +160,7 @@ If the order was wrong, re-run `xkbcomp` after daklak is running, or
 target daklak's device explicitly:
 
 ```
-ID=$(xinput list --short | awk '/viet-ime/{ for(i=1;i<=NF;i++) if($i ~ /^id=/){sub("id=","",$i); print $i; exit}}')
+ID=$(xinput list --short | awk '/daklak/{ for(i=1;i<=NF;i++) if($i ~ /^id=/){sub("id=","",$i); print $i; exit}}')
 xkbcomp -i "$ID" /tmp/daklak.xkb $DISPLAY
 ```
 
@@ -264,7 +264,7 @@ $USER` and re-login.
 
 **Vietnamese commits appear as F13/F14… or Japanese IME glyphs.**
 Keymap not applied — slots fell through to their default evdev keysym.
-Check `swaymsg -t get_inputs | grep -A5 viet-ime` for
+Check `swaymsg -t get_inputs | grep -A5 daklak` for
 `xkb_active_layout_name = "Daklak Vietnamese"`. If absent, the
 `swaymsg input … xkb_file` step in your setup didn't run or failed —
 re-run it manually.
@@ -288,12 +288,12 @@ device id directly with `xkbcomp -i <id> /tmp/daklak.xkb $DISPLAY`
 **keyd remap stops working when daklak runs.** If daklak starts before
 keyd, daklak grabs the physical keyboards first and keyd's
 `EVIOCGRAB` fails with `EBUSY` — keyd is silently neutered. Force order
-with systemd: in `~/.config/systemd/user/viet-ime.service`, add
+with systemd: in `~/.config/systemd/user/daklak.service`, add
 `After=keyd.service` so keyd grabs the physicals first and daklak
 grabs keyd's virtual output (recommended setup).
 
 **keyd config uses `[ids] *`.** Wildcard means keyd also grabs daklak's
-`viet-ime` uinput device. Every daklak pass-through emit re-enters
+`daklak` uinput device. Every daklak pass-through emit re-enters
 daklak via keyd's virtual output → feedback loop → kernel input buffer
 overflow → global kbd freeze. Restrict keyd to specific vendor/product
 ids — daklak's are `0xdac1:0xac01`, exclude that pair from keyd's
