@@ -102,8 +102,20 @@ impl OutputSink for AdapterSink<'_> {
         after_chars: u32,
     ) {
         match &self.text_ops {
-            // v2/wlroots: spec is bytes.
-            TextOpsTarget::V2 { im } => im.delete_surrounding_text(before_bytes, after_bytes),
+            // v2/wlroots: spec says bytes, but firefox's v3 client
+            // counts in chars/ASCII-units and stops at the first
+            // multibyte boundary (e.g. del 3 bytes over "án"=3 bytes
+            // only removes the trailing ASCII 'n', leaving 'á' →
+            // result "tráans" instead of "trans"). Gated per-window
+            // via chars_for_delete (config: force_chars_delete_apps).
+            TextOpsTarget::V2 { im } => {
+                let (before, after) = if self.chars_for_delete {
+                    (before_chars, after_chars)
+                } else {
+                    (before_bytes, after_bytes)
+                };
+                im.delete_surrounding_text(before, after);
+            }
             // v1: spec is bytes (text-input-unstable-v1.xml), but
             // firefox's v3 client on KWin's bridge expects chars —
             // gated per-window via chars_for_delete.

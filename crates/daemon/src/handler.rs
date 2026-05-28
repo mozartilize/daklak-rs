@@ -326,6 +326,11 @@ impl AdapterHandler for Daemon {
             if let Some(w) = self.window.as_mut() {
                 w.full_reset();
             }
+            // Same rationale as NAV: shortcuts (Ctrl+V paste, Ctrl+A
+            // select, etc.) end the current composition. Roll back so
+            // the next surrounding frame can re-seed from whatever
+            // word the cursor lands on.
+            self.last_action_at = Instant::now() - Duration::from_secs(60);
             ctx.vk_key_press_unstamped(time, key);
             return KeyDecision::Consumed;
         }
@@ -335,11 +340,16 @@ impl AdapterHandler for Daemon {
             if let Some(w) = self.window.as_mut() {
                 w.full_reset();
             }
+            // Roll last_action_at back so the next surrounding frame
+            // bypasses the recent_action gate and re-seeds. NAV ends
+            // the current composition — the cursor is now elsewhere
+            // and the next char should compose against whatever word
+            // the cursor lands on (killer feature, multi-hop case:
+            // "bò bo|" → arrow keys → "bò bof|" should compose).
+            self.last_action_at = Instant::now() - Duration::from_secs(60);
             ctx.vk_key_press_unstamped(time, key);
             return KeyDecision::Consumed;
         }
-
-        self.last_action_at = Instant::now();
 
         if self.window.is_none() {
             tracing::trace!(key, "key: no active window → forward");
@@ -347,8 +357,16 @@ impl AdapterHandler for Daemon {
         }
 
         if key == KEY_BACKSPACE {
+            // Don't update last_action_at: BS deletes, doesn't compose.
+            // The killer feature (retroactive tone after space+BS+'f' →
+            // bò) needs surrounding-text re-seed to fire on the BS's
+            // post-surrounding frame. If BS marked an action, the
+            // 150ms recent_action gate would block re-seed, leaving
+            // engine empty so the next 'f' is forwarded as ASCII.
             return self.handle_backspace();
         }
+
+        self.last_action_at = Instant::now();
 
         let Some(ch) = ch else {
             tracing::trace!(key, "key: no xkb char → forward raw");
