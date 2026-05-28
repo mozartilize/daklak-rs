@@ -54,8 +54,7 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV1, ()> for WaylandAdapter<H> {
                 );
                 state.state.im_ctx_v1 = Some(ctx);
                 state.state.v1_keyboard = Some(keyboard);
-                state.state.pending_frame.pending_activate = true;
-                state.state.pending_commit = false;
+                state.state.apply_event(crate::frame::FrameEvent::Activate);
                 // Don't fire apply_done_frame yet — wait for CommitState so
                 // that surrounding_text and purpose are available when the
                 // handler runs detect_capability (which distinguishes
@@ -68,7 +67,7 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV1, ()> for WaylandAdapter<H> {
                 );
                 state.state.im_ctx_v1 = None;
                 state.state.v1_keyboard = None;
-                state.state.pending_frame.pending_deactivate = true;
+                state.state.apply_event(crate::frame::FrameEvent::Deactivate);
                 // Deactivate has no trailing CommitState — fire immediately.
                 state.apply_done_frame();
             }
@@ -100,16 +99,11 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodContextV1, ()> for WaylandAdapter
                 cursor,
                 anchor,
             } => {
-                tracing::trace!(
-                    ctx_id = ?proxy.id(),
+                state.state.apply_event(crate::frame::FrameEvent::SurroundingText {
+                    text,
                     cursor,
                     anchor,
-                    text_len = text.len(),
-                    "im_v1: SurroundingText"
-                );
-                state.state.pending_frame.surrounding_text =
-                    Some(crate::frame::SurroundingText { text, cursor, anchor });
-                state.state.pending_commit = true;
+                });
             }
 
             zwp_input_method_context_v1::Event::ContentType { hint: _, purpose } => {
@@ -125,14 +119,7 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodContextV1, ()> for WaylandAdapter
                 //   v1 11 datetime → v3 12 datetime
                 //   v1 12 terminal → v3 13 terminal
                 let purpose_v3 = if purpose >= 9 { purpose + 1 } else { purpose };
-                tracing::trace!(
-                    ctx_id = ?proxy.id(),
-                    purpose_v1 = purpose,
-                    purpose_v3,
-                    "im_v1: ContentType"
-                );
-                state.state.pending_frame.purpose = purpose_v3;
-                state.state.pending_commit = true;
+                state.state.apply_event(crate::frame::FrameEvent::Purpose(purpose_v3));
             }
 
             zwp_input_method_context_v1::Event::CommitState { serial } => {

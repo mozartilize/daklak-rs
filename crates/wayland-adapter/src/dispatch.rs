@@ -85,37 +85,37 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV2, ()> for WaylandAdapter<H> {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        use crate::frame::FrameEvent;
         match event {
             zwp_input_method_v2::Event::Activate => {
-                tracing::trace!("im_v2: Activate");
-                state.state.pending_frame.pending_activate = true;
+                state.state.apply_event(FrameEvent::Activate);
             }
             zwp_input_method_v2::Event::Deactivate => {
-                tracing::trace!("im_v2: Deactivate");
-                state.state.pending_frame.pending_deactivate = true;
+                state.state.apply_event(FrameEvent::Deactivate);
             }
             zwp_input_method_v2::Event::SurroundingText {
                 text,
                 cursor,
                 anchor,
             } => {
-                tracing::trace!("im_v2: SurroundingText cursor={cursor}");
-                state.state.pending_frame.surrounding_text =
-                    Some(crate::frame::SurroundingText { text, cursor, anchor });
+                state.state.apply_event(FrameEvent::SurroundingText {
+                    text,
+                    cursor,
+                    anchor,
+                });
             }
             zwp_input_method_v2::Event::TextChangeCause { cause } => {
-                state.state.pending_frame.change_cause = Some(cause.into());
+                state.state.apply_event(FrameEvent::ChangeCause(cause.into()));
             }
             zwp_input_method_v2::Event::ContentType { hint: _, purpose } => {
-                state.state.pending_frame.purpose = purpose.into();
+                state.state.apply_event(FrameEvent::Purpose(purpose.into()));
             }
             zwp_input_method_v2::Event::Done => {
                 tracing::trace!("im_v2: Done");
                 state.apply_done_frame();
             }
             zwp_input_method_v2::Event::Unavailable => {
-                tracing::error!("compositor sent Unavailable — another IM is registered");
-                state.state.should_exit = true;
+                state.state.apply_event(FrameEvent::Unavailable);
             }
             _ => {}
         }

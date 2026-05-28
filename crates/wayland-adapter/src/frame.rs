@@ -37,3 +37,26 @@ impl DoneFrame {
         self.purpose = 0; // PURPOSE_NORMAL default
     }
 }
+
+/// Protocol-agnostic view of the input-method events that mutate
+/// `DoneFrame` between activate and done. Each backend dispatcher
+/// (`dispatch.rs` for v2/wlroots, `dispatch_v1.rs` for v1/KWin)
+/// translates its native protocol Event into this enum and calls
+/// `AdapterState::apply_event` — keeping the per-field mutation
+/// logic, tracing, and v1-only `pending_commit` bookkeeping in a
+/// single place. Adding a new variant fails to compile in
+/// `apply_event` until handled, blocking silent drift.
+#[derive(Debug)]
+pub enum FrameEvent {
+    Activate,
+    Deactivate,
+    SurroundingText { text: String, cursor: u32, anchor: u32 },
+    /// v3-numbered content-type purpose (`PURPOSE_*`). v1 dispatcher
+    /// translates v1 numbering → v3 before constructing this variant.
+    Purpose(u32),
+    /// v2-only; v1's `zwp_input_method_context_v1` has no text-change-cause.
+    ChangeCause(u32),
+    /// v2-only; sent when another IM is already registered with the
+    /// compositor. Triggers daemon exit.
+    Unavailable,
+}
