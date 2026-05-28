@@ -919,6 +919,8 @@ mod tests {
         #[derive(Default)]
         struct DeleteCaptureSink {
             deletes: Vec<(u32, u32, u32, u32)>,
+            vk_keys: Vec<(u32, u32, KeyState)>,
+            commits: Vec<String>,
         }
 
         impl OutputSink for DeleteCaptureSink {
@@ -933,9 +935,13 @@ mod tests {
                     .push((before_bytes, before_chars, after_bytes, after_chars));
             }
 
-            fn commit_string(&mut self, _text: &str) {}
+            fn commit_string(&mut self, text: &str) {
+                self.commits.push(text.to_owned());
+            }
             fn commit(&mut self, _serial: u32) {}
-            fn vk_key(&mut self, _time: u32, _key_code: u32, _state: KeyState) {}
+            fn vk_key(&mut self, time: u32, key_code: u32, state: KeyState) {
+                self.vk_keys.push((time, key_code, state));
+            }
             fn vk_modifiers(&mut self, _depressed: u32, _latched: u32, _locked: u32, _group: u32) {}
             fn uinput_key(&mut self, _key_code: u16, _value: i32) {}
             fn vk_commit_char(&mut self, _time: u32, _c: char) -> bool {
@@ -960,12 +966,12 @@ mod tests {
             // can inline-autocomplete from history (e.g. suggest
             // `translate.google.com`) and report surrounding_text like
             // "translate" with an active tail selection (cursor=3,
-            // anchor=9). We must not drop anchor-only updates, or Tier1
-            // delete won't include selection-after and Chromium rejects it.
-            //
-            // Note: this appears provider-dependent in practice (DuckDuckGo
-            // often avoids this selection shape). Root cause on the Chromium
-            // side is still unresolved; this test documents current behavior.
+            // anchor=9). We must not drop anchor-only updates — the
+            // selection detection triggers a ForwardKey fallback in Tier 1
+            // (virtual keyboard backspaces instead of delete_surrounding_text)
+            // to avoid the Chromium race condition where the key release
+            // arrives via the fast wl_keyboard path and changes Chrome's
+            // selection state before our text edit arrives.
             let mut daemon = Daemon::new(Config::default());
             daemon.current_active = true;
             daemon.window = Some(WindowState::new(
@@ -984,11 +990,18 @@ mod tests {
             let w = daemon.window.as_mut().expect("window state exists");
             w.strategy.apply(1, "â", 1, 0, &mut sink);
 
-            assert_eq!(
-                sink.deletes,
-                vec![(1, 1, 6, 6)],
-                "anchor-only frame change must update selection span for Tier1 delete"
+            // Selection present → no delete_surrounding_text (would race),
+            // instead ForwardKey BS: 2 BSes (1 for selection + 1 for 'a')
+            assert!(
+                sink.deletes.is_empty(),
+                "must NOT use delete_surrounding_text when selection is active"
             );
+            assert_eq!(
+                sink.vk_keys.len(),
+                4, // 2 backspaces × (press + release)
+                "anchor-only frame change must produce ForwardKey BS fallback"
+            );
+            assert_eq!(sink.commits, vec!["â".to_owned()]);
         }
     }
 

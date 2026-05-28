@@ -156,7 +156,7 @@ impl Strategy {
     ) {
         match self.method {
             BackspaceMethod::SurroundingText => {
-                surrounding::apply(&mut self.shadow, backspaces, commit, serial, sink);
+                surrounding::apply(&mut self.shadow, backspaces, commit, serial, time, sink);
             }
             BackspaceMethod::ForwardKey => {
                 forward_key::apply(&mut self.shadow, backspaces, commit, serial, time, sink);
@@ -511,27 +511,35 @@ mod tests {
     }
 
     #[test]
-    fn tier1_delete_includes_selected_after_cursor() {
+    fn tier1_selection_falls_back_to_forward_key() {
         // Chromium may keep an active selection (anchor > cursor) on first
-        // focused word. delete_surrounding_text must cover that selected
-        // range or the client rejects it and we get duplicated syllables.
+        // focused word. Using delete_surrounding_text races with the
+        // wl_keyboard path (key release arrives before our text edit),
+        // causing Chrome to change its autocomplete state and reject the
+        // delete.
         //
-        // Field finding (2026-05): this is easiest to repro in Chromium
-        // omnibox when Google search provider inline-autocomplete injects a
-        // history suggestion tail (e.g. `translate.google.com` ->
-        // surrounding_text like "translate" with cursor=3, anchor=9). With
-        // DuckDuckGo as default provider, the same history entry may not
-        // trigger this selection shape, and the bug disappears.
+        // Fix: when selection is present, fall back to ForwardKey (virtual
+        // keyboard backspaces). One BS clears the selection, then engine-
+        // requested BSes delete individual chars. Chrome handles this
+        // deterministically regardless of selection state.
         //
-        // Current status: we keep this selection-aware Tier1 behavior, but a
-        // complete fix is still unresolved for the Chromium + provider-
-        // specific autocomplete path.
+        // Scenario: Chromium omnibox + Google search provider inline-
+        // autocomplete injects "translate" with cursor=3, anchor=9.
+        // Engine says bs=1 (delete 'a'), commit "â".
+        // Expected: 2 BS (1 for selection + 1 for 'a') + commit "â".
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.on_surrounding_text("translate", 3, 9);
         let mut sink = MockSink::default();
         s.apply(1, "â", 1, 0, &mut sink);
-        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(1, 1, 6, 6));
-        assert_eq!(sink.calls[1], Call::CommitString("â".to_owned()));
+        assert_eq!(sink.calls, vec![
+            Call::VkKey(0, 14, KeyState::Pressed),   // BS 1: clears selection "nslate"
+            Call::VkKey(0, 14, KeyState::Released),
+            Call::VkKey(0, 14, KeyState::Pressed),   // BS 2: deletes 'a'
+            Call::VkKey(0, 14, KeyState::Released),
+            Call::CommitString("â".to_owned()),
+            Call::Commit(1),
+        ]);
+        assert_eq!(s.shadow.text(), "trâ");
     }
 
     #[test]

@@ -248,9 +248,11 @@ mod tests {
         // with Google search provider history suggestions:
         // "tra|nslate" (cursor=3, anchor=9).
         //
-        // Current status: selection-after accounting is required and covered
-        // here, but this alone does not fully fix the Chromium provider-
-        // specific bug in all environments.
+        // pop_delete_span returns the selection-after bytes/chars so the
+        // caller (surrounding::apply) can detect the selection and fall back
+        // to ForwardKey backspaces. The shadow text is updated (popped) for
+        // the before-cursor chars; the after-cursor selection is reported
+        // but not used for delete_surrounding_text (ForwardKey handles it).
         let mut buf = ShadowBuffer::new();
         buf.observe_surrounding("translate", 3, 9);
         assert_eq!(buf.text(), "tra");
