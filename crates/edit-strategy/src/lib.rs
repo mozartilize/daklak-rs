@@ -197,6 +197,15 @@ impl Strategy {
     pub fn method(&self) -> BackspaceMethod {
         self.method
     }
+
+    /// Late tier upgrade. Used when the activate frame had no surrounding
+    /// info (so Tier 1 was demoted to ForwardKey) but a later frame proves
+    /// the app actually supports surrounding-text. Caller is responsible
+    /// for the upgrade-only invariant: shadow state is preserved, no
+    /// downgrade is intended.
+    pub fn set_method(&mut self, m: BackspaceMethod) {
+        self.method = m;
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

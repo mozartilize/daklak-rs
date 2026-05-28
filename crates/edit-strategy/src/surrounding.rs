@@ -53,6 +53,13 @@ pub fn apply(
         return;
     }
 
+    tracing::debug!(
+        before_bytes,
+        before_chars,
+        commit,
+        serial,
+        "surrounding tier: emit delete_surrounding_text + commit_string"
+    );
     sink.delete_surrounding_text(before_bytes, before_chars, after_bytes, after_chars);
     sink.commit_string(commit);
     sink.commit(serial);

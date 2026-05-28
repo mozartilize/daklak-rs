@@ -250,6 +250,38 @@ impl AdapterHandler for Daemon {
             } else {
                 None
             };
+            // Late tier upgrade. Chromium under wlroots/sway doesn't
+            // include set_surrounding_text in its enable cycle, so the
+            // activate frame has has_surrounding=false and the tier
+            // detector picks ForwardKey. The first real keystroke then
+            // arrives with surrounding info — re-detect and upgrade to
+            // Tier 1 SurroundingText so autocomplete-selection handling
+            // (delete_surrounding_text + ForwardKey BS fallback) works.
+            // Upgrade-only: never downgrade ST → FK here.
+            if !activate
+                && w.strategy.method() == BackspaceMethod::ForwardKey
+            {
+                let probe = CapabilityProbe {
+                    purpose: frame.purpose,
+                    surrounding_text_seen: Some(SurroundingFrame {
+                        text: text.clone(),
+                        cursor: *cursor,
+                    }),
+                    app_id: self.focused_app_id.clone(),
+                    force_uinput_apps: self.config.force_uinput_apps.clone(),
+                    force_vk_only_apps: self.config.force_vk_only_apps.clone(),
+                    terminal_override: self.terminal_override,
+                };
+                let upgraded = detect_method(&probe);
+                if upgraded == BackspaceMethod::SurroundingText {
+                    tracing::info!(
+                        from = ?BackspaceMethod::ForwardKey,
+                        to = ?upgraded,
+                        "late tier upgrade on first surrounding_text"
+                    );
+                    w.strategy.set_method(upgraded);
+                }
+            }
             w.strategy.on_surrounding_text(text, *cursor, *anchor);
             if should_reseed {
                 w.engine.reset();

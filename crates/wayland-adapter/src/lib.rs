@@ -239,6 +239,7 @@ impl<'a> AdapterCtx<'a> {
                     chars_for_delete,
                     conn,
                     xkb: self.state.xkb.as_ref(),
+                    pending_im_commit_ack: &mut self.state.pending_im_commit_ack,
                 };
                 f(&mut sink);
             }
@@ -262,6 +263,7 @@ impl<'a> AdapterCtx<'a> {
                     chars_for_delete,
                     conn,
                     xkb: self.state.xkb.as_ref(),
+                    pending_im_commit_ack: &mut self.state.pending_im_commit_ack,
                 };
                 f(&mut sink);
             }
@@ -405,6 +407,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
 
     pub(crate) fn apply_done_frame(&mut self) {
         self.state.serial = self.state.serial.wrapping_add(1);
+        self.state.pending_im_commit_ack = false;
 
         let activate = self.state.pending_frame.pending_activate;
         let deactivate = self.state.pending_frame.pending_deactivate;
@@ -447,6 +450,20 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         {
             let mut ctx = AdapterCtx { state: &mut self.state };
             self.handler.on_done_frame(&mut ctx, &snapshot);
+        }
+
+        // Heartbeat ack on V2/wlroots: sway only emits `text_input_v3.done`
+        // when daklak commits on its `zwp_input_method_v2`. If the handler
+        // didn't produce any IM output this frame, the v3 client (e.g.
+        // chromium) never sees its commit ack'd — its state machine stalls
+        // and it stops sending `set_surrounding_text` updates. Emit a bare
+        // commit so sway's `handle_im_commit` fires and acks the v3 client.
+        if matches!(self.state.im_backend, ImBackend::V2Wlroots)
+            && !self.state.pending_im_commit_ack
+        {
+            if let Some(im) = &self.state.im {
+                im.commit(self.state.serial);
+            }
         }
 
         if deactivate {

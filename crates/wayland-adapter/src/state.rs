@@ -102,6 +102,15 @@ pub struct AdapterState {
     /// Last keycode + timestamp daklak forwarded as a vk.key release.
     pub last_forwarded_release: Option<(u32, Instant)>,
 
+    /// Set true by `AdapterSink::commit()` (V2 path) whenever daklak emits
+    /// `zwp_input_method_v2.commit`. Reset at the start of every
+    /// `apply_done_frame`. If still false after the handler runs, daklak
+    /// emits a bare ack-commit so wlroots' `handle_im_commit` fires and
+    /// sends `text_input_v3.done` back to the v3 client — unblocking
+    /// chromium's state machine which otherwise stops sending
+    /// `set_surrounding_text` after the initial enable.
+    pub pending_im_commit_ack: bool,
+
     pub should_exit: bool,
 
     // ── Compositor backend selection ─────────────────────────────────────────
@@ -192,6 +201,7 @@ impl AdapterState {
             synthetic_mods_emitted_at: None,
             last_forwarded_key: None,
             last_forwarded_release: None,
+            pending_im_commit_ack: false,
             should_exit: false,
             im_backend: crate::ImBackend::V2Wlroots,
             im_v1: None,
@@ -251,6 +261,46 @@ impl AdapterState {
                 if let Some(ctx) = &self.im_ctx_v1 {
                     ctx.key(serial, time, key, value);
                 }
+            }
+        }
+    }
+
+    /// Single funnel for input-method events that mutate `pending_frame`.
+    /// Backend dispatchers translate their protocol enum into `FrameEvent`
+    /// and call this. Centralizes tracing, field assignment, and v1's
+    /// `pending_commit` bookkeeping so changes can't drift between v1/v2.
+    pub fn apply_event(&mut self, event: crate::frame::FrameEvent) {
+        use crate::frame::{FrameEvent, SurroundingText};
+        match event {
+            FrameEvent::Activate => {
+                tracing::trace!("im: Activate");
+                self.pending_frame.pending_activate = true;
+                // v1 resets pending_commit at activate (CommitState
+                // batch starts fresh). v2 doesn't track this field.
+                self.pending_commit = false;
+            }
+            FrameEvent::Deactivate => {
+                tracing::trace!("im: Deactivate");
+                self.pending_frame.pending_deactivate = true;
+            }
+            FrameEvent::SurroundingText { text, cursor, anchor } => {
+                tracing::trace!(text = %text, cursor, anchor, "im: SurroundingText");
+                self.pending_frame.surrounding_text =
+                    Some(SurroundingText { text, cursor, anchor });
+                self.pending_commit = true;
+            }
+            FrameEvent::Purpose(purpose) => {
+                tracing::trace!(purpose, "im: ContentType");
+                self.pending_frame.purpose = purpose;
+                self.pending_commit = true;
+            }
+            FrameEvent::ChangeCause(cause) => {
+                tracing::trace!(cause, "im: TextChangeCause");
+                self.pending_frame.change_cause = Some(cause);
+            }
+            FrameEvent::Unavailable => {
+                tracing::error!("compositor sent Unavailable — another IM is registered");
+                self.should_exit = true;
             }
         }
     }

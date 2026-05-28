@@ -86,6 +86,11 @@ pub struct AdapterSink<'a> {
     /// KWin's forwardKeySym + kc 247 temp keymap and trigger foot's xkb
     /// recompile race.
     pub(crate) xkb: Option<&'a XkbState>,
+    /// V2 only: flipped to true by `commit()` so `apply_done_frame` can
+    /// detect whether daklak already acked the compositor's done event,
+    /// and emit a bare heartbeat commit otherwise. See AdapterState field
+    /// of the same name for rationale.
+    pub(crate) pending_im_commit_ack: &'a mut bool,
 }
 
 impl OutputSink for AdapterSink<'_> {
@@ -124,7 +129,10 @@ impl OutputSink for AdapterSink<'_> {
 
     fn commit(&mut self, serial: u32) {
         match &self.text_ops {
-            TextOpsTarget::V2 { im } => im.commit(serial),
+            TextOpsTarget::V2 { im } => {
+                im.commit(serial);
+                *self.pending_im_commit_ack = true;
+            }
             // v1 has no batching — commit is a no-op.
             TextOpsTarget::V1 { .. } => {}
         }
