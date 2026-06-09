@@ -1,8 +1,13 @@
 mod config;
+mod control;
 mod handler;
 mod ipc;
 mod main_loop;
+mod tray;
 mod window;
+
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use anyhow::Result;
 use tracing_subscriber::{filter::EnvFilter, fmt};
@@ -15,6 +20,18 @@ fn print_help() {
     println!();
     println!("Subcommands:");
     println!(
+        "  toggle       Toggle the input method on or off."
+    );
+    println!(
+        "  enable       Turn the input method on."
+    );
+    println!(
+        "  disable      Turn the input method off."
+    );
+    println!(
+        "  status       Print 'on' or 'off' and exit."
+    );
+    println!(
         "  gen-keymap   Print daklak's synthetic xkb keymap to stdout and exit.\n\
          \x20              Pipe to a file then load it into your compositor manually:\n\
          \x20                daklak gen-keymap > /tmp/daklak.xkb\n\
@@ -22,12 +39,40 @@ fn print_help() {
     );
     println!();
     println!("With no subcommand, runs the input-method daemon.");
+    println!();
+    println!("Sway keybind example:");
+    println!("  bindsym $mod+space exec daklak toggle");
+}
+
+/// Connect to the running daemon socket and send a one-line command.
+/// Returns the daemon's reply ("on" / "off" / "err ...").
+fn ipc_send(cmd: &str) -> Result<String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let path = ipc::socket_path()
+        .ok_or_else(|| anyhow::anyhow!("XDG_RUNTIME_DIR not set"))?;
+
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|e| anyhow::anyhow!("cannot connect to daklak socket {}: {e}", path.display()))?;
+
+    writeln!(stream, "{cmd}")?;
+    stream.flush()?;
+
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    Ok(reply.trim().to_owned())
 }
 
 fn main() -> Result<()> {
     // CLI subcommands — parsed before logging init so output stays clean.
     if let Some(arg) = std::env::args().nth(1) {
         match arg.as_str() {
+            "toggle" | "enable" | "disable" | "status" => {
+                let reply = ipc_send(&arg)?;
+                println!("{reply}");
+                return Ok(());
+            }
             "gen-keymap" => {
                 print!("{}", viet_ime_keymap::keymap_text());
                 return Ok(());
@@ -60,34 +105,44 @@ fn main() -> Result<()> {
         .build()?;
 
     rt.block_on(async move {
-        #[cfg(feature = "wayland")]
-        if config.enable_wayland {
-            let daemon = handler::Daemon::new(config);
-            let mut wayland = connect(daemon)?;
+        // --- shared control plane (works in every mode) ---
+        let enabled = Arc::new(AtomicBool::new(true));
+        let (cmd_tx, cmd_rx) = control::channel();
+        let (state_tx, state_rx) = tokio::sync::watch::channel(true);
 
-            // IPC server — spawned independently
-            if let Some(server) = ipc::IpcServer::bind().await {
-                tokio::spawn(async move {
-                    loop {
-                        match server.accept().await {
-                            Ok(stream) => {
-                                tokio::spawn(ipc::handle_connection(stream));
-                            }
-                            Err(e) => {
-                                tracing::warn!(?e, "IPC accept errored — IPC task exiting");
-                                break;
-                            }
+        control::spawn(cmd_rx, enabled.clone(), state_tx);
+
+        if let Some(server) = ipc::IpcServer::bind().await {
+            let tx = cmd_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match server.accept().await {
+                        Ok(stream) => {
+                            let tx = tx.clone();
+                            tokio::spawn(ipc::handle_connection(stream, tx));
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, "IPC accept errored — IPC task exiting");
+                            break;
                         }
                     }
-                });
-            }
-
-            crate::main_loop::core_loop_with_wayland(&mut wayland).await
-        } else {
-            let mut daemon = handler::Daemon::new(config);
-            daemon.activate_evdev();
-            let mut evdev = viet_ime_evdev_adapter::EvdevAdapter::open()?;
-            evdev.run(&mut daemon).await
+                }
+            });
         }
+
+        tray::spawn_tray(cmd_tx.clone(), state_rx);
+
+        // --- mode-specific run loop ---
+        #[cfg(feature = "wayland")]
+        if config.enable_wayland {
+            let daemon = handler::Daemon::new(config, enabled.clone());
+            let mut wayland = connect(daemon)?;
+            return crate::main_loop::core_loop_with_wayland(&mut wayland).await;
+        }
+
+        let mut daemon = handler::Daemon::new(config, enabled.clone());
+        daemon.activate_evdev();
+        let mut evdev = viet_ime_evdev_adapter::EvdevAdapter::open()?;
+        evdev.run(&mut daemon).await
     })
 }

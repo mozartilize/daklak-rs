@@ -2,6 +2,8 @@
 //! `wayland-adapter`. Owns the engine, strategy, killer-feature seeding,
 //! modifier-shortcut detection, idle-reset, and per-window routing decisions.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use viet_ime_edit_strategy::{
@@ -69,10 +71,16 @@ pub struct Daemon {
     /// capability probe so known-broken-on-ForwardKey terminals can
     /// auto-escalate. None outside an active session.
     pub focused_app_id: Option<String>,
+
+    /// Shared on/off flag — written by the control task, read each keystroke.
+    pub enabled: Arc<AtomicBool>,
+    /// Previous value of `enabled`; used for edge-detection (on→off triggers
+    /// a lazy full_reset on the next keystroke instead of from the control task).
+    last_enabled: bool,
 }
 
 impl Daemon {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, enabled: Arc<AtomicBool>) -> Self {
         let terminal_override = match std::env::var("DAKLAK_TERMINAL_TIER")
             .ok()
             .as_deref()
@@ -108,6 +116,8 @@ impl Daemon {
             last_action_at: Instant::now() - Duration::from_secs(60),
             terminal_override,
             focused_app_id: None,
+            enabled,
+            last_enabled: true,
         }
     }
 
@@ -319,6 +329,15 @@ impl AdapterHandler for Daemon {
     ) -> KeyDecision {
         if let Some(w) = self.window.as_mut() {
             w.check_idle_reset();
+        }
+
+        let now_enabled = self.enabled.load(Ordering::Acquire);
+        if self.last_enabled && !now_enabled {
+            if let Some(w) = self.window.as_mut() { w.full_reset(); }
+        }
+        self.last_enabled = now_enabled;
+        if !now_enabled {
+            return KeyDecision::ForwardRaw;
         }
 
         let shortcut_mods = ModifierState::CTRL | ModifierState::ALT | ModifierState::SUPER;
@@ -961,6 +980,8 @@ mod tests {
     }
 
     mod surrounding_anchor_regression {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
         use super::super::Daemon;
         use crate::config::Config;
         use crate::window::WindowState;
@@ -1024,7 +1045,7 @@ mod tests {
             // to avoid the Chromium race condition where the key release
             // arrives via the fast wl_keyboard path and changes Chrome's
             // selection state before our text edit arrives.
-            let mut daemon = Daemon::new(Config::default());
+            let mut daemon = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
             daemon.current_active = true;
             daemon.window = Some(WindowState::new(
                 InputMethod::Telex,
@@ -1061,6 +1082,8 @@ mod tests {
     //    alongside WindowState. Bug is v1/KWin only — v2/wlroots path
     //    (shadow_already_has_ch=false) never reads or writes raw_word.
     mod raw_word_reset {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
         use super::super::Daemon;
         use crate::config::Config;
         use crate::window::WindowState;
@@ -1069,7 +1092,7 @@ mod tests {
         use viet_ime_evdev_adapter::EvdevHandler;
 
         fn v1_daemon() -> Daemon {
-            let mut d = Daemon::new(Config::default());
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
             d.current_active = true;
             d.window = Some(WindowState::new(
                 InputMethod::Telex,

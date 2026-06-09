@@ -15,6 +15,10 @@ cargo = find_program('cargo', required: true)
 # The only C library linked at build time is xkbcommon.
 xkbcommon_dep = dependency('xkbcommon', required: true)
 
+# App indicator uses ksni (StatusNotifierItem over pure-Rust zbus) — no C library linked.
+# dbus-1 is informational only: checked so the build summary reflects runtime requirements.
+dbus_dep = dependency('dbus-1', required: false)
+
 buildtype = get_option('buildtype')
 cargo_profile = buildtype == 'debug' ? 'debug' : 'release'
 cargo_target_dir = meson.current_build_dir() / 'cargo-target'
@@ -31,6 +35,8 @@ summary({
   'kde support': get_option('kde'),
   'evdev grab': get_option('evdev_grab'),
   'xkbcommon': xkbcommon_dep.version(),
+  'app indicator': 'ksni (StatusNotifierItem, pure-Rust zbus)',
+  'dbus-1 (runtime)': dbus_dep.found() ? dbus_dep.version() : 'not found (informational)',
 }, bool_yn: true, section: 'Configuration')
 
 if get_option('evdev_grab')
