@@ -81,6 +81,12 @@ fn main() -> Result<()> {
                 print_help();
                 return Ok(());
             }
+            "--ibus" => {
+                // ibus-daemon spawned us via the component <exec> line.
+                // Fall through to main with enable_ibus = true.
+                // Config::load() will see DAKLAK_ENABLE_IBUS if set; we also
+                // force the flag here so no env var is needed.
+            }
             other => {
                 eprintln!("daklak: unknown subcommand {other:?}\n");
                 print_help();
@@ -96,7 +102,11 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let config = config::Config::load()?;
+    let mut config = config::Config::load()?;
+    // --ibus flag forces ibus mode regardless of config file.
+    if std::env::args().any(|a| a == "--ibus") {
+        config.enable_ibus = true;
+    }
     tracing::info!("input method: {:?}", config.method);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -133,6 +143,15 @@ fn main() -> Result<()> {
         tray::spawn_tray(cmd_tx.clone(), state_rx);
 
         // --- mode-specific run loop ---
+
+        #[cfg(feature = "ibus")]
+        if config.enable_ibus {
+            let chars_delete_apps = config.force_chars_delete_apps.clone();
+            let daemon = handler::Daemon::new(config, enabled.clone());
+            return viet_ime_ibus_adapter::IbusAdapter::run(daemon, enabled, chars_delete_apps)
+                .await;
+        }
+
         #[cfg(feature = "wayland")]
         if config.enable_wayland {
             let daemon = handler::Daemon::new(config, enabled.clone());

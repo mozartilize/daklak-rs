@@ -18,9 +18,9 @@ cd "$(dirname "$(readlink -f "$0")")"
 # Keep handler at trace (composition logic) but quiet the raw protocol
 # event dump from dispatch_v1 (3-5 events per keystroke = noise).
 # export WAYLAND_DEBUG=1
-export RUST_LOG=daklak=trace,viet_ime_wayland_adapter=trace,viet_ime_wayland_adapter::dispatch_v1=trace
-export DAKLAK_ENABLE_EVDEV_GRAB=0
-export DAKLAK_ENABLE_WAYLAND=1
+export RUST_LOG=daklak=trace,viet_ime_ibus_adapter=debug,viet_ime_edit_strategy=debug,viet_ime_engine=trace
+#export DAKLAK_ENABLE_EVDEV_GRAB=0
+#export DAKLAK_ENABLE_WAYLAND=1
 # export DAKLAK_FORCE_VK_ONLY_APPS=org.keepassxc.KeePassXC,ONLYOFFICE,steam,xfce4-terminal,com.mitchellh.ghostty
 
-exec ./target/debug/daklak >>/tmp/daklak.log 2>&1
+exec ./target/debug/daklak --ibus >>/tmp/daklak.log 2>&1

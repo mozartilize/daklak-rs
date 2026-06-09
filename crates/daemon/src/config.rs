@@ -98,6 +98,13 @@ pub struct Config {
     /// Env override `DAKLAK_BRACKET_SHORTCUTS` (truthy heuristic).
     #[serde(default)]
     pub bracket_shortcuts: bool,
+
+    /// Enable GNOME / IBus engine mode. Connects to ibus-daemon and registers
+    /// as `org.freedesktop.IBus.Daklak`. Requires the `ibus` Cargo feature.
+    /// Set automatically when daklak is launched via `--ibus` or by ibus-daemon.
+    /// Env override `DAKLAK_ENABLE_IBUS` (truthy heuristic).
+    #[serde(default)]
+    pub enable_ibus: bool,
 }
 
 fn default_enable_wayland() -> bool {
@@ -115,6 +122,7 @@ impl Default for Config {
             force_chars_delete_apps: default_force_chars_delete_apps(),
             enable_evdev_grab: false,
             bracket_shortcuts: false,
+            enable_ibus: false,
         }
     }
 }
@@ -183,6 +191,13 @@ impl Config {
 
         if let Ok(v) = std::env::var("DAKLAK_BRACKET_SHORTCUTS") {
             cfg.bracket_shortcuts = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Ok(v) = std::env::var("DAKLAK_ENABLE_IBUS") {
+            cfg.enable_ibus = matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );

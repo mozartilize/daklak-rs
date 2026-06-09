@@ -572,12 +572,16 @@ dependencies = [
 name = "probe"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "libc",
+ "tokio",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
  "wayland-scanner",
+ "zbus",
+ "zvariant",
 ]
 
 [[package]]
@@ -1039,6 +1043,7 @@ dependencies = [
  "viet-ime-engine",
  "viet-ime-evdev-adapter",
  "viet-ime-focus",
+ "viet-ime-ibus-adapter",
  "viet-ime-key-emitter",
  "viet-ime-keymap",
  "viet-ime-wayland-adapter",
@@ -1085,6 +1090,18 @@ dependencies = [
  "async-trait",
  "tracing",
  "x11rb",
+]
+
+[[package]]
+name = "viet-ime-ibus-adapter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+ "tracing",
+ "viet-ime-edit-strategy",
+ "zbus",
+ "zvariant",
 ]
 
 [[package]]

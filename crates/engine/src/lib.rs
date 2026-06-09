@@ -164,6 +164,43 @@ mod tests {
     // ===== Telex basic =====
 
     #[test]
+    fn telex_hieeus_is_hieu() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert_eq!(type_str(&mut eng, "hieeus"), "hiếu");
+    }
+
+    /// Regression for the IBus v1 raw_word seeding path: before every key the
+    /// daemon resets the engine and `feed_context`s the accumulated raw ASCII
+    /// prefix. A tone after a vowel-cluster transform (`ee`→ê then `s`) must
+    /// still land on the cluster vowel — i.e. produce `hiếu`, not `hiêí`. This
+    /// pins that `feed_context` rebuilds the cluster so the seed-per-key model
+    /// the IBus adapter relies on stays correct.
+    #[test]
+    fn feed_context_per_key_preserves_vowel_cluster() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        let mut raw = String::new();
+        let mut screen = String::new();
+        for ch in "hieeus".chars() {
+            let prefix = raw.clone();
+            eng.reset();
+            if !prefix.is_empty() {
+                eng.feed_context(&prefix);
+            }
+            raw.push(ch);
+            let r = eng.process_key(ch);
+            if r.consumed {
+                for _ in 0..r.backspaces {
+                    screen.pop();
+                }
+                screen.push_str(&r.commit);
+            } else {
+                screen.push(ch);
+            }
+        }
+        assert_eq!(screen, "hiếu");
+    }
+
+    #[test]
     fn telex_plain_a() {
         let mut eng = EngineState::new(InputMethod::Telex);
         assert_eq!(type_str(&mut eng, "a"), "a");

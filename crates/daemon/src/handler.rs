@@ -502,6 +502,49 @@ impl AdapterHandler for Daemon {
     }
 }
 
+#[cfg(feature = "ibus")]
+impl viet_ime_ibus_adapter::IbusHandler for Daemon {
+    fn process_key(&mut self, evdev: u32, ch: Option<char>) -> KeyDecision {
+        Daemon::process_key(self, evdev, ch)
+    }
+    fn apply_with_sink(
+        &mut self,
+        backspaces: usize,
+        commit: &str,
+        time: u32,
+        sink: &mut viet_ime_ibus_adapter::sink::IbusSink,
+    ) {
+        Daemon::apply_with_sink(self, backspaces, commit, time, sink);
+    }
+    fn observe_surrounding(&mut self, text: &str, cursor: u32, anchor: u32) {
+        Daemon::observe_surrounding(self, text, cursor, anchor);
+    }
+    fn set_modifiers(&mut self, m: viet_ime_edit_strategy::ModifierState) {
+        self.modifiers = m;
+        if let Some(w) = self.window.as_mut() {
+            w.strategy.set_modifiers(m);
+        }
+    }
+    fn activate_ibus(
+        &mut self,
+        method: viet_ime_edit_strategy::BackspaceMethod,
+        chars_for_delete: bool,
+    ) {
+        Daemon::activate_ibus(self, method, chars_for_delete);
+    }
+    fn deactivate_ibus(&mut self) {
+        Daemon::deactivate_ibus(self);
+    }
+    fn update_method(&mut self, has_surrounding: bool) {
+        Daemon::update_ibus_method(self, has_surrounding);
+    }
+    fn full_reset(&mut self) {
+        if let Some(w) = self.window.as_mut() {
+            w.full_reset();
+        }
+    }
+}
+
 impl viet_ime_evdev_adapter::EvdevHandler for Daemon {
     fn handle_char(&mut self, code: u32, ch: char) -> KeyDecision {
         Daemon::handle_char(self, code, ch)
@@ -552,6 +595,181 @@ impl Daemon {
         self.window = Some(ws);
         if let Some(w) = self.window.as_mut() {
             w.strategy.set_modifiers(self.modifiers);
+        }
+    }
+
+    // ── Transport-neutral surface for IBus and other non-Wayland adapters ──────
+
+    /// Like `on_key_pressed` but without `AdapterCtx`. NAV and modifier-shortcut
+    /// keys return `ForwardRaw` instead of `Consumed` (caller just passes through).
+    /// Uses `shadow_already_has_ch = false` — IBus intercepts before the client
+    /// receives the key, same as v2/wlroots grab path.
+    pub fn process_key(&mut self, key: u32, ch: Option<char>) -> KeyDecision {
+        if let Some(w) = self.window.as_mut() {
+            w.check_idle_reset();
+        }
+        let now_enabled = self.enabled.load(Ordering::Acquire);
+        if self.last_enabled && !now_enabled {
+            if let Some(w) = self.window.as_mut() {
+                w.full_reset();
+            }
+        }
+        self.last_enabled = now_enabled;
+        if !now_enabled {
+            return KeyDecision::ForwardRaw;
+        }
+        let shortcut_mods = ModifierState::CTRL | ModifierState::ALT | ModifierState::SUPER;
+        if self.modifiers.intersects(shortcut_mods) {
+            if let Some(w) = self.window.as_mut() {
+                w.full_reset();
+            }
+            self.last_action_at = Instant::now() - Duration::from_secs(60);
+            return KeyDecision::ForwardRaw;
+        }
+        if NAV_KEYS.contains(&key) {
+            if let Some(w) = self.window.as_mut() {
+                w.full_reset();
+            }
+            self.last_action_at = Instant::now() - Duration::from_secs(60);
+            return KeyDecision::ForwardRaw;
+        }
+        if self.window.is_none() {
+            return KeyDecision::ForwardRaw;
+        }
+        if key == KEY_BACKSPACE {
+            return self.handle_backspace();
+        }
+        self.last_action_at = Instant::now();
+        let Some(ch) = ch else {
+            // Non-printable key (Enter, Tab, Escape, …) ends the current word.
+            // Clear the composition so the next char starts fresh and isn't
+            // seeded with this line's keystrokes (e.g. "hiếu"⏎ then typing must
+            // not re-seed raw_word="hieeus" → "hieeushi…").
+            if let Some(w) = self.window.as_mut() {
+                w.full_reset();
+            }
+            self.last_action_at = Instant::now() - Duration::from_secs(60);
+            return KeyDecision::ForwardRaw;
+        };
+        // IBus is a client-side-insertion + observe-surrounding transport, the
+        // same shape as the v1/KWin path: use the raw_word seed so the engine
+        // keeps vowel-cluster context across transforms (after `ee`→ê it would
+        // otherwise forget `iê` and mis-place a later tone, e.g. hiêu+s → hiêí
+        // instead of hiếu). NOT the v2 grab path (false), which relies on the
+        // engine's running state that ibus keystroke gaps + reseeds disturb.
+        self.handle_char_inner(key, ch, true)
+    }
+
+    /// Apply a pending edit to an arbitrary sink. Used by transports that don't
+    /// go through `AdapterCtx::with_sink` (IBus, tests).
+    pub fn apply_with_sink<S: viet_ime_edit_strategy::OutputSink>(
+        &mut self,
+        backspaces: usize,
+        commit: &str,
+        time: u32,
+        sink: &mut S,
+    ) {
+        if let Some(w) = self.window.as_mut() {
+            w.strategy.apply(backspaces, commit, 0, time, sink);
+        }
+    }
+
+    /// Update shadow + engine seed from surrounding text (IBus `SetSurroundingText`).
+    /// Skips reseed within 150 ms of a daklak action (our own echo).
+    pub fn observe_surrounding(&mut self, text: &str, cursor: u32, anchor: u32) {
+        let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
+        let Some(w) = self.window.as_mut() else {
+            return;
+        };
+
+        // Duplicate-frame guard: clients re-emit identical surrounding text;
+        // re-running the reseed logic on an unchanged frame burns engine state.
+        if text == w.prev_text && cursor == w.prev_cursor && anchor == w.prev_anchor {
+            return;
+        }
+
+        // A 1-char insertion at the prior cursor is an ordinary keystroke —
+        // the engine's running composition already tracks it. Re-seeding here
+        // would clobber transient Telex state (double-letter ee→ê, a pending
+        // tone on the current syllable), which is exactly what broke "hieeus"
+        // and "phucs". So only re-seed on a genuine cursor jump (click
+        // elsewhere / focus into existing text), never on mid-word typing.
+        // Mirrors the wayland on_done_frame guard. (ibus reports cursor in
+        // chars; for the ASCII telex-typing case chars == bytes, so the
+        // byte-based detector is correct here; multibyte echo frames arrive
+        // <150 ms after our own commit and are caught by recent_action.)
+        let one_char_typed =
+            detect_one_char_insertion(&w.prev_text, w.prev_cursor, text, cursor);
+        let should_reseed = !one_char_typed && !recent_action;
+
+        w.strategy.on_surrounding_text(text, cursor, anchor);
+
+        if should_reseed {
+            let word = current_word_before_cursor(text, cursor);
+            w.engine.reset();
+            if word_qualifies_for_reseed(word) {
+                tracing::debug!(word, "re-seed engine (cursor jump)");
+                w.engine.feed_context(word);
+                w.raw_word_screen_widths = vec![1u8; word.len()];
+                w.raw_word = word.to_owned();
+            } else {
+                w.raw_word.clear();
+                w.raw_word_screen_widths.clear();
+            }
+        }
+
+        w.prev_text = text.to_owned();
+        w.prev_cursor = cursor;
+        w.prev_anchor = anchor;
+    }
+
+    /// Create a window session for a non-Wayland transport (IBus). Idempotent.
+    pub fn activate_ibus(
+        &mut self,
+        method: viet_ime_edit_strategy::BackspaceMethod,
+        chars_for_delete: bool,
+    ) {
+        if self.current_active {
+            return;
+        }
+        let mut ws = WindowState::new(
+            self.config.method.to_engine(),
+            method,
+            self.config.bracket_shortcuts,
+        );
+        ws.chars_for_delete = chars_for_delete;
+        ws.strategy.set_modifiers(self.modifiers);
+        self.window = Some(ws);
+        self.current_active = true;
+    }
+
+    /// Tear down the IBus session. Clears composition state.
+    pub fn deactivate_ibus(&mut self) {
+        if let Some(w) = self.window.as_mut() {
+            w.full_reset();
+        }
+        self.window = None;
+        self.current_active = false;
+    }
+
+    /// React to an IBus `SetCapabilities` while a session is live.
+    ///
+    /// Clients (gedit) emit a transient `caps=9` (FOCUS only, no surrounding)
+    /// during a focus switch, then the real `caps=41` (with surrounding) a
+    /// moment later — but `FocusIn` fires in between and latches the method
+    /// from the stale `caps=9`, pinning ForwardKey on a client that does
+    /// support surrounding text. So upgrade ForwardKey → SurroundingText when
+    /// surrounding becomes available. Upgrade-only: never downgrade on the
+    /// transient `caps=9`, which would re-introduce the broken path.
+    pub fn update_ibus_method(&mut self, has_surrounding: bool) {
+        if !has_surrounding {
+            return;
+        }
+        if let Some(w) = self.window.as_mut() {
+            if w.strategy.method() == BackspaceMethod::ForwardKey {
+                tracing::info!("ibus: upgrade ForwardKey → SurroundingText on caps");
+                w.strategy.set_method(BackspaceMethod::SurroundingText);
+            }
         }
     }
 

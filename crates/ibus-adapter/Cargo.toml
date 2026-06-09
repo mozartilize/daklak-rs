@@ -1,0 +1,15 @@
+[package]
+name = "viet-ime-ibus-adapter"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+viet-ime-edit-strategy = { path = "../edit-strategy" }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zvariant = "5"

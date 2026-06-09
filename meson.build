@@ -27,12 +27,16 @@ features = []
 if get_option('kde')
   features += 'kde'
 endif
+if get_option('ibus')
+  features += 'ibus'
+endif
 
 summary({
   'prefix': get_option('prefix'),
   'bin dir': get_option('bindir'),
   'build type': buildtype,
   'kde support': get_option('kde'),
+  'ibus/GNOME support': get_option('ibus'),
   'evdev grab': get_option('evdev_grab'),
   'xkbcommon': xkbcommon_dep.version(),
   'app indicator': 'ksni (StatusNotifierItem, pure-Rust zbus)',
@@ -61,6 +65,21 @@ if get_option('kde')
   )
   install_data(desktop,
     install_dir: get_option('datadir') / 'applications',
+  )
+endif
+
+if get_option('ibus')
+  ibus_comp_conf = configuration_data()
+  ibus_comp_conf.set('bindir', get_option('prefix') / get_option('bindir'))
+  ibus_comp_conf.set('version', meson.project_version())
+  ibus_comp = configure_file(
+    input: 'data/ibus/daklak.xml',
+    output: 'daklak.xml',
+    configuration: ibus_comp_conf,
+  )
+  ibus_comp_dir = get_option('datadir') / 'ibus' / 'component'
+  install_data(ibus_comp,
+    install_dir: ibus_comp_dir,
   )
 endif
 

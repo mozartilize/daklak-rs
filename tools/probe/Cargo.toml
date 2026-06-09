@@ -20,6 +20,10 @@ path = "src/bin/vk_xkb_probe_eight.rs"
 name = "im_v1_probe"
 path = "src/bin/im_v1_probe.rs"
 
+[[bin]]
+name = "ibus_probe"
+path = "src/bin/ibus_probe.rs"
+
 [dependencies]
 wayland-backend = { workspace = true }
 wayland-client = { workspace = true }
@@ -27,3 +31,9 @@ wayland-protocols = { workspace = true }
 wayland-protocols-wlr = { workspace = true }
 wayland-scanner = "0.31"
 libc = "0.2"
+
+# ibus_probe (Phase 0): IBus engine over D-Bus.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zvariant = "5"
+tokio = { workspace = true }
+anyhow = "1"

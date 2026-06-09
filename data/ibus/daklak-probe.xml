@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Phase 0 probe component for plan8 (NOT the production component).
+  Lets ibus list + spawn the throwaway ibus_probe engine so the live
+  "CommitText lands in a client" test can run.
+
+  Install for the LIVE test (per-user, no root, non-destructive to system):
+    cp data/ibus/daklak-probe.xml ~/.local/share/ibus/component/
+    ibus write-cache        # refresh the registry cache
+    ibus restart            # re-scan components (restarts YOUR ibus-daemon)
+    ibus engine daklak-probe # activate; or pick "Daklak (probe)" in ibus-setup
+  Then focus any ibus client and press a key — "xin chào" should commit.
+
+  Uninstall:
+    rm ~/.local/share/ibus/component/daklak-probe.xml && ibus write-cache && ibus restart
+
+  NOTE: <exec> is the absolute debug-build path so ibus can spawn it.
+  ibus-spawned model — do NOT run ibus_probe by hand at the same time
+  (two owners of the bus name).
+-->
+<component>
+    <name>org.freedesktop.IBus.Daklak</name>
+    <description>Daklak Vietnamese IME — Phase 0 probe</description>
+    <exec>/home/mozart/Documents/workspace/daklak-rs/target/debug/ibus_probe</exec>
+    <version>0.1.0</version>
+    <author>daklak</author>
+    <license>GPL-3.0-or-later</license>
+    <homepage>https://github.com/mozartilize/daklak-rs</homepage>
+    <textdomain>daklak</textdomain>
+    <engines>
+        <engine>
+            <name>daklak-probe</name>
+            <language>vi</language>
+            <license>GPL-3.0-or-later</license>
+            <author>daklak</author>
+            <layout>us</layout>
+            <longname>Daklak (probe)</longname>
+            <description>Phase 0 probe — commits "xin chào" on any key</description>
+            <icon>ibus-keyboard</icon>
+            <rank>0</rank>
+            <symbol>VN</symbol>
+        </engine>
+    </engines>
+</component>
