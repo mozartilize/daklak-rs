@@ -33,8 +33,10 @@ fn current_word_before_cursor(text: &str, cursor: u32) -> &str {
         .unwrap_or(0);
     let before = &text[..cursor];
     let start = before
-        .rfind(|c: char| c.is_whitespace() || c == '\0')
-        .map(|i| i + 1)
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace() || *c == '\0')
+        .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0);
     &before[start..]
 }
