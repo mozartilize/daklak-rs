@@ -1,10 +1,11 @@
+mod composer;
 mod config;
 mod control;
 mod handler;
 mod ipc;
 mod main_loop;
+mod transport;
 mod tray;
-mod window;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
