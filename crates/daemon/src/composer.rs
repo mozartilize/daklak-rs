@@ -349,11 +349,15 @@ impl Composer {
         self.apply_surrounding(text, cursor.0, anchor.0, force_reseed);
     }
 
-    /// IBus reports cursor in **chars**. For the ASCII telex-typing case
-    /// chars == bytes, so the byte-based one-char detector is correct here;
-    /// multibyte echo frames arrive <150 ms after our own commit and are
-    /// caught by the recent-action gate. ibus never force-reseeds (no
-    /// activate frame in this path).
+    /// IBus reports cursor/anchor in **chars**; everything downstream
+    /// (`apply_surrounding`, `shadow.observe_surrounding`,
+    /// `current_word_before_cursor`, `detect_one_char_insertion`) is
+    /// byte-based, so convert at this boundary. For ASCII telex chars == bytes
+    /// and this is a no-op, but once a multibyte char is committed (any
+    /// Vietnamese diacritic, e.g. `í` = 2 bytes) the char offset lands
+    /// mid-char when read as a byte offset, which truncated the shadow to ""
+    /// and dropped the next `delete_surrounding_text` (typing `iss` → `íis`).
+    /// ibus never force-reseeds (no activate frame in this path).
     #[cfg(feature = "ibus")]
     pub fn observe_surrounding_chars(
         &mut self,
@@ -361,7 +365,9 @@ impl Composer {
         cursor: CharCursor,
         anchor: CharCursor,
     ) {
-        self.apply_surrounding(text, cursor.0, anchor.0, false);
+        let cursor_bytes = char_to_byte_offset(text, cursor.0);
+        let anchor_bytes = char_to_byte_offset(text, anchor.0);
+        self.apply_surrounding(text, cursor_bytes, anchor_bytes, false);
     }
 
     /// The reseed gate proper — the single home of the logic that previously
@@ -425,6 +431,18 @@ impl Composer {
 /// Extract just the word immediately before the cursor (scan back to last
 /// whitespace). For retroactive editing, the engine only needs the current
 /// word's context — not the entire document.
+/// Convert a char offset into a byte offset within `text`. An offset equal to
+/// (or past) the char count maps to `text.len()` — the cursor sits at the end.
+/// IBus surrounding-text offsets are char-based; the rest of the daemon is
+/// byte-based, so this is applied at the IBus boundary.
+#[cfg(feature = "ibus")]
+fn char_to_byte_offset(text: &str, char_idx: u32) -> u32 {
+    text.char_indices()
+        .nth(char_idx as usize)
+        .map(|(b, _)| b as u32)
+        .unwrap_or(text.len() as u32)
+}
+
 pub fn current_word_before_cursor(text: &str, cursor: u32) -> &str {
     let cursor = (cursor as usize).min(text.len());
     let cursor = (0..=cursor)
@@ -701,5 +719,39 @@ mod tests {
     #[test]
     fn wqr_punctuation_rejected() {
         assert!(!wqr("hello,"));
+    }
+}
+
+#[cfg(all(test, feature = "ibus"))]
+mod char_to_byte_offset_tests {
+    use super::char_to_byte_offset as c2b;
+
+    #[test]
+    fn ascii_char_offset_equals_byte_offset() {
+        assert_eq!(c2b("is", 0), 0);
+        assert_eq!(c2b("is", 1), 1);
+        assert_eq!(c2b("is", 2), 2); // end
+    }
+
+    #[test]
+    fn multibyte_cursor_at_end_maps_to_byte_len() {
+        // "í" = U+00ED = 2 bytes, 1 char. IBus reports cursor_pos=1 (chars);
+        // this must map to byte 2 (end), NOT byte 1 (mid-char) — the bug that
+        // truncated the shadow to "" and produced "íis" when typing "iss".
+        assert_eq!(c2b("í", 1), 2);
+    }
+
+    #[test]
+    fn mixed_multibyte_offsets() {
+        // "íis" = í(2) + i(1) + s(1) = 4 bytes, 3 chars.
+        assert_eq!(c2b("íis", 0), 0);
+        assert_eq!(c2b("íis", 1), 2); // after í
+        assert_eq!(c2b("íis", 2), 3); // after i
+        assert_eq!(c2b("íis", 3), 4); // end
+    }
+
+    #[test]
+    fn offset_past_end_clamps_to_byte_len() {
+        assert_eq!(c2b("í", 99), 2);
     }
 }
