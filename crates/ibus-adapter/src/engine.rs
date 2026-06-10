@@ -114,9 +114,8 @@ pub trait IbusHandler: Send {
     fn set_modifiers(&mut self, m: viet_ime_edit_strategy::ModifierState);
     fn activate_ibus(&mut self, method: BackspaceMethod, chars_for_delete: bool);
     fn deactivate_ibus(&mut self);
-    /// React to a capability change mid-session (upgrade ForwardKey →
-    /// SurroundingText when surrounding text becomes available).
-    fn update_method(&mut self, has_surrounding: bool);
+    /// React to a routing change mid-session.
+    fn update_method(&mut self, method: BackspaceMethod);
     fn full_reset(&mut self);
 }
 
@@ -168,12 +167,18 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
                         tracing::warn!("DeleteSurroundingText failed: {e}");
                     }
                 }
-                for text in &sink.commits {
-                    if let Err(e) = Engine::<D>::commit_text(&emitter, ibus_text(text)).await {
-                        tracing::warn!("CommitText failed: {e}");
-                    }
-                }
+                // Deletion must precede the commit in BOTH tiers: surrounding
+                // emits delete_surrounding_text (above), ForwardKey emits
+                // BackSpace key events here. Flushing commits first would
+                // append the corrected text and only then backspace, dropping
+                // the correction (`tieêngếng` instead of `tiếng` in foot).
                 for fwd in &sink.forwards {
+                    tracing::debug!(
+                        keyval = format_args!("{:#06x}", fwd.keyval),
+                        keycode = fwd.keycode,
+                        state = fwd.state,
+                        "emit ForwardKeyEvent D-Bus signal"
+                    );
                     if let Err(e) = Engine::<D>::forward_key_event(
                         &emitter,
                         fwd.keyval,
@@ -185,12 +190,19 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
                         tracing::warn!("ForwardKeyEvent failed: {e}");
                     }
                 }
+                for text in &sink.commits {
+                    tracing::debug!(commit = %text, "emit CommitText D-Bus signal");
+                    if let Err(e) = Engine::<D>::commit_text(&emitter, ibus_text(text)).await {
+                        tracing::warn!("CommitText failed: {e}");
+                    }
+                }
                 true
             }
         }
     }
 
     async fn focus_in(&self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) {
+        tracing::debug!("D-Bus FocusIn (no client id)");
         self.do_focus_in(None, &emitter).await;
     }
 
@@ -200,7 +212,7 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
         object_path: &str,
         client: &str,
     ) {
-        let _ = object_path;
+        tracing::debug!(object_path, client, "D-Bus FocusInId");
         let app_id = if client.is_empty() { None } else { Some(client.to_ascii_lowercase()) };
         self.do_focus_in(app_id, &emitter).await;
     }
@@ -239,7 +251,7 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
         s.has_surrounding = has_surrounding;
         // FocusIn may have latched ForwardKey from a transient caps=9; upgrade
         // now that we know surrounding text is available.
-        s.daemon.update_method(has_surrounding);
+        s.daemon.update_method(method_for_capability(has_surrounding));
     }
 
     async fn set_cursor_location(&self, _x: i32, _y: i32, _w: i32, _h: i32) {}
@@ -257,9 +269,22 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
             "SetSurroundingText"
         );
         let mut s = self.state.lock().await;
-        if s.has_surrounding {
-            s.daemon.observe_surrounding(&text_str, cursor_pos, anchor_pos);
+        // Receiving surrounding text is PROOF the client supports it —
+        // regardless of a transient caps=9 that may have latched ForwardKey
+        // during a focus flap (gedit's defocused capability ends on caps=9, so
+        // a re-focus can race activate_ibus into picking ForwardKey and get
+        // stuck). Trust the evidence over the racy caps flag: flip
+        // has_surrounding sticky-true and upgrade the method (no-op if already
+        // SurroundingText). Mirrors the wayland "late tier upgrade on first
+        // surrounding_text".
+        if !s.has_surrounding {
+            tracing::info!(
+                "SetSurroundingText while has_surrounding=false → upgrade method (caps race)"
+            );
+            s.has_surrounding = true;
+            s.daemon.update_method(BackspaceMethod::SurroundingText);
         }
+        s.daemon.observe_surrounding(&text_str, cursor_pos, anchor_pos);
     }
 
     async fn property_activate(&self, _name: &str, _state: u32) {}
@@ -314,13 +339,14 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
         {
             let mut s = self.state.lock().await;
             s.client_app_id = app_id;
-            let method = if s.has_surrounding {
-                BackspaceMethod::SurroundingText
-            } else {
-                BackspaceMethod::ForwardKey
-            };
+            let method = method_for_capability(s.has_surrounding);
             let chars_for_delete = s.chars_for_delete();
-            tracing::debug!(?method, chars_for_delete, "FocusIn → activate_ibus");
+            tracing::debug!(
+                app_id = ?s.client_app_id,
+                ?method,
+                chars_for_delete,
+                "FocusIn → activate_ibus"
+            );
             s.daemon.activate_ibus(method, chars_for_delete);
             // lock dropped before the .await below
         }
@@ -332,8 +358,18 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
     }
 
     async fn do_focus_out(&self) {
-        tracing::debug!("FocusOut → deactivate_ibus");
-        self.state.lock().await.daemon.deactivate_ibus();
+        let mut s = self.state.lock().await;
+        tracing::debug!(app_id = ?s.client_app_id, "FocusOut → deactivate_ibus");
+        s.client_app_id = None;
+        s.daemon.deactivate_ibus();
+    }
+}
+
+fn method_for_capability(has_surrounding: bool) -> BackspaceMethod {
+    if has_surrounding {
+        BackspaceMethod::SurroundingText
+    } else {
+        BackspaceMethod::ForwardKey
     }
 }
 
@@ -397,4 +433,22 @@ pub async fn run<D: IbusHandler + Send + 'static>(
     let _conn = conn;
     std::future::pending::<()>().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_selection_prefers_surrounding() {
+        assert_eq!(
+            method_for_capability(true),
+            BackspaceMethod::SurroundingText
+        );
+    }
+
+    #[test]
+    fn method_selection_falls_back_to_forward_key() {
+        assert_eq!(method_for_capability(false), BackspaceMethod::ForwardKey);
+    }
 }

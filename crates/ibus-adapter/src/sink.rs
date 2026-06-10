@@ -84,12 +84,13 @@ impl OutputSink for IbusSink {
         if keyval == 0 {
             return;
         }
-        let x11_kc = key_code + 8;
         let s = match state {
             KeyState::Pressed => 0u32,
             KeyState::Released => IBUS_RELEASE_MASK,
         };
-        self.forwards.push(PendingForward { keyval, keycode: x11_kc, state: s });
+        // ForwardKeyEvent keycode follows ProcessKeyEvent input semantics: evdev.
+        // IBus frontends that need X11 keycode do the +8 conversion themselves.
+        self.forwards.push(PendingForward { keyval, keycode: key_code, state: s });
     }
 
     fn vk_modifiers(&mut self, _depressed: u32, _latched: u32, _locked: u32, _group: u32) {
@@ -101,13 +102,48 @@ impl OutputSink for IbusSink {
         // but handle backspace gracefully just in case.
         let kc = key_code as u32;
         let keyval = if kc == 14 { XK_BACKSPACE } else { return };
-        let x11_kc = kc + 8;
         let s = if value == 0 { IBUS_RELEASE_MASK } else { 0 };
-        self.forwards.push(PendingForward { keyval, keycode: x11_kc, state: s });
+        self.forwards.push(PendingForward { keyval, keycode: kc, state: s });
     }
 
     fn vk_commit_char(&mut self, _time: u32, c: char) -> bool {
         self.commits.push(c.to_string());
         true
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vk_key_uses_evdev_keycode_for_forward_event() {
+        let mut sink = IbusSink::default();
+        sink.vk_key(0, 14, KeyState::Pressed);
+        sink.vk_key(0, 14, KeyState::Released);
+
+        assert_eq!(sink.forwards.len(), 2);
+        assert_eq!(sink.forwards[0].keycode, 14);
+        assert_eq!(sink.forwards[0].keyval, XK_BACKSPACE);
+        assert_eq!(sink.forwards[0].state, 0);
+        assert_eq!(sink.forwards[1].keycode, 14);
+        assert_eq!(sink.forwards[1].keyval, XK_BACKSPACE);
+        assert_eq!(sink.forwards[1].state, IBUS_RELEASE_MASK);
+    }
+
+    #[test]
+    fn uinput_key_uses_evdev_keycode_for_forward_event() {
+        let mut sink = IbusSink::default();
+        sink.uinput_key(14, 1);
+        sink.uinput_key(14, 0);
+
+        assert_eq!(sink.forwards.len(), 2);
+        assert_eq!(sink.forwards[0].keycode, 14);
+        assert_eq!(sink.forwards[0].keyval, XK_BACKSPACE);
+        assert_eq!(sink.forwards[0].state, 0);
+        assert_eq!(sink.forwards[1].keycode, 14);
+        assert_eq!(sink.forwards[1].keyval, XK_BACKSPACE);
+        assert_eq!(sink.forwards[1].state, IBUS_RELEASE_MASK);
     }
 }

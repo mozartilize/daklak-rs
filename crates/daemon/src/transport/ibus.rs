@@ -37,8 +37,8 @@ impl viet_ime_ibus_adapter::IbusHandler for Daemon {
     fn deactivate_ibus(&mut self) {
         Daemon::deactivate_ibus(self);
     }
-    fn update_method(&mut self, has_surrounding: bool) {
-        Daemon::update_ibus_method(self, has_surrounding);
+    fn update_method(&mut self, method: viet_ime_edit_strategy::BackspaceMethod) {
+        Daemon::update_ibus_method(self, method);
     }
     fn full_reset(&mut self) {
         if let Some(w) = self.composer.as_mut() {

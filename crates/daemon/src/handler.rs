@@ -294,24 +294,13 @@ impl Daemon {
         self.current_active = false;
     }
 
-    /// React to an IBus `SetCapabilities` while a session is live.
-    ///
-    /// Clients (gedit) emit a transient `caps=9` (FOCUS only, no surrounding)
-    /// during a focus switch, then the real `caps=41` (with surrounding) a
-    /// moment later — but `FocusIn` fires in between and latches the method
-    /// from the stale `caps=9`, pinning ForwardKey on a client that does
-    /// support surrounding text. So upgrade ForwardKey → SurroundingText when
-    /// surrounding becomes available. Upgrade-only: never downgrade on the
-    /// transient `caps=9`, which would re-introduce the broken path.
+    /// React to an IBus routing change while a session is live.
     #[cfg(feature = "ibus")]
-    pub fn update_ibus_method(&mut self, has_surrounding: bool) {
-        if !has_surrounding {
-            return;
-        }
+    pub fn update_ibus_method(&mut self, want: BackspaceMethod) {
         if let Some(w) = self.composer.as_mut() {
-            if w.method() == BackspaceMethod::ForwardKey {
-                tracing::info!("ibus: upgrade ForwardKey → SurroundingText on caps");
-                w.set_method(BackspaceMethod::SurroundingText);
+            if w.method() != want {
+                tracing::info!(?want, "ibus: method updated");
+                w.set_method(want);
             }
         }
     }
