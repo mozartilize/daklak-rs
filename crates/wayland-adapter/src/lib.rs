@@ -205,12 +205,11 @@ pub trait AdapterHandler: 'static {
         is_xwayland: bool,
     );
 
-    /// Whether the active window wants v1 `delete_surrounding_text` to
-    /// emit chars (and the adapter to insert a small post-apply sleep so
-    /// the v1↔v3 bridge can flush before the next key). `None` if no
-    /// active window.
-    fn window_chars_for_delete(&self) -> Option<bool> {
-        None
+    /// Whether the active window needs a post-apply flush + sleep barrier so
+    /// compositor/client bridge echoes cannot batch with the next key. Delete
+    /// units are threaded separately through `apply_pending -> with_sink`.
+    fn window_debounce_barrier(&self) -> bool {
+        false
     }
 }
 
@@ -273,7 +272,7 @@ impl<'a> AdapterCtx<'a> {
         &mut self,
         raw_mods: (u32, u32, u32, u32),
         held_user_kc: Option<u32>,
-        chars_for_delete: bool,
+        delete_in_chars: bool,
         f: F,
     ) where
         F: FnOnce(&mut AdapterSink<'_>),
@@ -306,7 +305,7 @@ impl<'a> AdapterCtx<'a> {
                     synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
                     raw_mods,
                     held_user_kc,
-                    chars_for_delete,
+                    delete_in_chars,
                     conn,
                     xkb: self.state.xkb.as_ref(),
                     pending_im_commit_ack: &mut self.state.pending_im_commit_ack,
@@ -330,7 +329,7 @@ impl<'a> AdapterCtx<'a> {
                     synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
                     raw_mods,
                     held_user_kc,
-                    chars_for_delete,
+                    delete_in_chars,
                     conn,
                     xkb: self.state.xkb.as_ref(),
                     pending_im_commit_ack: &mut self.state.pending_im_commit_ack,
@@ -415,10 +414,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 }
 
                 let raw_mods = self.state.raw_mods;
-                let chars_for_delete = self
-                    .handler
-                    .window_chars_for_delete()
-                    .unwrap_or(false);
+                let debounce_barrier = self.handler.window_debounce_barrier();
                 {
                     let mut ctx = AdapterCtx { state: &mut self.state };
                     self.handler.apply_pending(
@@ -441,7 +437,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 // so KWin has flushed our events before the next user key
                 // arrives, giving firefox a chance to echo the post-
                 // commit surrounding_text and breaking the batch.
-                if chars_for_delete {
+                if debounce_barrier {
                     if let Some(c) = &self.state.conn {
                         let _ = c.flush();
                     }
@@ -830,6 +826,7 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
 #[cfg(test)]
 mod tests {
     use super::*;
+    use viet_ime_edit_strategy::ModifierState;
 
     #[test]
     fn profile_for_imv2_has_vk_no_keysym() {
@@ -890,5 +887,49 @@ mod tests {
         v2_plasma.focus = FocusSource::KdePlasma;
         assert_eq!(v2_plasma.protocol, ImProtocol::ImV2);
         assert_eq!(v2_plasma.focus, FocusSource::KdePlasma);
+    }
+
+    struct NoopHandler;
+
+    impl AdapterHandler for NoopHandler {
+        fn on_done_frame(&mut self, _ctx: &mut AdapterCtx<'_>, _frame: &FrameSnapshot) {}
+
+        fn on_key_pressed(
+            &mut self,
+            _ctx: &mut AdapterCtx<'_>,
+            _time: u32,
+            _key: u32,
+            _ch: Option<char>,
+        ) -> KeyDecision {
+            KeyDecision::Consumed
+        }
+
+        fn apply_pending(
+            &mut self,
+            _ctx: &mut AdapterCtx<'_>,
+            _time: u32,
+            _method: BackspaceMethod,
+            _backspaces: usize,
+            _commit: &str,
+            _raw_mods: (u32, u32, u32, u32),
+            _held_user_kc: Option<u32>,
+        ) {
+        }
+
+        fn on_modifiers(&mut self, _ctx: &mut AdapterCtx<'_>, _mods: ModifierState) {}
+
+        fn on_focus_changed(
+            &mut self,
+            _ctx: &mut AdapterCtx<'_>,
+            _app_id: Option<String>,
+            _is_xwayland: bool,
+        ) {
+        }
+    }
+
+    #[test]
+    fn adapter_handler_debounce_barrier_is_independent_from_delete_units() {
+        let h = NoopHandler;
+        assert!(!h.window_debounce_barrier());
     }
 }

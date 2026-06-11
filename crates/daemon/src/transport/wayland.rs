@@ -55,11 +55,14 @@ impl AdapterHandler for Daemon {
                         .any(|t| t.eq_ignore_ascii_case(&lower))
                 })
                 .unwrap_or(false);
-            c.set_chars_for_delete(chars_for_delete);
+            // firefox needs both the char-count delete AND the post-apply
+            // debounce; they are independent quirks (plan82 #4) that this app
+            // happens to require together.
+            c.set_window_quirks(chars_for_delete, chars_for_delete);
             if chars_for_delete {
                 tracing::info!(
                     app_id = ?self.focused_app_id,
-                    "force_chars_delete_apps match → v1 delete_surrounding_text will use char count"
+                    "force_chars_delete_apps match → char-count delete + debounce barrier"
                 );
             }
             c.set_modifiers(self.modifiers);
@@ -233,8 +236,8 @@ impl AdapterHandler for Daemon {
         let serial = ctx.serial();
         if let Some(w) = self.composer.as_mut() {
             tracing::debug!(method = ?w.method, backspaces, commit, "strategy.apply");
-            let chars_for_delete = w.chars_for_delete;
-            ctx.with_sink(raw_mods, held_user_kc, chars_for_delete, |sink| {
+            let delete_in_chars = w.delete_in_chars;
+            ctx.with_sink(raw_mods, held_user_kc, delete_in_chars, |sink| {
                 w.strategy.apply(backspaces, commit, serial, time, sink);
             });
         }
@@ -316,7 +319,7 @@ impl AdapterHandler for Daemon {
         }
     }
 
-    fn window_chars_for_delete(&self) -> Option<bool> {
-        self.composer.as_ref().map(|w| w.chars_for_delete)
+    fn window_debounce_barrier(&self) -> bool {
+        self.composer.as_ref().map(|w| w.debounce_barrier).unwrap_or(false)
     }
 }

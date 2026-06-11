@@ -61,12 +61,17 @@ pub struct Composer {
     pub raw_word_screen_widths: Vec<u8>,
     raw_word_from_surrounding: bool,
 
-    /// When true, `delete_surrounding_text` on the ImV1 sink emits a
-    /// CHAR count rather than the spec-compliant byte count. Set at
-    /// activate when `app_id` matches `force_chars_delete_apps` (firefox
-    /// by default). Other v3 clients (chromium/Qt/GTK) honor bytes per
-    /// spec — flipping universally would break them.
-    pub chars_for_delete: bool,
+    /// When true, `delete_surrounding_text` emits a CHAR count rather than the
+    /// spec-compliant byte count. Set at activate when `app_id` matches
+    /// `force_chars_delete_apps` (firefox by default). Other v3 clients honor
+    /// bytes per spec. Independent of `debounce_barrier` (plan82 #4) — a future
+    /// app may need one without the other.
+    pub delete_in_chars: bool,
+    /// When true, the Wayland apply loop forces a flush + 30 ms sleep after each
+    /// apply so firefox's v1↔v3 bridge echoes post-commit surrounding_text and
+    /// can't batch consecutive delete+commit pairs. A *timing* quirk, unrelated
+    /// to the delete unit above; firefox needs both, hence they were once fused.
+    pub debounce_barrier: bool,
 
     /// Timestamp of the last user-keystroke action — used to distinguish
     /// "compositor echo of our action" (recent) from "user clicked mid-word"
@@ -93,7 +98,8 @@ impl Composer {
             raw_word: String::new(),
             raw_word_screen_widths: Vec::new(),
             raw_word_from_surrounding: false,
-            chars_for_delete: false,
+            delete_in_chars: false,
+            debounce_barrier: false,
             last_action_at: Instant::now() - Duration::from_secs(60),
         }
     }
@@ -127,8 +133,11 @@ impl Composer {
         self.strategy.set_modifiers(m);
     }
 
-    pub fn set_chars_for_delete(&mut self, v: bool) {
-        self.chars_for_delete = v;
+    /// Set the per-window delete/debounce quirks. They are independent (#4);
+    /// firefox happens to need both, so callers may pass the same value twice.
+    pub fn set_window_quirks(&mut self, delete_in_chars: bool, debounce_barrier: bool) {
+        self.delete_in_chars = delete_in_chars;
+        self.debounce_barrier = debounce_barrier;
     }
 
     // ── lifecycle ─────────────────────────────────────────────────────────
@@ -661,6 +670,19 @@ mod tests {
             }
             _ => panic!("expected tone replacement edit"),
         }
+    }
+
+    #[test]
+    fn window_quirks_store_delete_units_and_debounce_independently() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+        c.set_window_quirks(true, false);
+        assert!(c.delete_in_chars);
+        assert!(!c.debounce_barrier);
+
+        c.set_window_quirks(false, true);
+        assert!(!c.delete_in_chars);
+        assert!(c.debounce_barrier);
     }
 
     #[test]

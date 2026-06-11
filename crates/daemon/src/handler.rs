@@ -293,7 +293,9 @@ impl Daemon {
             method,
             self.config.bracket_shortcuts,
         );
-        c.set_chars_for_delete(chars_for_delete);
+        // IBus has no Wayland apply-loop sleep, so the debounce barrier is moot
+        // here; only the delete unit matters.
+        c.set_window_quirks(chars_for_delete, false);
         c.set_modifiers(self.modifiers);
         self.composer = Some(c);
         self.current_active = true;
