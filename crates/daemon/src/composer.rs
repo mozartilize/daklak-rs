@@ -245,6 +245,10 @@ impl Composer {
         // v1/KWin path: maintain raw_word_screen_widths in sync with raw_word.
         // raw_word_screen_widths[i] = how many raw chars produced screen char i.
         // Invariant: sum(raw_word_screen_widths) == raw_word.len().
+        let v1_identity_output = shadow_already_has_ch
+            && r.consumed
+            && r.backspaces == 0
+            && r.commit.chars().eq(std::iter::once(ch));
         if shadow_already_has_ch && ch.is_ascii_alphabetic() {
             if r.consumed && !v1_identity_output && self.raw_word_from_surrounding {
                 for _ in 0..r.backspaces {
@@ -283,7 +287,7 @@ impl Composer {
             }
         }
 
-        if r.consumed {
+        if r.consumed && !v1_identity_output {
             let method = self.method;
             KeyDecision::Apply {
                 method,
@@ -412,6 +416,10 @@ impl Composer {
         let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
         let one_char_typed =
             detect_one_char_insertion(&self.prev_text, self.prev_cursor, text, cursor);
+        if recent_action && !one_char_typed && !force_reseed {
+            tracing::trace!(text, cursor, anchor, "skip recent surrounding_text echo");
+            return;
+        }
         let should_reseed = force_reseed || (!one_char_typed && !recent_action);
 
         self.strategy.on_surrounding_text(text, cursor, anchor);

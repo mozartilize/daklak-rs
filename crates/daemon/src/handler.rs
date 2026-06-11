@@ -108,12 +108,12 @@ impl Daemon {
     pub(crate) fn detect_capability(&self, frame: &FrameSnapshot) -> BackspaceMethod {
         let probe = CapabilityProbe {
             purpose: frame.purpose,
-            surrounding_text_seen: frame.surrounding_text.as_ref().map(|(text, cursor, _anchor)| {
-                SurroundingFrame {
+            surrounding_text_seen: frame.surrounding_text.as_ref().map(
+                |(text, cursor, _anchor)| SurroundingFrame {
                     text: text.clone(),
                     cursor: *cursor,
-                }
-            }),
+                },
+            ),
             app_id: self.focused_app_id.clone(),
             force_uinput_apps: self.config.force_uinput_apps.clone(),
             force_vk_only_apps: self.config.force_vk_only_apps.clone(),
@@ -564,7 +564,11 @@ mod tests {
             // Re-type 's': engine seeded with "pu" → process_key('s') → bs=1 commit='ú'
             let r_s = d.handle_char_inner(0, 's', true);
             match r_s {
-                viet_ime_wayland_adapter::KeyDecision::Apply { backspaces, ref commit, .. } => {
+                viet_ime_wayland_adapter::KeyDecision::Apply {
+                    backspaces,
+                    ref commit,
+                    ..
+                } => {
                     assert_eq!(backspaces, 1, "'s' must produce exactly 1 backspace");
                     assert_eq!(commit, "ú", "'s' after 'pu' must commit 'ú'");
                 }
