@@ -105,7 +105,11 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn detect_capability(&self, frame: &FrameSnapshot) -> BackspaceMethod {
+    pub(crate) fn detect_capability(
+        &self,
+        frame: &FrameSnapshot,
+        vk_keyboard_available: bool,
+    ) -> BackspaceMethod {
         let probe = CapabilityProbe {
             purpose: frame.purpose,
             surrounding_text_seen: frame.surrounding_text.as_ref().map(
@@ -118,10 +122,10 @@ impl Daemon {
             force_uinput_apps: self.config.force_uinput_apps.clone(),
             force_vk_only_apps: self.config.force_vk_only_apps.clone(),
             terminal_override: self.terminal_override,
-            // Phase 4 sources this from `ctx.profile().has_vk_keyboard` and
-            // deletes the transport/wayland.rs VkOnly→UInput downgrade. Until
-            // then `true` keeps the clamp a no-op and the old downgrade active.
-            vk_keyboard_available: true,
+            // Sourced from `TransportProfile.has_vk_keyboard` by the caller.
+            // `detect_method` clamps VkOnly→UInput when false — the single home
+            // of the downgrade that used to be an inline backend-name check.
+            vk_keyboard_available,
         };
         detect_method(&probe)
     }
@@ -371,6 +375,29 @@ mod tests {
                 app_id: None,
                 is_xwayland: false,
             }
+        }
+
+        #[test]
+        fn detect_capability_clamps_vk_only_when_transport_lacks_vk() {
+            // force_vk_only_apps would pick VkOnly, but on a transport with no
+            // virtual keyboard (vk_keyboard_available=false, e.g. KWin/ImV1)
+            // detect_capability must resolve to UInput — the clamp now lives in
+            // detect_method, fed by TransportProfile.has_vk_keyboard (#3, M2c).
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
+            d.config.force_vk_only_apps = vec!["chromium".to_owned()];
+            d.focused_app_id = Some("chromium".to_owned());
+            let f = frame("", 0, 0);
+
+            assert_eq!(
+                d.detect_capability(&f, false),
+                BackspaceMethod::UInput,
+                "no vk keyboard → VkOnly clamps to UInput"
+            );
+            assert_eq!(
+                d.detect_capability(&f, true),
+                BackspaceMethod::VkOnly,
+                "vk keyboard present → VkOnly stands"
+            );
         }
 
         #[test]

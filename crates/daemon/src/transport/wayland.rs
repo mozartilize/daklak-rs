@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use viet_ime_edit_strategy::{
     detect_method, BackspaceMethod, CapabilityProbe, ModifierState, SurroundingFrame,
 };
-use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, FrameSnapshot, ImProtocol, KeyDecision};
+use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, FrameSnapshot, KeyDecision};
 
 use crate::composer::{ByteCursor, Composer};
 use crate::handler::{Daemon, KEY_BACKSPACE, NAV_KEYS};
@@ -35,13 +35,9 @@ impl AdapterHandler for Daemon {
             self.current_active = true;
             self.focused_app_id = app_id;
 
-            let mut method = self.detect_capability(frame);
-            // VkOnly (Tier 4) requires a separate vk keyboard, which v1
-            // (KWin/Mutter) does not expose. Fall through to Tier 3 uinput.
-            if method == BackspaceMethod::VkOnly && ctx.protocol() == ImProtocol::ImV1 {
-                tracing::info!("VkOnly gated off on KWin (no vk) → falling back to UInput");
-                method = BackspaceMethod::UInput;
-            }
+            // VkOnly→UInput when the transport has no vk keyboard is clamped
+            // inside detect_method now (no inline backend-name check — #3).
+            let method = self.detect_capability(frame, ctx.profile().has_vk_keyboard);
             tracing::info!("capability detected: {:?}", method);
             let mut c = Composer::new(
                 self.config.method.to_engine(),
@@ -121,10 +117,7 @@ impl AdapterHandler for Daemon {
                     force_uinput_apps: self.config.force_uinput_apps.clone(),
                     force_vk_only_apps: self.config.force_vk_only_apps.clone(),
                     terminal_override: self.terminal_override,
-                    // Late upgrade only ever promotes FK→ST, so the clamp is
-                    // irrelevant here; `true` is correct and Phase 4 will route
-                    // this through the profile alongside detect_capability.
-                    vk_keyboard_available: true,
+                    vk_keyboard_available: ctx.profile().has_vk_keyboard,
                 };
                 let upgraded = detect_method(&probe);
                 if upgraded == BackspaceMethod::SurroundingText {
@@ -283,7 +276,7 @@ impl AdapterHandler for Daemon {
         let auto_xwayland_vk_only =
             self.config.auto_vk_only_for_xwayland && is_xwayland && app_id.is_some();
         let vk_only_matched = !in_force_uinput && (in_force_vk_only || auto_xwayland_vk_only);
-        let vk_available = ctx.protocol() != ImProtocol::ImV1;
+        let vk_available = ctx.profile().has_vk_keyboard;
         let matched = vk_only_matched && vk_available;
 
         if matched && !self.current_active {
