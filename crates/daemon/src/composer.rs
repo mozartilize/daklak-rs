@@ -80,6 +80,27 @@ pub struct Composer {
     last_action_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SurroundingDecision {
+    trust: bool,
+    reseed: bool,
+}
+
+struct SurroundingObserver;
+
+impl SurroundingObserver {
+    fn observe(
+        recent_action: bool,
+        one_char_typed: bool,
+        force_reseed: bool,
+        has_selection: bool,
+    ) -> SurroundingDecision {
+        let trust = !(recent_action && !one_char_typed && !force_reseed && !has_selection);
+        let reseed = force_reseed || (!one_char_typed && !recent_action);
+        SurroundingDecision { trust, reseed }
+    }
+}
+
 impl Composer {
     pub fn new(
         input_method: InputMethod,
@@ -434,15 +455,20 @@ impl Composer {
         // under `recent_action`, so we update the shadow without reseeding the
         // engine and clobbering Telex state.
         let has_selection = cursor != anchor;
-        if recent_action && !one_char_typed && !force_reseed && !has_selection {
+        let decision = SurroundingObserver::observe(
+            recent_action,
+            one_char_typed,
+            force_reseed,
+            has_selection,
+        );
+        if !decision.trust {
             tracing::trace!(text, cursor, anchor, "skip recent surrounding_text echo");
             return;
         }
-        let should_reseed = force_reseed || (!one_char_typed && !recent_action);
 
         self.strategy.on_surrounding_text(text, cursor, anchor);
 
-        if should_reseed {
+        if decision.reseed {
             let word = current_word_before_insertion_point(text, cursor, anchor);
             self.engine.reset();
             if !word.is_empty() && self.engine.feed_context(word) {
@@ -835,6 +861,20 @@ mod tests {
         assert_eq!(c.strategy.shadow.text(), "tra");
         let (_, _, after_bytes, _) = c.strategy.shadow.pop_delete_span(1);
         assert!(after_bytes > 0, "selection-after must be recorded");
+    }
+
+    #[test]
+    fn surrounding_observer_trusts_mid_word_one_char_without_reseed() {
+        let decision = super::SurroundingObserver::observe(true, true, false, false);
+
+        assert_eq!(decision, super::SurroundingDecision { trust: true, reseed: false });
+    }
+
+    #[test]
+    fn surrounding_observer_trusts_recent_selection_without_reseed() {
+        let decision = super::SurroundingObserver::observe(true, false, false, true);
+
+        assert_eq!(decision, super::SurroundingDecision { trust: true, reseed: false });
     }
 
     // ── detect_one_char_insertion ──────────────────────────────────────
