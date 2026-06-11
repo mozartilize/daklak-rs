@@ -21,6 +21,7 @@ use crate::config::Config;
 
 // Linux evdev code for Backspace.
 pub(crate) const KEY_BACKSPACE: u32 = 14;
+pub(crate) const KEY_ESC: u32 = 1;
 // Navigation keys that move the cursor — trigger shadow reset.
 pub(crate) const NAV_KEYS: &[u32] = &[
     105, 106, 103, 108, // Left, Right, Up, Down
@@ -162,6 +163,12 @@ impl Daemon {
         }
         if key == KEY_BACKSPACE {
             return self.handle_backspace();
+        }
+        if key == KEY_ESC {
+            if let Some(w) = self.composer.as_mut() {
+                w.defer_action();
+            }
+            return KeyDecision::ForwardRaw;
         }
         if let Some(w) = self.composer.as_mut() {
             w.mark_action();
@@ -562,6 +569,42 @@ mod tests {
                     assert_eq!(commit, "ú", "'s' after 'pu' must commit 'ú'");
                 }
                 _other => panic!("expected Apply for 's', got something else"),
+            }
+        }
+
+        #[cfg(feature = "ibus")]
+        #[test]
+        fn ibus_escape_does_not_clear_current_word_context() {
+            let mut d = v1_daemon();
+            d.process_key(35, Some('h'));
+            d.process_key(24, Some('o'));
+            d.process_key(49, Some('n'));
+
+            // KEY_ESC is commonly used to dismiss autocomplete popups. It should
+            // pass through without clearing the word being edited.
+            d.process_key(1, None);
+
+            match d.process_key(17, Some('w')) {
+                viet_ime_wayland_adapter::KeyDecision::Apply {
+                    backspaces,
+                    ref commit,
+                    ..
+                } => {
+                    assert_eq!(backspaces, 2);
+                    assert_eq!(commit, "ơn");
+                }
+                _other => panic!("expected Apply for 'w' after hon + Esc"),
+            }
+            match d.process_key(31, Some('s')) {
+                viet_ime_wayland_adapter::KeyDecision::Apply {
+                    backspaces,
+                    ref commit,
+                    ..
+                } => {
+                    assert_eq!(backspaces, 2);
+                    assert_eq!(commit, "ớn");
+                }
+                _other => panic!("expected Apply for 's' after honw + Esc"),
             }
         }
     }

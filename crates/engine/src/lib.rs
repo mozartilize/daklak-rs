@@ -114,13 +114,286 @@ impl EngineState {
     /// editing when the IME activates mid-word. Returns true if context
     /// was fed successfully.
     pub fn feed_context(&mut self, text: &str) -> bool {
-        self.engine.feed_context(text)
+        let (context, _) = telex_context_from_surrounding(text);
+        self.engine.feed_context(&context)
+    }
+
+    pub fn feed_context_for_key(&mut self, text: &str, next_key: char) -> bool {
+        let context = telex_context_from_surrounding_for_key(text, next_key);
+        self.engine.feed_context(&context)
     }
 
     /// Returns true if the engine has no pending composition state — i.e.
     /// the next key starts a fresh word.
     pub fn at_word_beginning(&self) -> bool {
         self.engine.at_word_beginning()
+    }
+}
+
+pub fn telex_context_from_surrounding(text: &str) -> (String, Vec<u8>) {
+    let mut result = String::with_capacity(text.len());
+    let mut widths = Vec::with_capacity(text.chars().count());
+    for ch in text.chars() {
+        let telex = telex_chars_from_composed(ch);
+        if !telex.is_empty() {
+            widths.push(telex.len() as u8);
+            result.push_str(telex);
+        }
+    }
+    (result, widths)
+}
+
+fn telex_context_from_surrounding_for_key(text: &str, next_key: char) -> String {
+    let preserve_vowel_shape = matches!(
+        next_key,
+        'a' | 'e'
+            | 'i'
+            | 'o'
+            | 'u'
+            | 'y'
+            | 's'
+            | 'f'
+            | 'r'
+            | 'x'
+            | 'j'
+            | 'w'
+            | 'A'
+            | 'E'
+            | 'I'
+            | 'O'
+            | 'U'
+            | 'Y'
+            | 'S'
+            | 'F'
+            | 'R'
+            | 'X'
+            | 'J'
+            | 'W'
+    );
+    let mut result = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if preserve_vowel_shape {
+            result.push_str(telex_chars_from_composed(ch));
+        } else {
+            result.push_str(telex_base_chars_from_composed(ch));
+        }
+    }
+    result
+}
+
+fn telex_base_chars_from_composed(ch: char) -> &'static str {
+    match ch {
+        'á' | 'à' | 'ả' | 'ã' | 'ạ' | 'ă' | 'ắ' | 'ằ' | 'ẳ' | 'ẵ' | 'ặ' | 'â' | 'ấ' | 'ầ' | 'ẩ'
+        | 'ẫ' | 'ậ' => "a",
+        'Á' | 'À' | 'Ả' | 'Ã' | 'Ạ' | 'Ă' | 'Ắ' | 'Ằ' | 'Ẳ' | 'Ẵ' | 'Ặ' | 'Â' | 'Ấ' | 'Ầ' | 'Ẩ'
+        | 'Ẫ' | 'Ậ' => "A",
+        'đ' => "d",
+        'Đ' => "D",
+        'é' | 'è' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ế' | 'ề' | 'ể' | 'ễ' | 'ệ' => "e",
+        'É' | 'È' | 'Ẻ' | 'Ẽ' | 'Ẹ' | 'Ê' | 'Ế' | 'Ề' | 'Ể' | 'Ễ' | 'Ệ' => "E",
+        'í' | 'ì' | 'ỉ' | 'ĩ' | 'ị' => "i",
+        'Í' | 'Ì' | 'Ỉ' | 'Ĩ' | 'Ị' => "I",
+        'ó' | 'ò' | 'ỏ' | 'õ' | 'ọ' | 'ô' | 'ố' | 'ồ' | 'ổ' | 'ỗ' | 'ộ' | 'ơ' | 'ớ' | 'ờ' | 'ở'
+        | 'ỡ' | 'ợ' => "o",
+        'Ó' | 'Ò' | 'Ỏ' | 'Õ' | 'Ọ' | 'Ô' | 'Ố' | 'Ồ' | 'Ổ' | 'Ỗ' | 'Ộ' | 'Ơ' | 'Ớ' | 'Ờ' | 'Ở'
+        | 'Ỡ' | 'Ợ' => "O",
+        'ú' | 'ù' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ứ' | 'ừ' | 'ử' | 'ữ' | 'ự' => "u",
+        'Ú' | 'Ù' | 'Ủ' | 'Ũ' | 'Ụ' | 'Ư' | 'Ứ' | 'Ừ' | 'Ử' | 'Ữ' | 'Ự' => "U",
+        'ý' | 'ỳ' | 'ỷ' | 'ỹ' | 'ỵ' => "y",
+        'Ý' | 'Ỳ' | 'Ỷ' | 'Ỹ' | 'Ỵ' => "Y",
+        _ => telex_chars_from_composed(ch),
+    }
+}
+
+fn telex_chars_from_composed(ch: char) -> &'static str {
+    match ch {
+        'á' => "as",
+        'à' => "af",
+        'ả' => "ar",
+        'ã' => "ax",
+        'ạ' => "aj",
+        'Á' => "AS",
+        'À' => "AF",
+        'Ả' => "AR",
+        'Ã' => "AX",
+        'Ạ' => "AJ",
+        'ă' => "aw",
+        'ắ' => "aws",
+        'ằ' => "awf",
+        'ẳ' => "awr",
+        'ẵ' => "awx",
+        'ặ' => "awj",
+        'Ă' => "AW",
+        'Ắ' => "AWS",
+        'Ằ' => "AWF",
+        'Ẳ' => "AWR",
+        'Ẵ' => "AWX",
+        'Ặ' => "AWJ",
+        'â' => "aa",
+        'ấ' => "aas",
+        'ầ' => "aaf",
+        'ẩ' => "aar",
+        'ẫ' => "aax",
+        'ậ' => "aaj",
+        'Â' => "AA",
+        'Ấ' => "AAS",
+        'Ầ' => "AAF",
+        'Ẩ' => "AAR",
+        'Ẫ' => "AAX",
+        'Ậ' => "AAJ",
+        'đ' => "dd",
+        'Đ' => "DD",
+        'é' => "es",
+        'è' => "ef",
+        'ẻ' => "er",
+        'ẽ' => "ex",
+        'ẹ' => "ej",
+        'É' => "ES",
+        'È' => "EF",
+        'Ẻ' => "ER",
+        'Ẽ' => "EX",
+        'Ẹ' => "EJ",
+        'ê' => "ee",
+        'ế' => "ees",
+        'ề' => "eef",
+        'ể' => "eer",
+        'ễ' => "eex",
+        'ệ' => "eej",
+        'Ê' => "EE",
+        'Ế' => "EES",
+        'Ề' => "EEF",
+        'Ể' => "EER",
+        'Ễ' => "EEX",
+        'Ệ' => "EEJ",
+        'í' => "is",
+        'ì' => "if",
+        'ỉ' => "ir",
+        'ĩ' => "ix",
+        'ị' => "ij",
+        'Í' => "IS",
+        'Ì' => "IF",
+        'Ỉ' => "IR",
+        'Ĩ' => "IX",
+        'Ị' => "IJ",
+        'ó' => "os",
+        'ò' => "of",
+        'ỏ' => "or",
+        'õ' => "ox",
+        'ọ' => "oj",
+        'Ó' => "OS",
+        'Ò' => "OF",
+        'Ỏ' => "OR",
+        'Õ' => "OX",
+        'Ọ' => "OJ",
+        'ô' => "oo",
+        'ố' => "oos",
+        'ồ' => "oof",
+        'ổ' => "oor",
+        'ỗ' => "oox",
+        'ộ' => "ooj",
+        'Ô' => "OO",
+        'Ố' => "OOS",
+        'Ồ' => "OOF",
+        'Ổ' => "OOR",
+        'Ỗ' => "OOX",
+        'Ộ' => "OOJ",
+        'ơ' => "ow",
+        'ớ' => "ows",
+        'ờ' => "owf",
+        'ở' => "owr",
+        'ỡ' => "owx",
+        'ợ' => "owj",
+        'Ơ' => "OW",
+        'Ớ' => "OWS",
+        'Ờ' => "OWF",
+        'Ở' => "OWR",
+        'Ỡ' => "OWX",
+        'Ợ' => "OWJ",
+        'ú' => "us",
+        'ù' => "uf",
+        'ủ' => "ur",
+        'ũ' => "ux",
+        'ụ' => "uj",
+        'Ú' => "US",
+        'Ù' => "UF",
+        'Ủ' => "UR",
+        'Ũ' => "UX",
+        'Ụ' => "UJ",
+        'ư' => "uw",
+        'ứ' => "uws",
+        'ừ' => "uwf",
+        'ử' => "uwr",
+        'ữ' => "uwx",
+        'ự' => "uwj",
+        'Ư' => "UW",
+        'Ứ' => "UWS",
+        'Ừ' => "UWF",
+        'Ử' => "UWR",
+        'Ữ' => "UWX",
+        'Ự' => "UWJ",
+        'ý' => "ys",
+        'ỳ' => "yf",
+        'ỷ' => "yr",
+        'ỹ' => "yx",
+        'ỵ' => "yj",
+        'Ý' => "YS",
+        'Ỳ' => "YF",
+        'Ỷ' => "YR",
+        'Ỹ' => "YX",
+        'Ỵ' => "YJ",
+        'A' => "A",
+        'B' => "B",
+        'C' => "C",
+        'D' => "D",
+        'E' => "E",
+        'F' => "F",
+        'G' => "G",
+        'H' => "H",
+        'I' => "I",
+        'J' => "J",
+        'K' => "K",
+        'L' => "L",
+        'M' => "M",
+        'N' => "N",
+        'O' => "O",
+        'P' => "P",
+        'Q' => "Q",
+        'R' => "R",
+        'S' => "S",
+        'T' => "T",
+        'U' => "U",
+        'V' => "V",
+        'W' => "W",
+        'X' => "X",
+        'Y' => "Y",
+        'Z' => "Z",
+        'a' => "a",
+        'b' => "b",
+        'c' => "c",
+        'd' => "d",
+        'e' => "e",
+        'f' => "f",
+        'g' => "g",
+        'h' => "h",
+        'i' => "i",
+        'j' => "j",
+        'k' => "k",
+        'l' => "l",
+        'm' => "m",
+        'n' => "n",
+        'o' => "o",
+        'p' => "p",
+        'q' => "q",
+        'r' => "r",
+        's' => "s",
+        't' => "t",
+        'u' => "u",
+        'v' => "v",
+        'w' => "w",
+        'x' => "x",
+        'y' => "y",
+        'z' => "z",
+        _ => "",
     }
 }
 
@@ -198,6 +471,66 @@ mod tests {
             }
         }
         assert_eq!(screen, "hiếu");
+    }
+
+    #[test]
+    fn feed_context_accepts_composed_vietnamese_for_tone_replacement() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert!(eng.feed_context("nó"));
+
+        let r = eng.process_key('r');
+
+        assert!(r.consumed);
+        assert_eq!(r.backspaces, 1);
+        assert_eq!(r.commit, "ỏ");
+    }
+
+    #[test]
+    fn feed_context_for_key_preserves_vowel_shape_for_uppercase_tone_key() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert!(eng.feed_context_for_key("khôn", 'R'));
+
+        let r = eng.process_key('R');
+
+        assert!(r.consumed);
+        assert_eq!(r.backspaces, 2);
+        assert_eq!(r.commit, "ổn");
+    }
+
+    #[test]
+    fn feed_context_accepts_composed_vietnamese_for_raw_restore() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert!(eng.feed_context("ră"));
+
+        let r = eng.process_key('w');
+
+        assert!(r.consumed);
+        assert_eq!(r.backspaces, 1);
+        assert_eq!(r.commit, "aw");
+    }
+
+    #[test]
+    fn feed_context_for_key_preserves_vowel_shape_for_uppercase_w_key() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert!(eng.feed_context_for_key("ră", 'W'));
+
+        let r = eng.process_key('W');
+
+        assert!(r.consumed);
+        assert_eq!(r.backspaces, 1);
+        assert_eq!(r.commit, "aW");
+    }
+
+    #[test]
+    fn feed_context_for_key_preserves_vowel_shape_for_live_vowel_update() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert!(eng.feed_context_for_key("lòn", 'o'));
+
+        let r = eng.process_key('o');
+
+        assert!(r.consumed);
+        assert_eq!(r.backspaces, 2);
+        assert_eq!(r.commit, "ồn");
     }
 
     #[test]
@@ -424,35 +757,20 @@ mod tests {
     }
 
     #[test]
-    fn feed_context_non_ascii_resets_engine() {
-        // KNOWN LIMITATION of vnkey-engine: feed_context() resets internal
-        // state whenever it encounters a non-ASCII char (chars outside
-        // 0x21..=0x7E). The engine cannot reverse-engineer composed Vietnamese
-        // text back into its keystroke state.
-        //
-        // Consequence for the daemon (Stage 3): we must NOT call feed_context
-        // on every surrounding_text frame — if it contains `â` (already
-        // committed), the call wipes the in-progress engine state and breaks
-        // ongoing composition. The daemon gates feed_context behind a
-        // "no recent action" check so it only fires on activate or genuine
-        // cursor jumps.
+    fn feed_context_accepts_composed_vietnamese_inside_word() {
         let mut eng = EngineState::new(InputMethod::Telex);
 
-        // First seed with pure ASCII — engine retains state
         assert!(eng.feed_context("pho"));
-        // Now typing 'w' should produce "ơ" (engine knows we're in word ctx)
         let r = eng.process_key('w');
         assert!(r.consumed);
         assert_eq!(r.commit, "ơ");
 
-        // Second seed with text containing Vietnamese char — engine WIPES
         eng.reset();
-        let _ = eng.feed_context("phơ");
-        // Try typing 'r' — engine should compose tone... but it can't,
-        // because the ơ was treated as a reset, not as composed vowel.
+        assert!(eng.feed_context("phơ"));
         let r = eng.process_key('r');
-        // Engine is in fresh state (post-reset), 'r' alone has no vowel target
-        assert!(!r.consumed, "feed_context with non-ASCII left engine empty");
+        assert!(r.consumed);
+        assert_eq!(r.backspaces, 1);
+        assert_eq!(r.commit, "ở");
     }
 
     // ===== Switching methods =====

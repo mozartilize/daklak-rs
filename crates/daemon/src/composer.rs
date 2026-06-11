@@ -59,6 +59,7 @@ pub struct Composer {
     /// raw chars (e.g. Telex 'u'+'s' → 'ú': width=2, so BS over 'ú' must
     /// pop both 'u' and 's' from raw_word, not just one).
     pub raw_word_screen_widths: Vec<u8>,
+    raw_word_from_surrounding: bool,
 
     /// When true, `delete_surrounding_text` on the V1Kde sink emits a
     /// CHAR count rather than the spec-compliant byte count. Set at
@@ -91,6 +92,7 @@ impl Composer {
             prev_anchor: 0,
             raw_word: String::new(),
             raw_word_screen_widths: Vec::new(),
+            raw_word_from_surrounding: false,
             chars_for_delete: false,
             last_action_at: Instant::now() - Duration::from_secs(60),
         }
@@ -142,6 +144,7 @@ impl Composer {
         self.last_input_char = None;
         self.raw_word.clear();
         self.raw_word_screen_widths.clear();
+        self.raw_word_from_surrounding = false;
         self.prev_text.clear();
         self.prev_cursor = 0;
         self.prev_anchor = 0;
@@ -198,16 +201,21 @@ impl Composer {
             if !ch.is_ascii_alphabetic() {
                 self.raw_word.clear();
                 self.raw_word_screen_widths.clear();
+                self.raw_word_from_surrounding = false;
             }
             let prefix = self.raw_word.clone();
             self.engine.reset();
-            if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphabetic()) {
+            if !prefix.is_empty() {
                 tracing::debug!(prefix, "seed engine from raw_word (v1 path)");
-                self.engine.feed_context(&prefix);
+                self.engine.feed_context_for_key(&prefix, ch);
             }
-            // Append `ch` AFTER seeding (engine's process_key adds it).
-            if ch.is_ascii_alphabetic() {
+            // Append `ch` AFTER seeding (engine's process_key adds it). For a
+            // word seeded from surrounding composed text, raw_word tracks the
+            // current visible word; transforms edit that visible word below,
+            // while no-edit keys append there.
+            if ch.is_ascii_alphabetic() && !self.raw_word_from_surrounding {
                 self.raw_word.push(ch);
+                self.raw_word_from_surrounding = false;
             }
         } else {
             // v2/wlroots path: original shadow-based seed.
@@ -238,7 +246,15 @@ impl Composer {
         // raw_word_screen_widths[i] = how many raw chars produced screen char i.
         // Invariant: sum(raw_word_screen_widths) == raw_word.len().
         if shadow_already_has_ch && ch.is_ascii_alphabetic() {
-            if r.consumed {
+            if r.consumed && !v1_identity_output && self.raw_word_from_surrounding {
+                for _ in 0..r.backspaces {
+                    self.raw_word.pop();
+                    self.raw_word_screen_widths.pop();
+                }
+                self.raw_word.push_str(&r.commit);
+                self.raw_word_screen_widths
+                    .extend(std::iter::repeat(1u8).take(r.commit.chars().count()));
+            } else if r.consumed && !v1_identity_output {
                 // Engine deleted r.backspaces screen chars and emitted r.commit.
                 // Pop r.backspaces widths (sum = s); the new raw chars for all
                 // commit screen chars together cost s + 1 (the current ch).
@@ -256,8 +272,14 @@ impl Composer {
                 let last_width = total.saturating_sub(m.saturating_sub(1)).max(1) as u8;
                 self.raw_word_screen_widths.push(last_width);
             } else {
+                if self.raw_word_from_surrounding && ch.is_ascii_alphabetic() {
+                    self.raw_word.push(ch);
+                    self.raw_word_screen_widths.push(1);
+                }
                 // ForwardRaw: one raw char → one screen char.
-                self.raw_word_screen_widths.push(1);
+                if !self.raw_word_from_surrounding {
+                    self.raw_word_screen_widths.push(1);
+                }
             }
         }
 
@@ -276,7 +298,11 @@ impl Composer {
 
     pub fn feed_backspace(&mut self) -> KeyDecision {
         let r = self.engine.process_backspace();
-        tracing::debug!(consumed = r.consumed, bs = r.backspaces, "engine.process_backspace");
+        tracing::debug!(
+            consumed = r.consumed,
+            bs = r.backspaces,
+            "engine.process_backspace"
+        );
 
         // v1/KWin path: raw_word tracks raw keystrokes so backspace must
         // pop the raw entries that produced the deleted screen char.
@@ -391,16 +417,17 @@ impl Composer {
         self.strategy.on_surrounding_text(text, cursor, anchor);
 
         if should_reseed {
-            let word = current_word_before_cursor(text, cursor);
+            let word = current_word_before_insertion_point(text, cursor, anchor);
             self.engine.reset();
-            if word_qualifies_for_reseed(word) {
+            if !word.is_empty() && self.engine.feed_context(word) {
                 tracing::debug!(word, "re-seed engine (activate or cursor jump)");
-                self.engine.feed_context(word);
-                self.raw_word_screen_widths = vec![1u8; word.len()];
+                self.raw_word_screen_widths = vec![1u8; word.chars().count()];
                 self.raw_word = word.to_owned();
+                self.raw_word_from_surrounding = true;
             } else {
                 self.raw_word.clear();
                 self.raw_word_screen_widths.clear();
+                self.raw_word_from_surrounding = false;
             }
         }
 
@@ -427,6 +454,10 @@ impl Composer {
 }
 
 // ── pure helpers the reseed gate depends on (with their unit tests) ─────────
+
+pub fn current_word_before_insertion_point(text: &str, cursor: u32, anchor: u32) -> &str {
+    current_word_before_cursor(text, cursor.min(anchor))
+}
 
 /// Extract just the word immediately before the cursor (scan back to last
 /// whitespace). For retroactive editing, the engine only needs the current
@@ -459,24 +490,6 @@ pub fn current_word_before_cursor(text: &str, cursor: u32) -> &str {
     &before[start..]
 }
 
-/// Whether `word` is suitable to re-seed the engine + `raw_word` from on
-/// a cursor jump.
-///
-/// Must accept ASCII letters of either case — Telex composes `DD→Đ`,
-/// `AA→Â`, `OO→Ô`, so capitals are valid raw input. A previous version
-/// gated on `is_ascii_lowercase` which silently dropped capitals,
-/// breaking the `DD→Đ` transform when the cursor entered a new word
-/// starting with a capital letter (e.g. `Đường\nD` then `D` again).
-///
-/// Must reject:
-/// - empty strings (no context to seed)
-/// - words containing non-ASCII (already-composed Vietnamese — we can't
-///   reconstruct the raw Telex from the composed form)
-/// - words containing digits, punctuation, etc. (not Telex input)
-pub fn word_qualifies_for_reseed(word: &str) -> bool {
-    !word.is_empty() && word.chars().all(|c| c.is_ascii_alphabetic())
-}
-
 /// Detects whether the transition from (`prev_text`, `prev_cursor`) to
 /// (`text`, `cursor`) is exactly one character inserted at `prev_cursor`.
 /// Handles end-of-text typing AND mid-text typing.
@@ -498,7 +511,11 @@ pub fn detect_one_char_insertion(
 
 #[cfg(test)]
 mod tests {
-    use super::current_word_before_cursor;
+    use super::{current_word_before_cursor, current_word_before_insertion_point};
+    use super::{ByteCursor, Composer};
+    use viet_ime_edit_strategy::BackspaceMethod;
+    use viet_ime_engine::InputMethod;
+    use viet_ime_wayland_adapter::KeyDecision;
 
     #[test]
     fn extracts_word_at_end_of_line() {
@@ -557,21 +574,206 @@ mod tests {
     }
 
     #[test]
-    fn seed_gate_skips_capitalized_word() {
-        let word = "Folder";
-        assert!(!word.chars().all(|c| c.is_ascii_lowercase()));
+    fn selection_after_word_prefix_seeds_prefix_for_both_directions() {
+        let text = "the vietnamese";
+        let selection_start = "the viet".len() as u32;
+        let selection_end = "the vietnamese".len() as u32;
+
+        assert_eq!(
+            current_word_before_insertion_point(text, selection_start, selection_end),
+            "viet"
+        );
+        assert_eq!(
+            current_word_before_insertion_point(text, selection_end, selection_start),
+            "viet"
+        );
     }
 
     #[test]
-    fn seed_gate_accepts_lowercase_vietnamese_precursor() {
-        let word = "phow";
-        assert!(word.chars().all(|c| c.is_ascii_lowercase()));
+    fn selection_at_word_start_seeds_nothing_for_both_directions() {
+        let text = "the vietnamese";
+        let selection_start = "the ".len() as u32;
+        let selection_end = "the viet".len() as u32;
+
+        assert_eq!(
+            current_word_before_insertion_point(text, selection_start, selection_end),
+            ""
+        );
+        assert_eq!(
+            current_word_before_insertion_point(text, selection_end, selection_start),
+            ""
+        );
     }
 
     #[test]
-    fn seed_gate_skips_word_with_digit() {
-        let word = "abc1";
-        assert!(!word.chars().all(|c| c.is_ascii_lowercase()));
+    fn cursor_inside_word_ignores_suffix_after_cursor() {
+        let text = "tiếng viet vui vẻ";
+        let cursor = "tiếng vie".len() as u32;
+
+        assert_eq!(
+            current_word_before_insertion_point(text, cursor, cursor),
+            "vie"
+        );
+    }
+
+    #[test]
+    fn cursor_at_end_of_word_seeds_full_ascii_suffix_after_vietnamese_text() {
+        let text = "tiếng viet vui vẻ";
+        let cursor = "tiếng viet".len() as u32;
+
+        assert_eq!(
+            current_word_before_insertion_point(text, cursor, cursor),
+            "viet"
+        );
+    }
+
+    #[test]
+    fn cursor_jump_after_composed_word_allows_next_tone_key_to_replace_tone() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let text = "chắc nó chừa mình ra";
+        let cursor = "chắc nó".len() as u32;
+
+        c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
+
+        match c.feed_key('r') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 1);
+                assert_eq!(commit, "ỏ");
+            }
+            _ => panic!("expected tone replacement edit"),
+        }
+    }
+
+    #[test]
+    fn cursor_jump_after_composed_vowel_keeps_plain_consonant_continuation_raw() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let text = "raw khôn";
+        let cursor = text.len() as u32;
+
+        c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
+
+        assert!(matches!(c.feed_key('g'), KeyDecision::ForwardRaw));
+        assert_eq!(c.raw_word, "không");
+    }
+
+    #[test]
+    fn cursor_jump_after_toned_vowel_allows_live_vowel_update() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let text = "cái lòn gì";
+        let cursor = "cái lòn".len() as u32;
+
+        c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
+
+        match c.feed_key('o') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 2);
+                assert_eq!(commit, "ồn");
+            }
+            _ => panic!("expected live vowel update edit"),
+        }
+    }
+
+    #[test]
+    fn retroactive_composed_word_tracks_visible_state_between_tone_updates() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let text = "nguyễn sĩ thanh";
+        let cursor = "nguyễn sĩ".len() as u32;
+
+        c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
+
+        match c.feed_key('s') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 1);
+                assert_eq!(commit, "í");
+            }
+            _ => panic!("expected tone update"),
+        }
+
+        match c.feed_key('x') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 1);
+                assert_eq!(commit, "ĩ");
+            }
+            _ => panic!("expected tone update"),
+        }
+
+        match c.feed_key('i') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 2);
+                assert_eq!(commit, "sixi");
+            }
+            _ => panic!("expected raw restore"),
+        }
+    }
+
+    #[test]
+    fn active_word_w_then_tone_keeps_final_consonant_order() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+        assert!(matches!(c.feed_key('h'), KeyDecision::ForwardRaw));
+        assert!(matches!(c.feed_key('o'), KeyDecision::ForwardRaw));
+        assert!(matches!(c.feed_key('n'), KeyDecision::ForwardRaw));
+
+        match c.feed_key('w') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 2);
+                assert_eq!(commit, "ơn");
+            }
+            _ => panic!("expected vowel shape update"),
+        }
+
+        match c.feed_key('s') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 2);
+                assert_eq!(commit, "ớn");
+            }
+            _ => panic!("expected tone update"),
+        }
+    }
+
+    #[test]
+    fn v1_identity_vowel_output_forwards_raw_instead_of_committing_duplicate() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+        assert!(matches!(c.feed_key('i'), KeyDecision::ForwardRaw));
+        assert_eq!(c.raw_word, "i");
+        assert_eq!(c.raw_word_screen_widths, vec![1]);
+        assert_eq!(c.strategy.shadow.text(), "i");
+    }
+
+    #[test]
+    fn recent_implausible_surrounding_echo_does_not_clobber_shadow() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+        c.mark_action();
+        assert!(matches!(c.feed_key('i'), KeyDecision::ForwardRaw));
+        c.observe_surrounding_bytes("i", ByteCursor(1), ByteCursor(1), false);
+        c.observe_surrounding_bytes("ii", ByteCursor(0), ByteCursor(0), false);
+
+        assert_eq!(c.strategy.shadow.text(), "i");
+        match c.feed_key('s') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 1);
+                assert_eq!(commit, "í");
+            }
+            _ => panic!("expected tone transform"),
+        }
     }
 
     // ── detect_one_char_insertion ──────────────────────────────────────
@@ -663,62 +865,6 @@ mod tests {
         // User types second 'D' → text="DD" cursor=2. MUST be detected as
         // 1-char keystroke so handle_char fires and `DD→Đ` rule runs.
         assert!(oci("D", 1, "DD", 2));
-    }
-
-    // ── word_qualifies_for_reseed ──────────────────────────────────────
-
-    use super::word_qualifies_for_reseed as wqr;
-
-    #[test]
-    fn wqr_capital_d_accepted() {
-        // The Đường-line-2 regression: word="D" must seed raw_word so the
-        // next 'D' keystroke can fire the DD→Đ Telex rule.
-        assert!(wqr("D"));
-    }
-
-    #[test]
-    fn wqr_double_capital_d_accepted() {
-        assert!(wqr("DD"));
-    }
-
-    #[test]
-    fn wqr_capital_aa_accepted() {
-        // AA→Â Telex rule needs the same capital handling.
-        assert!(wqr("AA"));
-    }
-
-    #[test]
-    fn wqr_mixed_case_accepted() {
-        // "Folder" is alphabetic; engine just won't transform — harmless.
-        assert!(wqr("Folder"));
-    }
-
-    #[test]
-    fn wqr_lowercase_accepted() {
-        assert!(wqr("phow"));
-    }
-
-    #[test]
-    fn wqr_empty_rejected() {
-        assert!(!wqr(""));
-    }
-
-    #[test]
-    fn wqr_vietnamese_rejected() {
-        // Already-composed Vietnamese: can't reconstruct raw Telex.
-        assert!(!wqr("đường"));
-        assert!(!wqr("tiếng"));
-        assert!(!wqr("mộng"));
-    }
-
-    #[test]
-    fn wqr_digit_rejected() {
-        assert!(!wqr("abc1"));
-    }
-
-    #[test]
-    fn wqr_punctuation_rejected() {
-        assert!(!wqr("hello,"));
     }
 }
 
