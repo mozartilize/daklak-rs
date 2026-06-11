@@ -41,7 +41,7 @@ impl<H: AdapterHandler> WaylandHandle<H> {
         // `pending_commit` is still set, force the frame apply here so
         // the daemon sees the text change.
         if self.app.state.pending_commit
-            && matches!(self.app.state.im_backend, crate::ImBackend::V1Kde)
+            && matches!(self.app.state.profile.protocol, crate::ImProtocol::ImV1)
         {
             tracing::debug!(
                 "v1: dispatch end — pending_commit still set, forcing apply_done_frame"

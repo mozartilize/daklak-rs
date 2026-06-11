@@ -23,7 +23,7 @@ pub fn apply(
         sink.vk_key(time, KEY_BACKSPACE, KeyState::Pressed);
         sink.vk_key(time, KEY_BACKSPACE, KeyState::Released);
     }
-    // Prefer per-char keysym emission on V1Kde — real wl_keyboard.key
+    // Prefer per-char keysym emission on ImV1 — real wl_keyboard.key
     // events via KWin's forwardKeySym + temporary-keymap synthesis.
     // Terminals like foot ignore commit_string but honor wl_keyboard.
     // Other backends return false → fall through to commit_string.

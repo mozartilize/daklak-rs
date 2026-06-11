@@ -62,16 +62,73 @@ pub use viet_ime_edit_strategy::{BackspaceMethod, KeyState, ModifierState, Outpu
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// Which input-method protocol the connected compositor speaks.
-/// Set during `connect()` and surfaced via `AdapterCtx::im_backend()`.
+/// Set during `connect()` and surfaced via `AdapterCtx::protocol()`.
 /// The daemon matches on this to adjust tier routing (e.g. VkOnly is
 /// unavailable on v1 because there's no separate vk keyboard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImBackend {
+pub enum ImProtocol {
     /// `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` — wlroots path.
-    V2Wlroots,
+    ImV2,
     /// `zwp_input_method_v1` (KWin/Mutter) — no vk, v1 context is the
     /// key-emission path.
-    V1Kde,
+    ImV1,
+}
+
+/// Everything daklak learns about the transport at `connect()` — fixed for the
+/// life of the process. The single source of every process-scoped capability;
+/// no use site re-derives a capability by matching on the protocol/backend name
+/// (plan82 incidents #3, #5). `focus` is added in a later milestone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportProfile {
+    /// IM protocol the compositor speaks. Identity only — capability decisions
+    /// read the bools below, never this.
+    pub protocol: ImProtocol,
+    /// `zwp_virtual_keyboard_v1` is available. Required for Tier 2 ForwardKey's
+    /// BS emit on v2 and for Tier 4 VkOnly. False on the v1 IM relay.
+    pub has_vk_keyboard: bool,
+    /// Commit chars can be synthesized via `zwp_input_method_context_v1::keysym`
+    /// (the v1 terminal path). True on ImV1, false on ImV2.
+    pub has_keysym_commit: bool,
+    /// `commit_string` actually reaches the client (false on evdev / vk-only).
+    pub delivers_commit_string: bool,
+    /// The transport auto-acks the v3 client's `done` (v1 `CommitState`
+    /// heartbeat); v2 needs daklak's bare commit to drive the ack.
+    pub heartbeats_done: bool,
+    /// The protocol can carry surrounding-text at all. This is the PROCESS
+    /// capability — distinct from whether a frame has actually been *seen*
+    /// (that runtime evidence lives in `CapabilityProbe.surrounding_text_seen`).
+    pub can_receive_surrounding: bool,
+}
+
+impl TransportProfile {
+    /// The capability bundle implied by an IM protocol. `connect()` calls this,
+    /// then may override `has_vk_keyboard` from the actual VK-manager bind and
+    /// fills `focus` from an independent probe (a per-connection fact, not a
+    /// function of the protocol). Pure — unit-testable without a compositor.
+    pub fn for_protocol(protocol: ImProtocol) -> Self {
+        match protocol {
+            // wlroots v2: separate vk keyboard, no keysym path, v2 has no
+            // implicit `done` heartbeat.
+            ImProtocol::ImV2 => Self {
+                protocol,
+                has_vk_keyboard: true,
+                has_keysym_commit: false,
+                delivers_commit_string: true,
+                heartbeats_done: false,
+                can_receive_surrounding: true,
+            },
+            // v1 IM relay: no vk keyboard (BS via the v1 context), keysym commit
+            // available, v1 `CommitState` heartbeats the v3 client.
+            ImProtocol::ImV1 => Self {
+                protocol,
+                has_vk_keyboard: false,
+                has_keysym_commit: true,
+                delivers_commit_string: true,
+                heartbeats_done: true,
+                can_receive_surrounding: true,
+            },
+        }
+    }
 }
 
 /// Frame snapshot delivered to the handler at each Done event.
@@ -169,8 +226,15 @@ impl<'a> AdapterCtx<'a> {
         self.state.modifiers
     }
 
-    pub fn im_backend(&self) -> ImBackend {
-        self.state.im_backend
+    pub fn protocol(&self) -> ImProtocol {
+        self.state.profile.protocol
+    }
+
+    /// The process-scoped transport capability profile, built once at
+    /// `connect()`. Read this for capability decisions — never re-match the
+    /// protocol/backend name at a use site (plan82 #3/#5).
+    pub fn profile(&self) -> TransportProfile {
+        self.state.profile
     }
 
     pub fn last_forwarded_key(&self) -> Option<(u32, Instant)> {
@@ -210,8 +274,8 @@ impl<'a> AdapterCtx<'a> {
     {
         let serial = self.state.serial;
         let conn = self.state.conn.as_ref();
-        match self.state.im_backend {
-            ImBackend::V2Wlroots => {
+        match self.state.profile.protocol {
+            ImProtocol::ImV2 => {
                 let im = match &self.state.im {
                     Some(x) => x,
                     None => return,
@@ -243,12 +307,12 @@ impl<'a> AdapterCtx<'a> {
                 };
                 f(&mut sink);
             }
-            ImBackend::V1Kde => {
+            ImProtocol::ImV1 => {
                 let ctx = match &self.state.im_ctx_v1 {
                     Some(x) => x,
                     None => return,
                 };
-                // V1Kde: forward_emitter is VkV1Emitter (ctx.key).
+                // ImV1: forward_emitter is VkV1Emitter (ctx.key).
                 let mut vk_forward = viet_ime_key_emitter::VkV1Emitter::new(ctx, serial);
                 let mut sink = AdapterSink {
                     text_ops: crate::sink::TextOpsTarget::V1 { ctx, serial },
@@ -458,7 +522,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         // chromium) never sees its commit ack'd — its state machine stalls
         // and it stops sending `set_surrounding_text` updates. Emit a bare
         // commit so sway's `handle_im_commit` fires and acks the v3 client.
-        if matches!(self.state.im_backend, ImBackend::V2Wlroots)
+        if matches!(self.state.profile.protocol, ImProtocol::ImV2)
             && !self.state.pending_im_commit_ack
         {
             if let Some(im) = &self.state.im {
@@ -526,13 +590,13 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         self.state.raw_mods = (mods_depressed, mods_latched, mods_locked, group);
 
         let serial = self.state.serial;
-        match self.state.im_backend {
-            ImBackend::V2Wlroots => {
+        match self.state.profile.protocol {
+            ImProtocol::ImV2 => {
                 if let Some(vk) = &self.state.vk {
                     vk.modifiers(mods_depressed, mods_latched, mods_locked, group);
                 }
             }
-            ImBackend::V1Kde => {
+            ImProtocol::ImV1 => {
                 if let Some(ctx) = &self.state.im_ctx_v1 {
                     ctx.modifiers(serial, mods_depressed, mods_latched, mods_locked, group);
                 }
@@ -633,7 +697,7 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
     app.state.seat = Some(seat.clone());
 
     // ── Compositor backend detection: v2 (wlroots) or v1 (KWin/Mutter) ─────
-    let (im_backend, backend) =
+    let (profile, backend) =
         if let Ok(v2) = globals.bind::<ZwpInputMethodManagerV2, _, _>(&qh, 1..=1, ()) {
             // ── v2 (wlroots) path ────────────────────────────────────────────────
             app.state.im_manager = Some(v2.clone());
@@ -688,7 +752,9 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
             app.state.vk = Some(vk);
             app.state.conn = Some(conn.clone());
 
-            (ImBackend::V2Wlroots, backend)
+            // v2/wlroots: vk_manager is bound above (required, errors otherwise)
+            // so the vk keyboard is always present.
+            (TransportProfile::for_protocol(ImProtocol::ImV2), backend)
 
         } else if let Ok(v1) = globals.bind::<ZwpInputMethodV1, _, _>(&qh, 1..=1, ()) {
             // ── v1 (KWin/Mutter) path ────────────────────────────────────────────
@@ -728,7 +794,7 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
             event_queue.roundtrip(&mut app).context("initial roundtrip")?;
 
             tracing::info!("input method v1 bound (KWin/Mutter)");
-            (ImBackend::V1Kde, backend)
+            (TransportProfile::for_protocol(ImProtocol::ImV1), backend)
 
         } else {
             anyhow::bail!(
@@ -736,7 +802,7 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
             );
         };
 
-    app.state.im_backend = im_backend;
+    app.state.profile = profile;
 
     event_queue.roundtrip(&mut app).context("second roundtrip")?;
 
@@ -751,4 +817,37 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
         wl_fd,
         focus_backend: backend,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_for_imv2_has_vk_no_keysym() {
+        let p = TransportProfile::for_protocol(ImProtocol::ImV2);
+        assert_eq!(p.protocol, ImProtocol::ImV2);
+        assert!(p.has_vk_keyboard, "v2 has a virtual keyboard");
+        assert!(!p.has_keysym_commit, "v2 has no keysym commit path");
+        assert!(!p.heartbeats_done, "v2 needs daklak's bare commit to ack");
+        assert!(p.delivers_commit_string && p.can_receive_surrounding);
+    }
+
+    #[test]
+    fn profile_for_imv1_no_vk_has_keysym() {
+        let p = TransportProfile::for_protocol(ImProtocol::ImV1);
+        assert_eq!(p.protocol, ImProtocol::ImV1);
+        assert!(!p.has_vk_keyboard, "v1 IM relay exposes no vk keyboard");
+        assert!(p.has_keysym_commit, "v1 commits chars via context keysym");
+        assert!(p.heartbeats_done, "v1 CommitState heartbeats the v3 client");
+        assert!(p.delivers_commit_string && p.can_receive_surrounding);
+    }
+
+    #[test]
+    fn vk_keyboard_capability_follows_protocol_not_name() {
+        // The whole point of #3/#5: feasibility reads the bool, and the bool
+        // differs by protocol — v1 cannot run VkOnly, v2 can.
+        assert!(!TransportProfile::for_protocol(ImProtocol::ImV1).has_vk_keyboard);
+        assert!(TransportProfile::for_protocol(ImProtocol::ImV2).has_vk_keyboard);
+    }
 }

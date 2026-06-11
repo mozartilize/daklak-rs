@@ -71,7 +71,7 @@ pub struct Config {
 
     /// Apps whose `app_id` (case-insensitive) make daklak emit
     /// `delete_surrounding_text` as a CHARACTER count instead of a byte
-    /// count on the V1Kde sink. Firefox's text-input-v3 client (or the
+    /// count on the ImV1 sink. Firefox's text-input-v3 client (or the
     /// KWin v1↔v3 bridge for it) interprets `before_length` as Unicode
     /// scalar count rather than bytes, so daklak passing bytes
     /// over-deletes for multi-byte vowels (` ơr`→`ở` — leading space

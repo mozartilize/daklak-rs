@@ -111,7 +111,7 @@ pub trait OutputSink {
     fn vk_commit_char(&mut self, time: u32, c: char) -> bool;
 
     /// Emit `text` as a sequence of `(press, release)` keysym pairs.
-    /// Only implemented on V1Kde via `zwp_input_method_context_v1::keysym`,
+    /// Only implemented on ImV1 via `zwp_input_method_context_v1::keysym`,
     /// which KWin synthesises into real `wl_keyboard.key` events (using a
     /// temporary keymap with `unmappedKeyCode=247` for Unicode keysyms
     /// that don't exist in the system layout). This is the only path that

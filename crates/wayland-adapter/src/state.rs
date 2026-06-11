@@ -114,8 +114,8 @@ pub struct AdapterState {
     pub should_exit: bool,
 
     // ── Compositor backend selection ─────────────────────────────────────────
-    /// Which IM protocol is active. Set during `connect()`.
-    pub im_backend: crate::ImBackend,
+    /// Process-scoped transport capability profile. Set during `connect()`.
+    pub profile: crate::TransportProfile,
     /// v1 IM global (only on KWin/Mutter). `None` on wlroots.
     pub im_v1: Option<ZwpInputMethodV1>,
     /// v1 context proxy — short-lived, one per text-input session.
@@ -203,7 +203,9 @@ impl AdapterState {
             last_forwarded_release: None,
             pending_im_commit_ack: false,
             should_exit: false,
-            im_backend: crate::ImBackend::V2Wlroots,
+            // Placeholder until `connect()` builds the real profile. Never
+            // observed before connect overwrites it.
+            profile: crate::TransportProfile::for_protocol(crate::ImProtocol::ImV2),
             im_v1: None,
             im_ctx_v1: None,
             v1_keyboard: None,
@@ -251,13 +253,13 @@ impl AdapterState {
     /// vk_v2.
     pub fn emit_forward_key(&mut self, time: u32, key: u32, value: u32) {
         let serial = self.serial;
-        match self.im_backend {
-            crate::ImBackend::V2Wlroots => {
+        match self.profile.protocol {
+            crate::ImProtocol::ImV2 => {
                 if let Some(vk) = &self.vk {
                     vk.key(time, key, value);
                 }
             }
-            crate::ImBackend::V1Kde => {
+            crate::ImProtocol::ImV1 => {
                 if let Some(ctx) = &self.im_ctx_v1 {
                     ctx.key(serial, time, key, value);
                 }

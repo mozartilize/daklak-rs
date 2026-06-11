@@ -70,7 +70,7 @@ pub struct AdapterSink<'a> {
     /// release for that keycode before the normal press/release pair,
     /// transitioning X's state to UP first.
     pub(crate) held_user_kc: Option<u32>,
-    /// Per-window override: when true, the V1Kde `delete_surrounding_text`
+    /// Per-window override: when true, the ImV1 `delete_surrounding_text`
     /// emits a CHAR count rather than the spec-compliant byte count.
     /// Set from `WindowState::chars_for_delete` (which the daemon
     /// populates from `force_chars_delete_apps` at activate). Required
@@ -203,7 +203,7 @@ impl OutputSink for AdapterSink<'_> {
     }
 
     fn commit_via_keysym(&mut self, serial: u32, time: u32, text: &str) -> bool {
-        // Only V1Kde implements this; V2 has no zwp_input_method_v2::keysym
+        // Only ImV1 implements this; V2 has no zwp_input_method_v2::keysym
         // equivalent (it has commit_string + commit batching).
         let TextOpsTarget::V1 { ctx, .. } = &self.text_ops else {
             return false;

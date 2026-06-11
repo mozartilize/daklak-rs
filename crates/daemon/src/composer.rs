@@ -61,7 +61,7 @@ pub struct Composer {
     pub raw_word_screen_widths: Vec<u8>,
     raw_word_from_surrounding: bool,
 
-    /// When true, `delete_surrounding_text` on the V1Kde sink emits a
+    /// When true, `delete_surrounding_text` on the ImV1 sink emits a
     /// CHAR count rather than the spec-compliant byte count. Set at
     /// activate when `app_id` matches `force_chars_delete_apps` (firefox
     /// by default). Other v3 clients (chromium/Qt/GTK) honor bytes per
