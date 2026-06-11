@@ -18,12 +18,105 @@ pub struct ByteCursor(pub u32);
 #[cfg(feature = "ibus")]
 pub struct CharCursor(pub u32);
 
+pub(crate) struct EditModel {
+    strategy: Strategy,
+    prev_text: String,
+    prev_cursor: u32,
+    prev_anchor: u32,
+}
+
+impl EditModel {
+    fn new(method: BackspaceMethod) -> Self {
+        Self {
+            strategy: Strategy::new(method),
+            prev_text: String::new(),
+            prev_cursor: 0,
+            prev_anchor: 0,
+        }
+    }
+
+    fn method(&self) -> BackspaceMethod {
+        self.strategy.method()
+    }
+
+    fn set_method(&mut self, m: BackspaceMethod) {
+        self.strategy.set_method(m);
+    }
+
+    fn set_modifiers(&mut self, m: ModifierState) {
+        self.strategy.set_modifiers(m);
+    }
+
+    fn reset(&mut self) {
+        self.strategy.reset_shadow();
+        self.prev_text.clear();
+        self.prev_cursor = 0;
+        self.prev_anchor = 0;
+    }
+
+    fn shadow_text(&self) -> &str {
+        self.strategy.shadow.text()
+    }
+
+    fn push_forwarded_char(&mut self, ch: char) {
+        self.strategy.shadow.text_mut().push(ch);
+    }
+
+    fn pop_forwarded_char(&mut self) {
+        self.strategy.shadow.text_mut().pop();
+    }
+
+    fn on_surrounding_text(&mut self, text: &str, cursor: u32, anchor: u32) {
+        self.strategy.on_surrounding_text(text, cursor, anchor);
+    }
+
+    fn record_surrounding(&mut self, text: &str, cursor: u32, anchor: u32) {
+        self.prev_text = text.to_owned();
+        self.prev_cursor = cursor;
+        self.prev_anchor = anchor;
+    }
+
+    fn one_char_insertion_since_prev(&self, text: &str, cursor: u32) -> bool {
+        detect_one_char_insertion(&self.prev_text, self.prev_cursor, text, cursor)
+    }
+
+    fn is_duplicate_frame(&self, text: &str, cursor: u32, anchor: u32) -> bool {
+        text == self.prev_text && cursor == self.prev_cursor && anchor == self.prev_anchor
+    }
+
+    fn clear_prev_surrounding(&mut self) {
+        self.prev_text.clear();
+        self.prev_cursor = 0;
+        self.prev_anchor = 0;
+    }
+
+    fn prev_surrounding_for_trace(&self) -> (&str, u32) {
+        (&self.prev_text, self.prev_cursor)
+    }
+
+    fn apply<S: viet_ime_edit_strategy::OutputSink>(
+        &mut self,
+        backspaces: usize,
+        commit: &str,
+        serial: u32,
+        time: u32,
+        sink: &mut S,
+    ) {
+        self.strategy.apply(backspaces, commit, serial, time, sink);
+    }
+
+    #[cfg(test)]
+    fn pop_delete_span_for_test(&mut self, backspaces: usize) -> (u32, u32, u32, u32) {
+        self.strategy.shadow.pop_delete_span(backspaces)
+    }
+}
+
 /// Per-text-input composition state + behavior. On wlroots/Sway, one instance
 /// at a time (compositor sends deactivate before new activate); ibus/evdev
 /// create one per active session.
 pub struct Composer {
     pub engine: EngineState,
-    pub strategy: Strategy,
+    edit: EditModel,
     pub method: BackspaceMethod,
     pub last_keystroke_at: Instant,
 
@@ -37,15 +130,6 @@ pub struct Composer {
     /// engine state.
     pub last_input_char: Option<char>,
 
-    // ── Surrounding-text diff tracking (v1 IM / KWin path) ──────────────
-    /// Previous surrounding_text from the last frame. Used to detect
-    /// character insertions by diff, so we can drive the engine without
-    /// intercepting physical key events.
-    pub prev_text: String,
-    /// Byte cursor position matching prev_text.
-    pub prev_cursor: u32,
-    /// Byte anchor position matching prev_text.
-    pub prev_anchor: u32,
     /// v1/KWin path: original Telex chars typed in the current word
     /// (ASCII). Reset on word boundary. Used to seed the engine on every
     /// keystroke so multi-char tone rules see the full raw context
@@ -109,13 +193,10 @@ impl Composer {
     ) -> Self {
         Self {
             engine: EngineState::new_with_options(input_method, bracket_shortcuts),
-            strategy: Strategy::new(backspace_method),
+            edit: EditModel::new(backspace_method),
             method: backspace_method,
             last_keystroke_at: Instant::now(),
             last_input_char: None,
-            prev_text: String::new(),
-            prev_cursor: 0,
-            prev_anchor: 0,
             raw_word: String::new(),
             raw_word_screen_widths: Vec::new(),
             raw_word_from_surrounding: false,
@@ -143,15 +224,16 @@ impl Composer {
     // ── config / probing ────────────────────────────────────────────────
 
     pub fn method(&self) -> BackspaceMethod {
-        self.strategy.method()
+        self.edit.method()
     }
 
     pub fn set_method(&mut self, m: BackspaceMethod) {
-        self.strategy.set_method(m);
+        self.edit.set_method(m);
+        self.method = m;
     }
 
     pub fn set_modifiers(&mut self, m: ModifierState) {
-        self.strategy.set_modifiers(m);
+        self.edit.set_modifiers(m);
     }
 
     /// Set the per-window delete/debounce quirks. They are independent (#4);
@@ -170,14 +252,11 @@ impl Composer {
     /// diff bookkeeping (prev_text, prev_cursor).
     pub fn full_reset(&mut self) {
         self.engine.reset();
-        self.strategy.reset_shadow();
+        self.edit.reset();
         self.last_input_char = None;
         self.raw_word.clear();
         self.raw_word_screen_widths.clear();
         self.raw_word_from_surrounding = false;
-        self.prev_text.clear();
-        self.prev_cursor = 0;
-        self.prev_anchor = 0;
     }
 
     /// Check 2-second idle heuristic. Returns true (and resets engine) if
@@ -250,7 +329,7 @@ impl Composer {
         } else {
             // v2/wlroots path: original shadow-based seed.
             if self.engine.at_word_beginning() && !prev_was_separator {
-                let shadow_text = self.strategy.shadow.text().to_owned();
+                let shadow_text = self.edit.shadow_text().to_owned();
                 let raw_word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
                 if !raw_word.is_empty() && raw_word.chars().all(|c| c.is_ascii_lowercase()) {
                     tracing::debug!(word = raw_word, "seed engine from shadow at word boundary");
@@ -268,7 +347,7 @@ impl Composer {
             consumed = r.consumed,
             bs = r.backspaces,
             commit = %r.commit,
-            shadow = %self.strategy.shadow.text(),
+            shadow = %self.edit.shadow_text(),
             "engine.process_key"
         );
 
@@ -325,7 +404,7 @@ impl Composer {
                 commit: r.commit,
             }
         } else {
-            self.strategy.shadow.text_mut().push(ch);
+            self.edit.push_forwarded_char(ch);
             KeyDecision::ForwardRaw
         }
     }
@@ -375,7 +454,7 @@ impl Composer {
             }
         } else {
             tracing::trace!("BS not consumed → forward");
-            self.strategy.shadow.text_mut().pop();
+            self.edit.pop_forwarded_char();
             self.last_keystroke_at = Instant::now();
             KeyDecision::ForwardRaw
         }
@@ -392,7 +471,18 @@ impl Composer {
         time: u32,
         sink: &mut S,
     ) {
-        self.strategy.apply(backspaces, commit, 0, time, sink);
+        self.edit.apply(backspaces, commit, 0, time, sink);
+    }
+
+    pub fn apply_to_sink<S: viet_ime_edit_strategy::OutputSink>(
+        &mut self,
+        backspaces: usize,
+        commit: &str,
+        serial: u32,
+        time: u32,
+        sink: &mut S,
+    ) {
+        self.edit.apply(backspaces, commit, serial, time, sink);
     }
 
     // ── surrounding-text / reseed gate (the ONE copy) ───────────────────────
@@ -444,8 +534,7 @@ impl Composer {
     /// mid-word typing or within 150 ms of our own action (echo).
     fn apply_surrounding(&mut self, text: &str, cursor: u32, anchor: u32, force_reseed: bool) {
         let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
-        let one_char_typed =
-            detect_one_char_insertion(&self.prev_text, self.prev_cursor, text, cursor);
+        let one_char_typed = self.edit.one_char_insertion_since_prev(text, cursor);
         // A frame with an active selection (anchor ≠ cursor) carries the
         // Chromium autocomplete state the Tier-1 selection fallback depends on
         // (see surrounding::apply). VSCode's stale echoes are plain duplicated
@@ -466,7 +555,7 @@ impl Composer {
             return;
         }
 
-        self.strategy.on_surrounding_text(text, cursor, anchor);
+        self.edit.on_surrounding_text(text, cursor, anchor);
 
         if decision.reseed {
             let word = current_word_before_insertion_point(text, cursor, anchor);
@@ -483,9 +572,7 @@ impl Composer {
             }
         }
 
-        self.prev_text = text.to_owned();
-        self.prev_cursor = cursor;
-        self.prev_anchor = anchor;
+        self.edit.record_surrounding(text, cursor, anchor);
     }
 
     /// True if (text, cursor, anchor) exactly matches the last frame — clients
@@ -493,15 +580,27 @@ impl Composer {
     /// unchanged frame burns engine state. Transport glue checks this before
     /// `observe_surrounding_*`.
     pub fn is_duplicate_frame(&self, text: &str, cursor: u32, anchor: u32) -> bool {
-        text == self.prev_text && cursor == self.prev_cursor && anchor == self.prev_anchor
+        self.edit.is_duplicate_frame(text, cursor, anchor)
     }
 
     /// Clear the surrounding-text diff bookkeeping (no surrounding text in
     /// this frame). Wayland-only: the v3 frame had no surrounding_text.
     pub fn clear_prev_surrounding(&mut self) {
-        self.prev_text.clear();
-        self.prev_cursor = 0;
-        self.prev_anchor = 0;
+        self.edit.clear_prev_surrounding();
+    }
+
+    pub fn prev_surrounding_for_trace(&self) -> (&str, u32) {
+        self.edit.prev_surrounding_for_trace()
+    }
+
+    #[cfg(test)]
+    fn shadow_text(&self) -> &str {
+        self.edit.shadow_text()
+    }
+
+    #[cfg(test)]
+    fn pop_shadow_delete_span_for_test(&mut self, backspaces: usize) -> (u32, u32, u32, u32) {
+        self.edit.pop_delete_span_for_test(backspaces)
     }
 }
 
@@ -565,9 +664,47 @@ pub fn detect_one_char_insertion(
 mod tests {
     use super::{current_word_before_cursor, current_word_before_insertion_point};
     use super::{ByteCursor, Composer};
-    use viet_ime_edit_strategy::BackspaceMethod;
+    use viet_ime_edit_strategy::{BackspaceMethod, KeyState, OutputSink};
     use viet_ime_engine::InputMethod;
     use viet_ime_wayland_adapter::KeyDecision;
+
+    #[derive(Default)]
+    struct DeleteCaptureSink {
+        deletes: Vec<(u32, u32, u32, u32)>,
+        vk_keys: Vec<(u32, u32, KeyState)>,
+        commits: Vec<String>,
+    }
+
+    impl OutputSink for DeleteCaptureSink {
+        fn delete_surrounding_text(
+            &mut self,
+            before_bytes: u32,
+            before_chars: u32,
+            after_bytes: u32,
+            after_chars: u32,
+        ) {
+            self.deletes
+                .push((before_bytes, before_chars, after_bytes, after_chars));
+        }
+
+        fn commit_string(&mut self, text: &str) {
+            self.commits.push(text.to_owned());
+        }
+
+        fn commit(&mut self, _serial: u32) {}
+
+        fn vk_key(&mut self, time: u32, key_code: u32, state: KeyState) {
+            self.vk_keys.push((time, key_code, state));
+        }
+
+        fn vk_modifiers(&mut self, _depressed: u32, _latched: u32, _locked: u32, _group: u32) {}
+
+        fn uinput_key(&mut self, _code: u16, _value: i32) {}
+
+        fn vk_commit_char(&mut self, _time: u32, _ch: char) -> bool {
+            false
+        }
+    }
 
     #[test]
     fn extracts_word_at_end_of_line() {
@@ -817,7 +954,7 @@ mod tests {
         assert!(matches!(c.feed_key('i'), KeyDecision::ForwardRaw));
         assert_eq!(c.raw_word, "i");
         assert_eq!(c.raw_word_screen_widths, vec![1]);
-        assert_eq!(c.strategy.shadow.text(), "i");
+        assert_eq!(c.shadow_text(), "i");
     }
 
     #[test]
@@ -829,7 +966,7 @@ mod tests {
         c.observe_surrounding_bytes("i", ByteCursor(1), ByteCursor(1), false);
         c.observe_surrounding_bytes("ii", ByteCursor(0), ByteCursor(0), false);
 
-        assert_eq!(c.strategy.shadow.text(), "i");
+        assert_eq!(c.shadow_text(), "i");
         match c.feed_key('s') {
             KeyDecision::Apply {
                 backspaces, commit, ..
@@ -858,8 +995,8 @@ mod tests {
         // Frame reached the shadow: before-cursor text is "tra" and the
         // after-cursor selection "nslate" is recorded, so pop_delete_span
         // yields after_bytes > 0 and the ForwardKey fallback would fire.
-        assert_eq!(c.strategy.shadow.text(), "tra");
-        let (_, _, after_bytes, _) = c.strategy.shadow.pop_delete_span(1);
+        assert_eq!(c.shadow_text(), "tra");
+        let (_, _, after_bytes, _) = c.pop_shadow_delete_span_for_test(1);
         assert!(after_bytes > 0, "selection-after must be recorded");
     }
 
@@ -875,6 +1012,20 @@ mod tests {
         let decision = super::SurroundingObserver::observe(true, false, false, true);
 
         assert_eq!(decision, super::SurroundingDecision { trust: true, reseed: false });
+    }
+
+    #[test]
+    fn edit_model_owns_shadow_and_tier_apply() {
+        let mut edit = super::EditModel::new(BackspaceMethod::SurroundingText);
+        edit.push_forwarded_char('a');
+        assert_eq!(edit.shadow_text(), "a");
+
+        let mut sink = DeleteCaptureSink::default();
+        edit.apply(1, "â", 1, 0, &mut sink);
+
+        assert_eq!(sink.deletes.len(), 1);
+        assert_eq!(sink.commits, vec!["â".to_owned()]);
+        assert_eq!(edit.shadow_text(), "â");
     }
 
     // ── detect_one_char_insertion ──────────────────────────────────────

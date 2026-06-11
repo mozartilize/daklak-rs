@@ -83,12 +83,13 @@ impl AdapterHandler for Daemon {
         // ONLY on activate or genuine cursor jump (user clicked elsewhere) —
         // the reseed gate inside `observe_surrounding_bytes` enforces that.
         if let Some((text, cursor, anchor)) = frame.surrounding_text.as_ref() {
+            let (prev_text, prev_cursor) = w.prev_surrounding_for_trace();
             tracing::trace!(
                 text = %text,
                 text_len = text.len(),
                 cursor = *cursor,
-                prev_text = %w.prev_text,
-                prev_cursor = w.prev_cursor,
+                prev_text = %prev_text,
+                prev_cursor,
                 raw_word = %w.raw_word,
                 "on_done_frame surrounding_text"
             );
@@ -238,7 +239,7 @@ impl AdapterHandler for Daemon {
             tracing::debug!(method = ?w.method, backspaces, commit, "strategy.apply");
             let delete_in_chars = w.delete_in_chars;
             ctx.with_sink(raw_mods, held_user_kc, delete_in_chars, |sink| {
-                w.strategy.apply(backspaces, commit, serial, time, sink);
+                w.apply_to_sink(backspaces, commit, serial, time, sink);
             });
         }
     }

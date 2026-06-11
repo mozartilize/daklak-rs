@@ -430,7 +430,7 @@ mod tests {
 
             let mut sink = DeleteCaptureSink::default();
             let w = daemon.composer.as_mut().expect("composer state exists");
-            w.strategy.apply(1, "â", 1, 0, &mut sink);
+            w.apply_to_sink(1, "â", 1, 0, &mut sink);
 
             // Selection present → no delete_surrounding_text (would race),
             // instead ForwardKey BS: 2 BSes (1 for selection + 1 for 'a')
