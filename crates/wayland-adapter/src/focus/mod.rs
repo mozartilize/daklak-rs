@@ -3,7 +3,7 @@
 //! Re-exports `FocusBackend` + `FocusEvent` from `viet-ime-focus`.
 //! The WLR backend stays here because it depends on `wayland-protocols-wlr`.
 
-pub use viet_ime_focus::{FocusBackend, FocusEvent};
+pub use viet_ime_focus::{FocusBackend, FocusEvent, FocusSource};
 pub use viet_ime_focus::x11;
 
 #[cfg(feature = "kde")]

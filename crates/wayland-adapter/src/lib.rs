@@ -83,6 +83,10 @@ pub struct TransportProfile {
     /// IM protocol the compositor speaks. Identity only — capability decisions
     /// read the bools below, never this.
     pub protocol: ImProtocol,
+    /// Focus-tracking source, probed independently of `protocol` (plan82 #5).
+    /// `for_protocol` leaves this `None`; `connect()` overwrites it after the
+    /// focus probe.
+    pub focus: crate::focus::FocusSource,
     /// `zwp_virtual_keyboard_v1` is available. Required for Tier 2 ForwardKey's
     /// BS emit on v2 and for Tier 4 VkOnly. False on the v1 IM relay.
     pub has_vk_keyboard: bool,
@@ -111,6 +115,7 @@ impl TransportProfile {
             // implicit `done` heartbeat.
             ImProtocol::ImV2 => Self {
                 protocol,
+                focus: crate::focus::FocusSource::None,
                 has_vk_keyboard: true,
                 has_keysym_commit: false,
                 delivers_commit_string: true,
@@ -121,6 +126,7 @@ impl TransportProfile {
             // available, v1 `CommitState` heartbeats the v3 client.
             ImProtocol::ImV1 => Self {
                 protocol,
+                focus: crate::focus::FocusSource::None,
                 has_vk_keyboard: false,
                 has_keysym_commit: true,
                 delivers_commit_string: true,
@@ -659,6 +665,48 @@ fn log_duplicate_tail_diagnostic(
     }
 }
 
+/// Probe the focus-tracking source, independent of the IM protocol (plan82 #5).
+/// Order: `wlr-foreign-toplevel-management` (wlroots and anything exposing it),
+/// then KDE Plasma (only under the `kde` feature), else none. Runs for both v1
+/// and v2 — a non-KDE v1 compositor that exposes wlr gets focus tracking, and a
+/// v2 compositor on KDE could get Plasma. Installs the winner's proxies + the
+/// X11 bridge into `app.state`.
+fn probe_focus<H: AdapterHandler>(
+    globals: &wayland_client::globals::GlobalList,
+    qh: &QueueHandle<WaylandAdapter<H>>,
+    app: &mut WaylandAdapter<H>,
+) -> (crate::focus::FocusSource, Option<Box<dyn FocusBackend>>) {
+    use crate::focus::FocusSource;
+
+    match globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(qh, 1..=3, ()) {
+        Ok(m) => {
+            app.state.ftl_manager = Some(m);
+            app.state.x11_bridge = X11Bridge::spawn();
+            let (b, tx) = WlrForeignToplevelBackend::new(app.state.focus_current.clone());
+            app.state.focus_tx = Some(tx);
+            tracing::info!("focus backend: wlr-foreign-toplevel-management v3");
+            return (FocusSource::WlrForeignToplevel, Some(Box::new(b)));
+        }
+        Err(e) => tracing::debug!("wlr-foreign-toplevel unavailable ({e:#})"),
+    }
+
+    #[cfg(feature = "kde")]
+    match globals.bind::<OrgKdePlasmaWindowManagement, _, _>(qh, 1..=18, ()) {
+        Ok(m) => {
+            app.state.plasma_manager = Some(m.clone());
+            app.state.x11_bridge = X11Bridge::spawn();
+            let (b, tx) = KdePlasmaBackend::new(app.state.focus_current.clone());
+            app.state.focus_tx = Some(tx);
+            tracing::info!("focus backend: org_kde_plasma_window_management v20");
+            return (FocusSource::KdePlasma, Some(Box::new(b)));
+        }
+        Err(e) => tracing::debug!("org_kde_plasma_window_management unavailable ({e:#})"),
+    }
+
+    tracing::warn!("no focus backend available; focus tracking disabled");
+    (FocusSource::None, None)
+}
+
 pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::WaylandHandle<H>> {
     let conn = Connection::connect_to_env().context("connect to Wayland display")?;
 
@@ -697,7 +745,7 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
     app.state.seat = Some(seat.clone());
 
     // ── Compositor backend detection: v2 (wlroots) or v1 (KWin/Mutter) ─────
-    let (profile, backend) =
+    let mut profile =
         if let Ok(v2) = globals.bind::<ZwpInputMethodManagerV2, _, _>(&qh, 1..=1, ()) {
             // ── v2 (wlroots) path ────────────────────────────────────────────────
             app.state.im_manager = Some(v2.clone());
@@ -707,24 +755,8 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
                 .context("bind zwp_virtual_keyboard_manager_v1")?;
             app.state.vk_manager = Some(vk_manager.clone());
 
-            let backend: Option<Box<dyn FocusBackend>> =
-                match globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ()) {
-                    Ok(m) => {
-                        app.state.ftl_manager = Some(m);
-                        app.state.x11_bridge = X11Bridge::spawn();
-                        let (b, tx) =
-                            WlrForeignToplevelBackend::new(app.state.focus_current.clone());
-                        app.state.focus_tx = Some(tx);
-                        tracing::info!("focus backend: wlr-foreign-toplevel-management v3");
-                        Some(Box::new(b))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "wlr-foreign-toplevel unavailable ({e:#}); focus tracking disabled"
-                        );
-                        None
-                    }
-                };
+            // Focus source is probed once, after protocol detection, in
+            // `probe_focus` — independent of v1/v2 (plan82 #5).
 
             event_queue.roundtrip(&mut app).context("initial roundtrip")?;
 
@@ -754,47 +786,20 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
 
             // v2/wlroots: vk_manager is bound above (required, errors otherwise)
             // so the vk keyboard is always present.
-            (TransportProfile::for_protocol(ImProtocol::ImV2), backend)
+            TransportProfile::for_protocol(ImProtocol::ImV2)
 
         } else if let Ok(v1) = globals.bind::<ZwpInputMethodV1, _, _>(&qh, 1..=1, ()) {
             // ── v1 (KWin/Mutter) path ────────────────────────────────────────────
             app.state.im_v1 = Some(v1.clone());
             app.state.conn = Some(conn.clone());
 
-            #[cfg(feature = "kde")]
-            let backend: Option<Box<dyn FocusBackend>> = {
-                match globals
-                    .bind::<OrgKdePlasmaWindowManagement, _, _>(&qh, 1..=18, ())
-                {
-                    Ok(m) => {
-                        app.state.plasma_manager = Some(m.clone());
-                        app.state.x11_bridge = X11Bridge::spawn();
-                        let (b, tx) = KdePlasmaBackend::new(
-                            app.state.focus_current.clone(),
-                        );
-                        app.state.focus_tx = Some(tx);
-                        tracing::info!("focus backend: org_kde_plasma_window_management v20");
-                        Some(Box::new(b))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "org_kde_plasma_window_management unavailable ({e:#}); focus tracking disabled"
-                        );
-                        None
-                    }
-                }
-            };
-
-            #[cfg(not(feature = "kde"))]
-            let backend: Option<Box<dyn FocusBackend>> = {
-                tracing::warn!("KDE feature not compiled; focus tracking disabled");
-                None
-            };
+            // Focus source is probed once, after protocol detection, in
+            // `probe_focus` — independent of v1/v2 (plan82 #5).
 
             event_queue.roundtrip(&mut app).context("initial roundtrip")?;
 
             tracing::info!("input method v1 bound (KWin/Mutter)");
-            (TransportProfile::for_protocol(ImProtocol::ImV1), backend)
+            TransportProfile::for_protocol(ImProtocol::ImV1)
 
         } else {
             anyhow::bail!(
@@ -802,6 +807,9 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
             );
         };
 
+    // Focus source — probed once, independent of the IM protocol (plan82 #5).
+    let (focus_source, backend) = probe_focus(&globals, &qh, &mut app);
+    profile.focus = focus_source;
     app.state.profile = profile;
 
     event_queue.roundtrip(&mut app).context("second roundtrip")?;
@@ -849,5 +857,38 @@ mod tests {
         // differs by protocol — v1 cannot run VkOnly, v2 can.
         assert!(!TransportProfile::for_protocol(ImProtocol::ImV1).has_vk_keyboard);
         assert!(TransportProfile::for_protocol(ImProtocol::ImV2).has_vk_keyboard);
+    }
+
+    #[test]
+    fn focus_is_not_implied_by_protocol() {
+        // `for_protocol` leaves focus unset — connect()'s independent probe owns
+        // it (plan82 #5). Protocol must NOT carry a focus assumption.
+        use crate::focus::FocusSource;
+        assert_eq!(
+            TransportProfile::for_protocol(ImProtocol::ImV1).focus,
+            FocusSource::None
+        );
+        assert_eq!(
+            TransportProfile::for_protocol(ImProtocol::ImV2).focus,
+            FocusSource::None
+        );
+    }
+
+    #[test]
+    fn profile_can_pair_any_protocol_with_any_focus() {
+        // The combination the old V1Kde/V2Wlroots enum could not represent:
+        // a v1 compositor tracking focus via wlr-foreign-toplevel, and a v2
+        // compositor tracking via KDE Plasma. Both are now expressible.
+        use crate::focus::FocusSource;
+        let mut v1_wlr = TransportProfile::for_protocol(ImProtocol::ImV1);
+        v1_wlr.focus = FocusSource::WlrForeignToplevel;
+        assert_eq!(v1_wlr.protocol, ImProtocol::ImV1);
+        assert_eq!(v1_wlr.focus, FocusSource::WlrForeignToplevel);
+        assert!(!v1_wlr.has_vk_keyboard, "still v1: no vk keyboard");
+
+        let mut v2_plasma = TransportProfile::for_protocol(ImProtocol::ImV2);
+        v2_plasma.focus = FocusSource::KdePlasma;
+        assert_eq!(v2_plasma.protocol, ImProtocol::ImV2);
+        assert_eq!(v2_plasma.focus, FocusSource::KdePlasma);
     }
 }

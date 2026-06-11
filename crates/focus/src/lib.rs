@@ -3,6 +3,21 @@ use async_trait::async_trait;
 #[cfg(feature = "x11")]
 pub mod x11;
 
+/// Which focus-tracking source won at `connect()`. A separate axis from the IM
+/// protocol (plan82 #5): probed independently, so v1 and v2 both pick whichever
+/// source the compositor actually exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusSource {
+    /// `wlr-foreign-toplevel-management-v1` (wlroots and any compositor that
+    /// exposes it — not implied by the IM protocol).
+    WlrForeignToplevel,
+    /// `org_kde_plasma_window_management` (compiled only under the `kde`
+    /// cargo feature).
+    KdePlasma,
+    /// No focus source available — focus tracking disabled.
+    None,
+}
+
 /// A focus-change observation emitted by a backend.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FocusEvent {
