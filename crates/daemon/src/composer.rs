@@ -416,7 +416,16 @@ impl Composer {
         let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
         let one_char_typed =
             detect_one_char_insertion(&self.prev_text, self.prev_cursor, text, cursor);
-        if recent_action && !one_char_typed && !force_reseed {
+        // A frame with an active selection (anchor ≠ cursor) carries the
+        // Chromium autocomplete state the Tier-1 selection fallback depends on
+        // (see surrounding::apply). VSCode's stale echoes are plain duplicated
+        // text with the cursor collapsed to the start (anchor == cursor), so a
+        // selection distinguishes the frame we must record from the garbage we
+        // must drop. Let selection frames through — `should_reseed` stays false
+        // under `recent_action`, so we update the shadow without reseeding the
+        // engine and clobbering Telex state.
+        let has_selection = cursor != anchor;
+        if recent_action && !one_char_typed && !force_reseed && !has_selection {
             tracing::trace!(text, cursor, anchor, "skip recent surrounding_text echo");
             return;
         }
@@ -782,6 +791,28 @@ mod tests {
             }
             _ => panic!("expected tone transform"),
         }
+    }
+
+    #[test]
+    fn recent_selection_surrounding_frame_reaches_shadow() {
+        // Chromium omnibox autocomplete: user types into "tra", the omnibox
+        // expands to "translate" with "nslate" selected (cursor=3, anchor=9).
+        // That frame arrives within the post-keystroke `recent_action` window
+        // and is not a one-char insertion, but it carries the selection the
+        // Tier-1 fallback (surrounding::apply) needs. The stale-echo gate must
+        // NOT drop it. Regression for the bug reintroduced by the VSCode
+        // stale-echo guard.
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+        c.mark_action();
+        c.observe_surrounding_bytes("translate", ByteCursor(3), ByteCursor(9), false);
+
+        // Frame reached the shadow: before-cursor text is "tra" and the
+        // after-cursor selection "nslate" is recorded, so pop_delete_span
+        // yields after_bytes > 0 and the ForwardKey fallback would fire.
+        assert_eq!(c.strategy.shadow.text(), "tra");
+        let (_, _, after_bytes, _) = c.strategy.shadow.pop_delete_span(1);
+        assert!(after_bytes > 0, "selection-after must be recorded");
     }
 
     // ── detect_one_char_insertion ──────────────────────────────────────
