@@ -4,6 +4,7 @@
 //! wire glue lives in [`crate::transport`]. `Daemon` keeps a single live
 //! `Composer` and exposes transport-neutral entry points that the glue calls.
 
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "ibus")]
 use std::sync::atomic::Ordering;
@@ -29,10 +30,9 @@ pub(crate) const NAV_KEYS: &[u32] = &[
     104, 109, // PageUp, PageDown
 ];
 
-/// Orchestration state. Owns config + the single live `Composer` + policy flags.
-pub struct Daemon {
-    pub config: Config,
-
+/// Router-owned lifecycle and composition state. `Daemon` holds config/policy;
+/// `Router` holds the active session, focus, modifiers, and enabled edge state.
+pub struct Router {
     pub modifiers: ModifierState,
     pub current_active: bool,
 
@@ -48,20 +48,56 @@ pub struct Daemon {
     /// not here.
     pub composer: Option<Composer>,
 
-    /// Forced tier for `purpose == PURPOSE_TERMINAL`, read once from
-    /// `DAKLAK_TERMINAL_TIER` at startup. None → detect_method default.
-    pub terminal_override: Option<BackspaceMethod>,
-
     /// Focused window's `app_id` captured at activate. Threaded into the
     /// capability probe so known-broken-on-ForwardKey terminals can
     /// auto-escalate. None outside an active session.
     pub focused_app_id: Option<String>,
 
-    /// Shared on/off flag — written by the control task, read each keystroke.
-    pub enabled: Arc<AtomicBool>,
     /// Previous value of `enabled`; used for edge-detection (on→off triggers
     /// a lazy full_reset on the next keystroke instead of from the control task).
     pub(crate) last_enabled: bool,
+}
+
+impl Router {
+    fn new() -> Self {
+        Self {
+            modifiers: ModifierState::empty(),
+            current_active: false,
+            synthetic_active: false,
+            composer: None,
+            focused_app_id: None,
+            last_enabled: true,
+        }
+    }
+}
+
+/// Orchestration state. Owns config + shared policy; delegates active lifecycle
+/// and key-routing state to [`Router`].
+pub struct Daemon {
+    pub config: Config,
+
+    pub router: Router,
+
+    /// Forced tier for `purpose == PURPOSE_TERMINAL`, read once from
+    /// `DAKLAK_TERMINAL_TIER` at startup. None → detect_method default.
+    pub terminal_override: Option<BackspaceMethod>,
+
+    /// Shared on/off flag — written by the control task, read each keystroke.
+    pub enabled: Arc<AtomicBool>,
+}
+
+impl Deref for Daemon {
+    type Target = Router;
+
+    fn deref(&self) -> &Self::Target {
+        &self.router
+    }
+}
+
+impl DerefMut for Daemon {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.router
+    }
 }
 
 impl Daemon {
@@ -94,14 +130,9 @@ impl Daemon {
 
         Self {
             config,
-            modifiers: ModifierState::empty(),
-            current_active: false,
-            synthetic_active: false,
-            composer: None,
+            router: Router::new(),
             terminal_override,
-            focused_app_id: None,
             enabled,
-            last_enabled: true,
         }
     }
 
@@ -325,6 +356,22 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
+    use super::Daemon;
+    use crate::config::Config;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    #[test]
+    fn daemon_initializes_router_lifecycle_state() {
+        let d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
+
+        assert!(!d.router.current_active);
+        assert!(!d.router.synthetic_active);
+        assert!(d.router.composer.is_none());
+        assert!(d.router.focused_app_id.is_none());
+        assert!(d.router.last_enabled);
+    }
+
     mod surrounding_anchor_regression {
         use super::super::Daemon;
         use crate::composer::Composer;

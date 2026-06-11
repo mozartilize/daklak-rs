@@ -75,7 +75,8 @@ impl AdapterHandler for Daemon {
         }
 
         // After deactivate, composer is None — nothing more to do.
-        let Some(w) = self.composer.as_mut() else {
+        let focused_app_id = self.router.focused_app_id.clone();
+        let Some(w) = self.router.composer.as_mut() else {
             return;
         };
 
@@ -117,7 +118,7 @@ impl AdapterHandler for Daemon {
                         text: text.clone(),
                         cursor: *cursor,
                     }),
-                    app_id: self.focused_app_id.clone(),
+                    app_id: focused_app_id.clone(),
                     force_uinput_apps: self.config.force_uinput_apps.clone(),
                     force_vk_only_apps: self.config.force_vk_only_apps.clone(),
                     terminal_override: self.terminal_override,
