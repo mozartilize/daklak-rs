@@ -118,6 +118,10 @@ impl Daemon {
             force_uinput_apps: self.config.force_uinput_apps.clone(),
             force_vk_only_apps: self.config.force_vk_only_apps.clone(),
             terminal_override: self.terminal_override,
+            // Phase 4 sources this from `ctx.profile().has_vk_keyboard` and
+            // deletes the transport/wayland.rs VkOnly→UInput downgrade. Until
+            // then `true` keeps the clamp a no-op and the old downgrade active.
+            vk_keyboard_available: true,
         };
         detect_method(&probe)
     }

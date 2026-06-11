@@ -30,6 +30,13 @@ pub struct CapabilityProbe {
     /// Forced tier for `purpose == PURPOSE_TERMINAL`, set by the daemon from
     /// `DAKLAK_TERMINAL_TIER` once at startup. Wins over the app_id list.
     pub terminal_override: Option<BackspaceMethod>,
+
+    /// Whether the active transport exposes a virtual keyboard
+    /// (`zwp_virtual_keyboard_v1`). VkOnly (Tier 4, Path C) is infeasible
+    /// without it, so `detect_method` clamps VkOnly → UInput when this is
+    /// false. Sourced once from `TransportProfile.has_vk_keyboard`; the
+    /// decision lives here so no use site re-checks the backend by name.
+    pub vk_keyboard_available: bool,
 }
 
 pub struct SurroundingFrame {
@@ -63,6 +70,19 @@ const PURPOSE_TERMINAL: u32 = 13;
 ///    - Non-terminals → SurroundingText if app sent a surrounding_text frame
 ///      at activate, else ForwardKey.
 pub fn detect_method(probe: &CapabilityProbe) -> BackspaceMethod {
+    let desired = desired_method(probe);
+    // Feasibility clamp: never emit a tier the transport cannot deliver.
+    // VkOnly (Tier 4, Path C) needs `zwp_virtual_keyboard_v1`; on a transport
+    // without it (the KWin/Mutter v1 IM relay exposes no vk to the IME side)
+    // fall through to UInput. This is the single home of the downgrade that
+    // used to live as a backend-name check in `transport/wayland.rs` (#3).
+    match desired {
+        BackspaceMethod::VkOnly if !probe.vk_keyboard_available => BackspaceMethod::UInput,
+        other => other,
+    }
+}
+
+fn desired_method(probe: &CapabilityProbe) -> BackspaceMethod {
     if probe.purpose == PURPOSE_TERMINAL {
         if let Some(forced) = probe.terminal_override {
             return forced;
@@ -128,6 +148,9 @@ mod tests {
             force_uinput_apps: Vec::new(),
             force_vk_only_apps: Vec::new(),
             terminal_override: None,
+            // Default to the common case (v2+VK / v1 keysym both feasible for
+            // every tier these tests exercise). The clamp tests set it false.
+            vk_keyboard_available: true,
         }
     }
 
@@ -267,6 +290,34 @@ mod tests {
         assert_eq!(detect_method(&p), BackspaceMethod::ForwardKey);
         let p = probe_with_app_id(13, "com.mitchellh.ghostty");
         assert_eq!(detect_method(&p), BackspaceMethod::ForwardKey);
+    }
+
+    #[test]
+    fn vk_only_falls_back_to_uinput_when_no_vk_keyboard() {
+        // force_vk_only_apps would pick VkOnly, but the transport has no
+        // virtual keyboard (e.g. KWin/Mutter v1) → clamp to UInput.
+        let mut p = probe_with_app_id(0, "chromium");
+        p.force_vk_only_apps = vec!["chromium".to_owned()];
+        p.vk_keyboard_available = false;
+        assert_eq!(detect_method(&p), BackspaceMethod::UInput);
+    }
+
+    #[test]
+    fn vk_only_kept_when_vk_keyboard_present() {
+        let mut p = probe_with_app_id(0, "chromium");
+        p.force_vk_only_apps = vec!["chromium".to_owned()];
+        p.vk_keyboard_available = true;
+        assert_eq!(detect_method(&p), BackspaceMethod::VkOnly);
+    }
+
+    #[test]
+    fn terminal_override_vk_only_also_clamped_without_vk() {
+        // The clamp is on the final tier, so even an explicit terminal
+        // override of VkOnly is downgraded when no vk keyboard exists.
+        let mut p = probe(13, None);
+        p.terminal_override = Some(BackspaceMethod::VkOnly);
+        p.vk_keyboard_available = false;
+        assert_eq!(detect_method(&p), BackspaceMethod::UInput);
     }
 
     #[test]

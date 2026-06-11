@@ -121,6 +121,10 @@ impl AdapterHandler for Daemon {
                     force_uinput_apps: self.config.force_uinput_apps.clone(),
                     force_vk_only_apps: self.config.force_vk_only_apps.clone(),
                     terminal_override: self.terminal_override,
+                    // Late upgrade only ever promotes FK→ST, so the clamp is
+                    // irrelevant here; `true` is correct and Phase 4 will route
+                    // this through the profile alongside detect_capability.
+                    vk_keyboard_available: true,
                 };
                 let upgraded = detect_method(&probe);
                 if upgraded == BackspaceMethod::SurroundingText {
