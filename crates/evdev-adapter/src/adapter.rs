@@ -81,7 +81,7 @@ pub struct EvdevAdapter {
     /// emit_string's mod dance.
     emitted_mods: u32,
     /// Physical evdev keycodes the user currently has depressed
-    /// (`value=1` seen, `value=0` not yet). Path A tail-drop fix:
+    /// (`value=1` seen, `value=0` not yet). Tail-drop fix:
     /// when emit_string is about to press a key the user is still
     /// holding, libxkbcommon (in the focused client) treats the
     /// second press as a no-op duplicate. We emit a prelude release
@@ -271,7 +271,7 @@ impl EvdevAdapter {
                 "emit_string: char_to_emit"
             );
             self.set_uinput_mods(spec.mods);
-            // Path A: if the user is still physically holding the key
+            // Tail-drop fix: if the user is still physically holding the key
             // we're about to emit, libxkbcommon (in the focused
             // client) sees the second press as a duplicate of an
             // already-held key and drops it. Emit a prelude release
@@ -279,7 +279,7 @@ impl EvdevAdapter {
             if self.held_physical.contains(&spec.keycode) {
                 tracing::debug!(
                     keycode = spec.keycode,
-                    "emit_string: prelude release for still-held user key (Path A)"
+                    "emit_string: prelude release for still-held user key (tail-drop fix)"
                 );
                 self.passthrough(spec.keycode, 0);
             }
@@ -305,7 +305,7 @@ impl EvdevAdapter {
         let code = ev.code() as u32;
         let value = ev.value();
 
-        // Track physical key state for Path A (tail-drop fix in
+        // Track physical key state for the tail-drop fix (in
         // emit_string). value=1 press, value=0 release; autorepeat=2
         // doesn't change held state.
         match value {

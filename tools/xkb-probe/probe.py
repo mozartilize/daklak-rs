@@ -23,7 +23,7 @@ Run order:
        ID=$(swaymsg -t get_inputs | jq -r \
            '.[] | select(.name=="daklak-xkb-probe").identifier')
        swaymsg input "$ID" xkb_file \
-           /home/mozart/Documents/workspace/daklak-rs/tools/xkb-probe/probe.xkb
+           ./daklak-rs/tools/xkb-probe/probe.xkb
        # Verify sway accepted it (no error). Optional:
        swaymsg -t get_inputs | jq '.[] | select(.name=="daklak-xkb-probe")'
      Note: sway/xkbcommon reports "Inappropriate ioctl for device" for

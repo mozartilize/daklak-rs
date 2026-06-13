@@ -9,12 +9,12 @@
   Then: ibus-setup → Input Method → Add → Vietnamese → Vietnamese (Daklak)
   Or CLI: ibus engine daklak
 
-  @bindir@ and @version@ are substituted by meson at install time.
+    @daklak_exec@ and @version@ are substituted by meson at install time.
 -->
 <component>
     <name>org.freedesktop.IBus.Daklak</name>
     <description>Daklak Vietnamese input method</description>
-    <exec>@bindir@/daklak --ibus</exec>
+    <exec>@daklak_exec@</exec>
     <version>@version@</version>
     <author>daklak contributors</author>
     <license>GPL-3.0-or-later</license>

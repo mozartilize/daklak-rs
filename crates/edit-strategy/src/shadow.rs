@@ -1,7 +1,7 @@
 /// Shadow buffer — tracks the text immediately before the cursor that the
 /// daemon has committed during the current word. Used to compute the byte
 /// count for `delete_surrounding_text` (Tier 1) and to detect cursor-delta
-/// invalidation (see plan0.md priority-1 invalidation).
+/// invalidation (cursor-delta is the priority-1 signal).
 pub struct ShadowBuffer {
     text: String,
     last_cursor: Option<u32>,

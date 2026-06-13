@@ -148,7 +148,7 @@ pub struct Composer {
     /// When true, `delete_surrounding_text` emits a CHAR count rather than the
     /// spec-compliant byte count. Set at activate when `app_id` matches
     /// `force_chars_delete_apps` (firefox by default). Other v3 clients honor
-    /// bytes per spec. Independent of `debounce_barrier` (plan82 #4) — a future
+    /// bytes per spec. Independent of `debounce_barrier` — a future
     /// app may need one without the other.
     pub delete_in_chars: bool,
     /// When true, the Wayland apply loop forces a flush + 30 ms sleep after each

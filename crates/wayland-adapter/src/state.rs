@@ -179,7 +179,7 @@ impl AdapterState {
                     tracing::info!(
                         size = km.size,
                         vn_pairs = keymap::vn_pairs(),
-                        "synthetic Vietnamese keymap built (Path C, FOUR_LEVEL ≤255)"
+                        "synthetic Vietnamese keymap built (Tier 4 VkOnly, FOUR_LEVEL ≤255)"
                     );
                     Some(km)
                 }

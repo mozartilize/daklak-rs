@@ -20,6 +20,7 @@ xkbcommon_dep = dependency('xkbcommon', required: true)
 dbus_dep = dependency('dbus-1', required: false)
 
 buildtype = get_option('buildtype')
+is_dev_install = buildtype == 'debug'
 cargo_profile = buildtype == 'debug' ? 'debug' : 'release'
 cargo_target_dir = meson.current_build_dir() / 'cargo-target'
 
@@ -57,7 +58,12 @@ install_data('res/config.toml.example',
 
 if get_option('kde')
   desktop_conf = configuration_data()
-  desktop_conf.set('BINDIR', get_option('prefix') / get_option('bindir'))
+  desktop_conf.set(
+    'DAKLAK_EXEC',
+    is_dev_install
+      ? meson.project_source_root() / 'daklak-wrap.sh'
+      : get_option('prefix') / get_option('bindir') / 'daklak',
+  )
   desktop = configure_file(
     input: 'res/daklak.desktop.in',
     output: 'daklak.desktop',
@@ -70,10 +76,15 @@ endif
 
 if get_option('ibus')
   ibus_comp_conf = configuration_data()
-  ibus_comp_conf.set('bindir', get_option('prefix') / get_option('bindir'))
+  ibus_comp_conf.set(
+    'daklak_exec',
+    is_dev_install
+      ? meson.project_source_root() / 'daklak-ibus-wrap.sh'
+      : get_option('prefix') / get_option('bindir') / 'daklak --ibus',
+  )
   ibus_comp_conf.set('version', meson.project_version())
   ibus_comp = configure_file(
-    input: 'data/ibus/daklak.xml',
+    input: 'res/ibus/daklak.xml',
     output: 'daklak.xml',
     configuration: ibus_comp_conf,
   )
@@ -81,6 +92,7 @@ if get_option('ibus')
   install_data(ibus_comp,
     install_dir: ibus_comp_dir,
   )
+  meson.add_install_script('scripts/meson-ibus-postinst.sh')
 endif
 
 daklak_bin = custom_target(

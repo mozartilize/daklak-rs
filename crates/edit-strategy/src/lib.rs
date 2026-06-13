@@ -14,13 +14,13 @@ use bitflags::bitflags;
 
 /// Which Wayland/uinput mechanism a given text-input object gets.
 /// One per text_input_object, NOT per window — Firefox has separate objects
-/// for address bar vs page content (plan0.md:354-369).
+/// for address bar vs page content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackspaceMethod {
     SurroundingText, // Tier 1 — delete_surrounding_text
     ForwardKey,      // Tier 2 — zwp_virtual_keyboard_v1 synthetic BS
     UInput,          // Tier 3 — /dev/uinput synthetic BS with modifier guard
-    /// Tier 4 (Path C) — everything via `zwp_virtual_keyboard_v1::key()`,
+    /// Tier 4 (VkOnly) — everything via `zwp_virtual_keyboard_v1::key()`,
     /// using daklak's synthesized xkb keymap that maps spare evdev slots
     /// (200+) to Vietnamese precomposed chars. No `commit_string`, no
     /// `zwp_text_input_v3` — usable for clients that never advertise
@@ -40,7 +40,7 @@ pub enum KeyDecision {
     ForwardRaw,
     /// Engine consumed and produced an edit. Adapter wraps `apply_pending`
     /// in the Tier-3 grab dance (when method == UInput) and computes
-    /// `held_user_kc` (Path A) before passing both to the handler.
+    /// `held_user_kc` (tail-char-drop fix) before passing both to the handler.
     Apply {
         method: BackspaceMethod,
         backspaces: usize,
@@ -178,7 +178,7 @@ impl Strategy {
     }
 
     /// Observe a surrounding_text frame from the compositor. Resets shadow on
-    /// cursor delta (plan0.md priority-1 invalidation).
+    /// cursor delta (the priority-1 invalidation signal).
     pub fn on_surrounding_text(&mut self, text: &str, cursor: u32, anchor: u32) {
         self.shadow.observe_surrounding(text, cursor, anchor);
     }
@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(bs_calls.len(), 4);
     }
 
-    // ── Tier 4 — VkOnly (Path C) ──────────────────────────────────────────────
+    // ── Tier 4 — VkOnly ──────────────────────────────────────────────
 
     #[test]
     fn tier4_single_backspace_and_commit() {

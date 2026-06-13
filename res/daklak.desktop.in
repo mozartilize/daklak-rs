@@ -2,7 +2,7 @@
 Name=Daklak Vietnamese Input Method
 GenericName=Input Method
 Comment=Vietnamese input method for Wayland
-Exec=@BINDIR@/daklak
+Exec=@DAKLAK_EXEC@
 Icon=daklak
 Terminal=false
 Type=Application

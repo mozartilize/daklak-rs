@@ -62,7 +62,7 @@ pub struct AdapterSink<'a> {
     /// Tuple = (depressed, latched, locked, group) as in
     /// `zwp_input_method_keyboard_grab_v2::Modifiers`.
     pub(crate) raw_mods: (u32, u32, u32, u32),
-    /// Tail-char-drop fix (Path A). When the user is currently holding a
+    /// Tail-char-drop fix. When the user is currently holding a
     /// key whose keycode equals the one daklak is about to re-emit via
     /// `vk_commit_char`, the XWayland X-server input thread silently
     /// drops the synthetic press because that keycode is already

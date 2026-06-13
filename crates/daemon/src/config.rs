@@ -48,7 +48,7 @@ pub struct Config {
     /// Apps that never advertise `zwp_text_input_v3` (Qt5,
     /// XWayland-via-virtual-keyboard, etc.) — daklak synthesizes an
     /// "activate" via Sway IPC focus polling and routes them through
-    /// Tier 4 VkOnly (Path C): all output via `vk_key` using daklak's
+    /// Tier 4 VkOnly: all output via `vk_key` using daklak's
     /// synthesized Vietnamese keymap. Match is case-insensitive on
     /// `app_id`. Env override `DAKLAK_FORCE_VK_ONLY_APPS` replaces this
     /// list.
@@ -63,7 +63,7 @@ pub struct Config {
     /// the user having to enumerate every WM_CLASS. `force_uinput_apps`
     /// still wins on conflict — chromium-class XWayland apps remain
     /// routable to Tier 3 via that list to avoid the evdev-200+ render
-    /// crash (see [project_path_c_vkonly.md]). Env override
+    /// crash. Env override
     /// `DAKLAK_AUTO_VK_ONLY_XWAYLAND` (any non-empty/non-"0"/non-"false"
     /// value enables).
     #[serde(default)]

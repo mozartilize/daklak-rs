@@ -42,8 +42,8 @@ pub const DAKLAK_UINPUT_VERSION: u16 = 0x0001;
 /// Tier 3 (Backspace-only) still uses this device; the wider key surface
 /// is forward-compatible.
 ///
-/// Requires `/dev/uinput` to be writable. See plan2.md "Local development"
-/// for setup (udev rule or `sudo chmod 666 /dev/uinput`).
+/// Requires `/dev/uinput` to be writable (udev rule or
+/// `sudo chmod 666 /dev/uinput`).
 pub struct UinputDevice {
     dev: VirtualDevice,
 }
@@ -154,7 +154,7 @@ mod tests {
 
     /// Smoke test: open the uinput device and verify it appears in
     /// /proc/bus/input/devices. Requires user in `input` group or
-    /// `sudo chmod 666 /dev/uinput` — see plan2.md for setup.
+    /// `sudo chmod 666 /dev/uinput`.
     #[test]
     #[ignore]
     fn uinput_device_opens() {

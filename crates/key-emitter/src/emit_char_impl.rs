@@ -1,7 +1,7 @@
 //! Backend-agnostic `emit_char` body.
 //!
 //! Routes a single Vietnamese precomposed `char` to whatever backend the
-//! caller picked (`VkV2Emitter` / `VkV1Emitter`). Owns the Path A
+//! caller picked (`VkV2Emitter` / `VkV1Emitter`). Owns the tail-char-drop
 //! prelude-release fix and the modifier dance.
 //!
 //! Sites:
@@ -36,7 +36,7 @@ pub fn emit_char(
     let (_, lat, lock, group) = raw_mods;
     let echo = emitter.modifier_echo_through_grab();
 
-    // Path A (XWayland tail-char-drop fix). When the user is currently
+    // XWayland tail-char-drop fix. When the user is currently
     // holding a key whose keycode equals the one we're about to press,
     // X's input thread still has it DOWN and silently no-ops our
     // synthetic press as a duplicate. Emit a synthetic release first.
@@ -44,7 +44,7 @@ pub fn emit_char(
         tracing::debug!(
             keycode = spec.keycode,
             char = %c,
-            "emit_char: prelude release for still-held user key (Path A)"
+            "emit_char: prelude release for still-held user key (tail-char-drop fix)"
         );
         emitter.emit_key(time, spec.keycode, 0);
     }

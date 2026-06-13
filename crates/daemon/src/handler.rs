@@ -36,7 +36,7 @@ pub struct Router {
     pub modifiers: ModifierState,
     pub current_active: bool,
 
-    /// True when `current_active` was synthesized by daklak (Path C —
+    /// True when `current_active` was synthesized by daklak (Tier 4 VkOnly —
     /// FocusBackend reported a focused toplevel matching `force_vk_only_apps`
     /// / `auto_vk_only_for_xwayland`) rather than driven by a compositor
     /// `zwp_input_method_v2::Activate` event. Real activate always wins.
@@ -44,8 +44,7 @@ pub struct Router {
 
     /// Single live composition state. Shape unchanged from the old
     /// `window: Option<WindowState>` — only the type name changed. The
-    /// per-session HashMap is the deferred follow-up (see plan81 §Deferred),
-    /// not here.
+    /// per-session HashMap is a deferred follow-up, not here.
     pub composer: Option<Composer>,
 
     /// Focused window's `app_id` captured at activate. Threaded into the

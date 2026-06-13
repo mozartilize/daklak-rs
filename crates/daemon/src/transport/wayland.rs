@@ -56,7 +56,7 @@ impl AdapterHandler for Daemon {
                 })
                 .unwrap_or(false);
             // firefox needs both the char-count delete AND the post-apply
-            // debounce; they are independent quirks (plan82 #4) that this app
+            // debounce; they are independent quirks that this app
             // happens to require together.
             c.set_window_quirks(chars_for_delete, chars_for_delete);
             if chars_for_delete {

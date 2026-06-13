@@ -43,7 +43,7 @@ Failure modes:
 Run order:
   1. sudo -E uv run probe-eight-level.py
   2. swaymsg input <ID-of-daklak-xkb-probe8> xkb_file \\
-       /home/mozart/Documents/workspace/daklak-rs/tools/xkb-probe/probe-eight-level.xkb
+       ./daklak-rs/tools/xkb-probe/probe-eight-level.xkb
   3. env -u WAYLAND_DISPLAY xev -event keyboard
   4. ENTER 8 times in probe shell, focus xev within 2s of each.
 """

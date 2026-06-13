@@ -3,11 +3,11 @@
 //! Owns:
 //! - `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` proxies
 //! - xkb keymap loading + char translation
-//! - Daklak synthetic keymap upload to vk (Path C / Tier 4 enablement)
+//! - Daklak synthetic keymap upload to vk (Tier 4 VkOnly enablement)
 //! - Tier 3 grab-release/regrab dance around /dev/uinput emissions
 //! - Self-emit suppression queue + synthetic-mods echo suppression
 //! - Focus tracking via `wlr-foreign-toplevel-management-v1` + X11 bridge
-//! - `last_forwarded_key` / `last_forwarded_release` bookkeeping for Path A
+//! - `last_forwarded_key` / `last_forwarded_release` bookkeeping for the tail-char-drop fix
 //!
 //! Does NOT own:
 //! - Engine state / composition logic
@@ -76,14 +76,14 @@ pub enum ImProtocol {
 
 /// Everything daklak learns about the transport at `connect()` — fixed for the
 /// life of the process. The single source of every process-scoped capability;
-/// no use site re-derives a capability by matching on the protocol/backend name
-/// (plan82 incidents #3, #5). `focus` is added in a later milestone.
+/// no use site re-derives a capability by matching on the protocol/backend name.
+/// `focus` is added in a later milestone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportProfile {
     /// IM protocol the compositor speaks. Identity only — capability decisions
     /// read the bools below, never this.
     pub protocol: ImProtocol,
-    /// Focus-tracking source, probed independently of `protocol` (plan82 #5).
+    /// Focus-tracking source, probed independently of `protocol`.
     /// `for_protocol` leaves this `None`; `connect()` overwrites it after the
     /// focus probe.
     pub focus: crate::focus::FocusSource,
@@ -237,7 +237,7 @@ impl<'a> AdapterCtx<'a> {
 
     /// The process-scoped transport capability profile, built once at
     /// `connect()`. Read this for capability decisions — never re-match the
-    /// protocol/backend name at a use site (plan82 #3/#5).
+    /// protocol/backend name at a use site.
     pub fn profile(&self) -> TransportProfile {
         self.state.profile
     }
@@ -259,13 +259,13 @@ impl<'a> AdapterCtx<'a> {
     }
 
     /// Forward a raw press WITHOUT stamping last_forwarded_key. Used by the
-    /// modifier-shortcut path — those keys don't participate in Path A.
+    /// modifier-shortcut path — those keys don't participate in the tail-char-drop fix.
     pub fn vk_key_press_unstamped(&mut self, time: u32, key: u32) {
         self.state.emit_forward_key(time, key, 1);
     }
 
     /// Construct an AdapterSink bound to live adapter proxies + the supplied
-    /// per-emit hints (raw_mods snapshot, held_user_kc for Path A), then run
+    /// per-emit hints (raw_mods snapshot, held_user_kc for the tail-char-drop fix), then run
     /// the closure with `&mut sink`. The closure typically invokes
     /// `strategy.apply` on the resulting sink.
     pub fn with_sink<F>(
@@ -450,8 +450,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 // ForwardKey + foot/KWin is handled per-keysym inside
                 // `AdapterSink::commit_via_keysym` — see that fn for
                 // the kc 247 forwardKeySym race explanation. No
-                // additional post-apply sleep needed at this boundary.
-                // See `project_tail_drop_after_tone_space.md`.)
+                // additional post-apply sleep needed at this boundary.)
 
                 if uinput_path {
                     if let Some(c) = &self.state.conn {
@@ -648,7 +647,7 @@ fn log_duplicate_tail_diagnostic(
             held,
             backspaces,
             commit,
-            "DUPLICATE-TAIL: vk_only commit tail keycode matches user's last forwarded press/release → Path A prelude release will be emitted if held"
+            "DUPLICATE-TAIL: vk_only commit tail keycode matches user's last forwarded press/release → tail-drop prelude release will be emitted if held"
         );
     } else {
         tracing::debug!(
@@ -661,7 +660,7 @@ fn log_duplicate_tail_diagnostic(
     }
 }
 
-/// Probe the focus-tracking source, independent of the IM protocol (plan82 #5).
+/// Probe the focus-tracking source, independent of the IM protocol.
 /// Order: `wlr-foreign-toplevel-management` (wlroots and anything exposing it),
 /// then KDE Plasma (only under the `kde` feature), else none. Runs for both v1
 /// and v2 — a non-KDE v1 compositor that exposes wlr gets focus tracking, and a
@@ -752,7 +751,7 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
             app.state.vk_manager = Some(vk_manager.clone());
 
             // Focus source is probed once, after protocol detection, in
-            // `probe_focus` — independent of v1/v2 (plan82 #5).
+            // `probe_focus` — independent of v1/v2.
 
             event_queue.roundtrip(&mut app).context("initial roundtrip")?;
 
@@ -790,7 +789,7 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
             app.state.conn = Some(conn.clone());
 
             // Focus source is probed once, after protocol detection, in
-            // `probe_focus` — independent of v1/v2 (plan82 #5).
+            // `probe_focus` — independent of v1/v2.
 
             event_queue.roundtrip(&mut app).context("initial roundtrip")?;
 
@@ -803,7 +802,7 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
             );
         };
 
-    // Focus source — probed once, independent of the IM protocol (plan82 #5).
+    // Focus source — probed once, independent of the IM protocol.
     let (focus_source, backend) = probe_focus(&globals, &qh, &mut app);
     profile.focus = focus_source;
     app.state.profile = profile;
@@ -859,7 +858,7 @@ mod tests {
     #[test]
     fn focus_is_not_implied_by_protocol() {
         // `for_protocol` leaves focus unset — connect()'s independent probe owns
-        // it (plan82 #5). Protocol must NOT carry a focus assumption.
+        // it. Protocol must NOT carry a focus assumption.
         use crate::focus::FocusSource;
         assert_eq!(
             TransportProfile::for_protocol(ImProtocol::ImV1).focus,

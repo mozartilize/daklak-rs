@@ -4,7 +4,7 @@ use async_trait::async_trait;
 pub mod x11;
 
 /// Which focus-tracking source won at `connect()`. A separate axis from the IM
-/// protocol (plan82 #5): probed independently, so v1 and v2 both pick whichever
+/// protocol: probed independently, so v1 and v2 both pick whichever
 /// source the compositor actually exposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusSource {

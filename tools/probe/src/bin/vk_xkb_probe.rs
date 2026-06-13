@@ -5,7 +5,7 @@
 //
 // Usage:
 //   cargo run -p probe --bin vk_xkb_probe -- \
-//     /home/mozart/Documents/workspace/daklak-rs/tools/xkb-probe/probe-four-level.xkb
+//     ./daklak-rs/tools/xkb-probe/probe-four-level.xkb
 
 use std::ffi::CString;
 use std::fs;

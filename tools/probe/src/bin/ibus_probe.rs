@@ -1,4 +1,4 @@
-//! Phase 0 spike for plan8 (GNOME / IBus support).
+//! Probe spike for GNOME / IBus support.
 //!
 //! Goal: prove the `IBusText` GVariant serialization is correct and that a
 //! hand-built `CommitText` lands in a real client. NOT production code — the

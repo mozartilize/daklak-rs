@@ -4,7 +4,7 @@ use crate::{KeyState, OutputSink, ShadowBuffer};
 pub const KEY_BACKSPACE: u32 = 14;
 
 /// Execute a delete+commit entirely via `zwp_virtual_keyboard_v1::key()`
-/// (Tier 4 — `BackspaceMethod::VkOnly`, Path C).
+/// (Tier 4 — `BackspaceMethod::VkOnly`).
 ///
 /// Used for clients that don't advertise `zwp_text_input_v3` and thus never
 /// fire `commit_string` for daklak (Qt5, XWayland-via-vk, raw-tui in some

@@ -1,7 +1,7 @@
 use crate::{ModifierState, OutputSink, ShadowBuffer};
 
 /// Linux evdev key codes for modifier keys (left-side variants).
-/// See: /usr/include/linux/input-event-codes.h and plan0.md:282-310.
+/// See: /usr/include/linux/input-event-codes.h.
 const KEY_LEFTSHIFT: u16 = 42;
 const KEY_LEFTCTRL: u16 = 29;
 const KEY_LEFTALT: u16 = 56;
@@ -24,7 +24,7 @@ fn modifier_codes(m: ModifierState) -> &'static [u16] {
 /// Execute a delete+commit via uinput synthetic Backspace + `commit_string`
 /// (Tier 3 — BackspaceMethod::UInput).
 ///
-/// Modifier guard (plan0.md:282-310): if any modifier is held, release it
+/// Modifier guard: if any modifier is held, release it
 /// before the BS events and restore it after. This prevents Sway from
 /// merging the held modifier state from the physical keyboard with our
 /// synthetic events, which would produce e.g. Shift+Backspace (= "delete

@@ -4,7 +4,7 @@
 //! The Engine handles all ibus method calls (ProcessKeyEvent, FocusIn, etc.)
 //! and emits signals (CommitText, DeleteSurroundingText, ForwardKeyEvent).
 //!
-//! Async model (plan8 constraint):
+//! Async model:
 //! - All interface methods are async; zbus runs them on the caller's tokio executor.
 //! - Engine state is behind Rc<RefCell<_>> — single-threaded LocalSet, no Mutex.
 //! - ProcessKeyEvent emits all output signals BEFORE returning the bool so that

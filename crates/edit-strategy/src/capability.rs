@@ -19,7 +19,7 @@ pub struct CapabilityProbe {
     /// config.toml) and the env var `DAKLAK_FORCE_UINPUT_APPS`.
     /// Daklak ships with no opinionated default.
     pub force_uinput_apps: Vec<String>,
-    /// Apps whose `app_id` forces Tier 4 VkOnly (Path C). Loaded from
+    /// Apps whose `app_id` forces Tier 4 VkOnly. Loaded from
     /// `force_vk_only_apps` in config.toml and env var
     /// `DAKLAK_FORCE_VK_ONLY_APPS`. Wins over the purpose default but
     /// loses to `force_uinput_apps` (UInput is the older, more
@@ -32,7 +32,7 @@ pub struct CapabilityProbe {
     pub terminal_override: Option<BackspaceMethod>,
 
     /// Whether the active transport exposes a virtual keyboard
-    /// (`zwp_virtual_keyboard_v1`). VkOnly (Tier 4, Path C) is infeasible
+    /// (`zwp_virtual_keyboard_v1`). VkOnly (Tier 4) is infeasible
     /// without it, so `detect_method` clamps VkOnly → UInput when this is
     /// false. Sourced once from `TransportProfile.has_vk_keyboard`; the
     /// decision lives here so no use site re-checks the backend by name.
@@ -57,7 +57,7 @@ const PURPOSE_TERMINAL: u32 = 13;
 /// 1. Env override (terminal-only): `DAKLAK_TERMINAL_TIER` wins for purpose=13.
 /// 2. App-id list — `force_uinput_apps` (any purpose) → Tier 3 UInput.
 /// 3. App-id list — `force_vk_only_apps` (any purpose) → Tier 4 VkOnly
-///    (Path C). Routes everything through `zwp_virtual_keyboard_v1::key()`
+///    (VkOnly). Routes everything through `zwp_virtual_keyboard_v1::key()`
 ///    using daklak's synthesized Vietnamese keymap — bypasses
 ///    `text_input_v3` entirely. Safe target: clients with NO
 ///    `text_input_v3` at all (Qt5/XWayland-via-vk). Unsafe target:
@@ -72,7 +72,7 @@ const PURPOSE_TERMINAL: u32 = 13;
 pub fn detect_method(probe: &CapabilityProbe) -> BackspaceMethod {
     let desired = desired_method(probe);
     // Feasibility clamp: never emit a tier the transport cannot deliver.
-    // VkOnly (Tier 4, Path C) needs `zwp_virtual_keyboard_v1`; on a transport
+    // VkOnly (Tier 4) needs `zwp_virtual_keyboard_v1`; on a transport
     // without it (the KWin/Mutter v1 IM relay exposes no vk to the IME side)
     // fall through to UInput. This is the single home of the downgrade that
     // used to live as a backend-name check in `transport/wayland.rs` (#3).
@@ -98,7 +98,7 @@ fn desired_method(probe: &CapabilityProbe) -> BackspaceMethod {
     }
     // Terminals: default to ForwardKey regardless of surrounding_text
     // presence. SurroundingText would self-emit-loop and drop commits on
-    // foot/ghostty (see memory/project_terminal_tier.md). UInput would
+    // foot/ghostty. UInput would
     // race the terminal's own read loop. ForwardKey is the only safe
     // default; users can override via DAKLAK_TERMINAL_TIER.
     if probe.purpose == PURPOSE_TERMINAL {
