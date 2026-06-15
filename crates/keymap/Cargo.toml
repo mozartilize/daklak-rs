@@ -7,3 +7,8 @@ license = "GPL-3.0-or-later"
 [dependencies]
 anyhow = { workspace = true }
 xkbcommon = { workspace = true }
+
+[features]
+# Exposes `XkbState` test builders (e.g. a real "us" layout) for the tests of
+# downstream crates. Off in normal builds.
+test-util = []

@@ -277,6 +277,22 @@ impl<'a> AdapterCtx<'a> {
         self.state.forwarding_repeat
     }
 
+    /// True when `ch` (the char decoded at the active modifier level) differs
+    /// from what `key` produces at its BASE level — i.e. a level-shifting
+    /// modifier (Shift, AltGr/Level3, CapsLock, …) changed the output.
+    ///
+    /// On the v1/KWin ForwardKey path a raw-forwarded keycode is re-decoded by
+    /// the client at base level (KWin doesn't refresh the client's modifier
+    /// state for an IM-forwarded key), so a level-shifted char must be
+    /// committed as text instead. Returns false when there's no keymap to
+    /// compare against — then the raw-forward default stands.
+    pub fn is_level_shifted(&self, key: u32, ch: char) -> bool {
+        match self.state.xkb.as_ref() {
+            Some(xkb) => xkb.base_char(key) != Some(ch),
+            None => false,
+        }
+    }
+
     /// Construct an AdapterSink bound to live adapter proxies + the supplied
     /// per-emit hints (raw_mods snapshot, held_user_kc for the tail-char-drop fix), then run
     /// the closure with `&mut sink`. The closure typically invokes
@@ -1000,6 +1016,22 @@ mod tests {
         assert_eq!(s.press_value(), 2, "repeat press = state 2");
         s.forwarding_repeat = false;
         assert_eq!(s.press_value(), 1, "back to state 1 once repeat clears");
+    }
+
+    #[test]
+    fn is_level_shifted_compares_decoded_char_to_base_level() {
+        let mut s = AdapterState::new();
+        // No keymap → can't compare → never diverts (raw-forward default).
+        {
+            let ctx = AdapterCtx { state: &mut s };
+            assert!(!ctx.is_repeat());
+            assert!(!ctx.is_level_shifted(38, 'L'), "no keymap → not level-shifted");
+        }
+        // With a real us keymap, key 38 base = 'l'.
+        s.xkb = Some(viet_ime_keymap::xkb::XkbState::us_for_test());
+        let ctx = AdapterCtx { state: &mut s };
+        assert!(ctx.is_level_shifted(38, 'L'), "'L' differs from base 'l'");
+        assert!(!ctx.is_level_shifted(38, 'l'), "'l' IS the base level");
     }
 
     #[test]

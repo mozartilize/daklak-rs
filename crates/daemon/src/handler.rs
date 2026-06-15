@@ -776,4 +776,83 @@ mod tests {
             );
         }
     }
+
+    /// Shift-held passthrough chars on the v1/KWin ForwardKey path. KWin's
+    /// notifyKeyboardKey doesn't refresh the client's modifier state for an
+    /// IM-forwarded keycode, so a raw-forwarded shifted letter loses its case.
+    /// The transport commits the already-decoded char as text instead.
+    mod shifted_passthrough {
+        use super::super::Daemon;
+        use crate::composer::Composer;
+        use crate::config::Config;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use viet_ime_edit_strategy::{BackspaceMethod, KeyDecision};
+        use viet_ime_engine::InputMethod;
+        use viet_ime_keymap::xkb::XkbState;
+        use viet_ime_wayland_adapter::{
+            AdapterCtx, AdapterHandler, AdapterState, ImProtocol, TransportProfile,
+        };
+
+        const KEY_L: u32 = 38;
+
+        fn daemon() -> Daemon {
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
+            d.current_active = true;
+            d.composer = Some(Composer::new(
+                InputMethod::Telex,
+                BackspaceMethod::ForwardKey,
+                false,
+            ));
+            d
+        }
+
+        /// Drive `on_key_pressed` with a real `us` keymap installed so
+        /// `is_level_shifted` can compare the decoded char to its base level.
+        /// `ch` is the already-decoded char the adapter would pass.
+        fn key(d: &mut Daemon, protocol: ImProtocol, ch: char) -> KeyDecision {
+            let mut state = AdapterState::new();
+            state.profile = TransportProfile::for_protocol(protocol);
+            state.xkb = Some(XkbState::us_for_test());
+            let mut ctx = AdapterCtx { state: &mut state };
+            d.on_key_pressed(&mut ctx, 0, KEY_L, Some(ch))
+        }
+
+        #[test]
+        fn v1_level_shifted_passthrough_commits_decoded_char() {
+            let mut d = daemon();
+            // 'L' is a consonant the engine forwards (doesn't compose alone).
+            // Its base level for key 38 is 'l', so 'L' is level-shifted → on v1
+            // it must be committed as text, not forwarded as a raw keycode.
+            match key(&mut d, ImProtocol::ImV1, 'L') {
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    assert_eq!(backspaces, 0);
+                    assert_eq!(commit, "L", "decoded char committed verbatim");
+                }
+                _ => panic!("expected Apply commit for level-shifted passthrough on v1"),
+            }
+        }
+
+        #[test]
+        fn v1_base_level_passthrough_still_forwards_raw() {
+            let mut d = daemon();
+            // 'l' IS the base level for key 38 → not level-shifted → the common
+            // path is unchanged (raw keycode forward).
+            assert!(
+                matches!(key(&mut d, ImProtocol::ImV1, 'l'), KeyDecision::ForwardRaw),
+                "base-level passthrough still forwards the raw keycode"
+            );
+        }
+
+        #[test]
+        fn v2_level_shifted_passthrough_still_forwards_raw() {
+            let mut d = daemon();
+            // v2 (no keysym-commit) carries modifiers on the vk path, so the
+            // divert must NOT apply even for a level-shifted char.
+            assert!(
+                matches!(key(&mut d, ImProtocol::ImV2, 'L'), KeyDecision::ForwardRaw),
+                "v2 keeps raw forward; the KWin modifier quirk doesn't apply"
+            );
+        }
+    }
 }

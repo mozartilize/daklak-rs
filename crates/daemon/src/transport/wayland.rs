@@ -245,7 +245,38 @@ impl AdapterHandler for Daemon {
             return KeyDecision::ForwardRaw;
         };
 
-        self.handle_char(key, ch)
+        let decision = self.handle_char(key, ch);
+
+        // v1/KWin ForwardKey: a passthrough char (engine didn't consume it, or
+        // emitted it unchanged) is normally forwarded as a raw keycode. But
+        // KWin's notifyKeyboardKey for an IM-forwarded key does NOT refresh the
+        // client's modifier state — it only flushes modifiers on keysym/commit
+        // — so the client re-decodes the keycode at BASE level. Any char the
+        // active modifier level changed from base (Shift → `WAYLAND`, AltGr/
+        // Level3 → `€`, CapsLock, …) would therefore be corrupted. daklak
+        // already decoded `ch` at the correct level; commit it as text instead
+        // of forwarding the bare keycode. Base-level chars (the common
+        // unshifted case) keep raw-keycode forwarding; control keys (Enter/Tab)
+        // are never committed as text.
+        if matches!(decision, KeyDecision::ForwardRaw)
+            && ctx.profile().has_keysym_commit
+            && ctx.is_level_shifted(key, ch)
+            && !ch.is_control()
+        {
+            let method = self
+                .composer
+                .as_ref()
+                .map(|w| w.method())
+                .unwrap_or(BackspaceMethod::ForwardKey);
+            tracing::debug!(ch = %ch, "level-shifted passthrough → commit (v1 keycode loses modifier level)");
+            return KeyDecision::Apply {
+                method,
+                backspaces: 0,
+                commit: ch.to_string(),
+            };
+        }
+
+        decision
     }
 
     fn apply_pending(

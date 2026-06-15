@@ -10,7 +10,6 @@ use xkbcommon::xkb::{
 /// Initialized from the Keymap fd received via the keyboard grab
 /// (ZwpInputMethodKeyboardGrabV2 Keymap event).
 pub struct XkbState {
-    #[allow(dead_code)]
     keymap: Keymap,
     state: State,
 }
@@ -60,6 +59,24 @@ impl XkbState {
         Self { keymap, state }
     }
 
+    /// A real `us` layout `XkbState`, for downstream-crate tests that need a
+    /// genuine keymap (e.g. to exercise `base_char`). Enabled by `test-util`.
+    #[cfg(feature = "test-util")]
+    pub fn us_for_test() -> Self {
+        let ctx = XkbContext::new(CONTEXT_NO_FLAGS);
+        let keymap = Keymap::new_from_names(
+            &ctx,
+            "",
+            "",
+            "us",
+            "",
+            None,
+            KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("build us test keymap");
+        Self::from_keymap(keymap)
+    }
+
     /// Translate a hardware evdev keycode to the char it produces with the
     /// current modifier state, or `None` for non-printable keys.
     ///
@@ -67,6 +84,26 @@ impl XkbState {
     pub fn key_to_char(&self, evdev_code: u32) -> Option<char> {
         let xkb_keycode = Keycode::new(evdev_code + 8);
         let sym = self.state.key_get_one_sym(xkb_keycode);
+        let utf32 = xkbcommon::xkb::keysym_to_utf32(sym);
+        if utf32 == 0 || utf32 == 0xFFFF_FFFF {
+            return None;
+        }
+        char::from_u32(utf32)
+    }
+
+    /// The char this keycode produces at its BASE level (level 0) of the
+    /// active layout, ignoring all depressed/latched/locked modifiers. `None`
+    /// for keys with no printable base symbol.
+    ///
+    /// Used to detect when the active modifier state changed the decoded char
+    /// (Shift, AltGr/Level3, CapsLock, …): on the KWin v1 ForwardKey path a
+    /// raw-forwarded keycode is decoded by the client at base level, so any
+    /// char that differs from its base must be committed as text instead.
+    pub fn base_char(&self, evdev_code: u32) -> Option<char> {
+        let xkb_keycode = Keycode::new(evdev_code + 8);
+        let layout = self.state.key_get_layout(xkb_keycode);
+        let syms = self.keymap.key_get_syms_by_level(xkb_keycode, layout, 0);
+        let sym = syms.first().copied()?;
         let utf32 = xkbcommon::xkb::keysym_to_utf32(sym);
         if utf32 == 0 || utf32 == 0xFFFF_FFFF {
             return None;
@@ -91,5 +128,35 @@ impl XkbState {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn us() -> XkbState {
+        let ctx = XkbContext::new(CONTEXT_NO_FLAGS);
+        let keymap =
+            Keymap::new_from_names(&ctx, "", "", "us", "", None, KEYMAP_COMPILE_NO_FLAGS).unwrap();
+        XkbState::from_keymap(keymap)
+    }
+
+    #[test]
+    fn base_char_ignores_modifiers() {
+        let mut xkb = us();
+        // evdev 38 = 'l'. Base level is lowercase regardless of state.
+        assert_eq!(xkb.base_char(38), Some('l'));
+        // Hold Shift (Wayland mods_depressed bit 0x1). key_to_char now sees
+        // 'L', but base_char must still report the level-0 char.
+        xkb.update_modifiers(0x1, 0, 0, 0);
+        assert_eq!(xkb.key_to_char(38), Some('L'), "shift raises decode level");
+        assert_eq!(xkb.base_char(38), Some('l'), "base_char ignores shift");
+    }
+
+    #[test]
+    fn base_char_none_for_nonprintable() {
+        // evdev 59 = F1 — keysym has no UTF-32 mapping.
+        assert_eq!(us().base_char(59), None);
     }
 }
