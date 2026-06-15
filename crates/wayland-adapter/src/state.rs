@@ -101,6 +101,12 @@ pub struct AdapterState {
     pub last_forwarded_key: Option<(u32, Instant)>,
     /// Last keycode + timestamp daklak forwarded as a vk.key release.
     pub last_forwarded_release: Option<(u32, Instant)>,
+    /// True while dispatching a key-REPEAT event (wl_keyboard state=2) rather
+    /// than a fresh press. Forward helpers read this to emit `value=2` so the
+    /// focused client sees a proper repeat. Without it, rate-0 clients that
+    /// rely on the compositor's server-side repeat (Chromium/Electron on KWin)
+    /// get no continuous-key behavior through the IM grab. See dispatch_key_repeat.
+    pub forwarding_repeat: bool,
 
     /// Set true by `AdapterSink::commit()` (V2 path) whenever daklak emits
     /// `zwp_input_method_v2.commit`. Reset at the start of every
@@ -201,6 +207,7 @@ impl AdapterState {
             synthetic_mods_emitted_at: None,
             last_forwarded_key: None,
             last_forwarded_release: None,
+            forwarding_repeat: false,
             pending_im_commit_ack: false,
             should_exit: false,
             // Placeholder until `connect()` builds the real profile. Never
@@ -251,6 +258,16 @@ impl AdapterState {
     /// Tier 4 (VkOnly Vietnamese precomposed chars) does NOT route here;
     /// it goes through `with_sink → synth_keymap_emitter` which is always
     /// vk_v2.
+    /// The wl_keyboard key state for a press: `2` (Repeated) while dispatching
+    /// a repeat, else `1` (Pressed). Release is always `0` (passed explicitly).
+    pub fn press_value(&self) -> u32 {
+        if self.forwarding_repeat {
+            2
+        } else {
+            1
+        }
+    }
+
     pub fn emit_forward_key(&mut self, time: u32, key: u32, value: u32) {
         let serial = self.serial;
         match self.profile.protocol {

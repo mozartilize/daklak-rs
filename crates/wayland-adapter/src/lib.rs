@@ -254,14 +254,27 @@ impl<'a> AdapterCtx<'a> {
     /// last_forwarded_key. Used by daemon when a key bypasses composition
     /// (no active window, xkb has no char for it, nav key, etc.).
     pub fn forward_press(&mut self, time: u32, key: u32) {
-        self.state.emit_forward_key(time, key, 1);
-        self.state.last_forwarded_key = Some((key, Instant::now()));
+        let value = self.state.press_value();
+        self.state.emit_forward_key(time, key, value);
+        // A repeat is not a fresh press — don't refresh the tail-char-drop window.
+        if !self.state.forwarding_repeat {
+            self.state.last_forwarded_key = Some((key, Instant::now()));
+        }
     }
 
     /// Forward a raw press WITHOUT stamping last_forwarded_key. Used by the
     /// modifier-shortcut path — those keys don't participate in the tail-char-drop fix.
+    /// Emits `value=2` while dispatching a repeat (see [`AdapterCtx::is_repeat`]).
     pub fn vk_key_press_unstamped(&mut self, time: u32, key: u32) {
-        self.state.emit_forward_key(time, key, 1);
+        let value = self.state.press_value();
+        self.state.emit_forward_key(time, key, value);
+    }
+
+    /// True when the current `on_key_pressed` call is a key-REPEAT (wl_keyboard
+    /// state=2), not a fresh press. The daemon reads this to skip engine
+    /// mutation / re-composition and to swallow repeats of compose keys.
+    pub fn is_repeat(&self) -> bool {
+        self.state.forwarding_repeat
     }
 
     /// Construct an AdapterSink bound to live adapter proxies + the supplied
@@ -468,6 +481,50 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 }
             }
         }
+    }
+
+    /// IM grab delivered a key REPEAT (wl_keyboard state=2). KWin generates
+    /// server-side repeat as state=2 key events; rate-0 clients (Chromium /
+    /// Electron on KWin) rely on those instead of self-repeating. The press
+    /// path collapses these into `value=1`, so the client never sees a repeat
+    /// and continuous-key actions (Ctrl+Arrow, hold-arrow) die. Here we set
+    /// `forwarding_repeat` so the forward helpers emit `value=2`, re-run the
+    /// daemon's forward decision WITHOUT mutating the compose engine (it reads
+    /// `ctx.is_repeat()` to skip re-composition), and never re-Apply a commit.
+    pub(crate) fn dispatch_key_repeat(&mut self, time: u32, key: u32) {
+        tracing::trace!(key, "dispatch_key_repeat: IM grab delivered repeat");
+        // A repeat of our own synthetic emit shouldn't loop back, but guard
+        // identically to a press to stay safe against grab roundtrips.
+        if self.state.suppress_self_emit(key, 1) {
+            return;
+        }
+
+        let ch = self.state.xkb.as_ref().and_then(|x| x.key_to_char(key));
+
+        self.state.forwarding_repeat = true;
+        let decision = {
+            let mut ctx = AdapterCtx { state: &mut self.state };
+            self.handler.on_key_pressed(&mut ctx, time, key, ch)
+        };
+
+        match decision {
+            // Consumed: nav / modifier-shortcut already forwarded with value=2
+            // via the ctx helpers. Compose-key repeats are swallowed by the
+            // daemon (returns Consumed) so we never re-type a held letter.
+            KeyDecision::Consumed => {}
+            // Forward-only keys (no active window / no xkb char): emit the
+            // repeat directly. Don't stamp last_forwarded_key — a repeat is
+            // not a fresh press for the tail-char-drop window.
+            KeyDecision::ForwardRaw => {
+                self.state.emit_forward_key(time, key, 2);
+            }
+            // A repeat must never drive a fresh delete+commit. The daemon
+            // shouldn't return Apply on repeat, but guard regardless.
+            KeyDecision::Apply { .. } => {
+                tracing::debug!(key, "repeat resolved to Apply — ignored");
+            }
+        }
+        self.state.forwarding_repeat = false;
     }
 
     pub(crate) fn apply_done_frame(&mut self) {
@@ -930,5 +987,32 @@ mod tests {
     fn adapter_handler_debounce_barrier_is_independent_from_delete_units() {
         let h = NoopHandler;
         assert!(!h.window_debounce_barrier());
+    }
+
+    #[test]
+    fn press_value_is_2_only_while_forwarding_repeat() {
+        // The whole repeat fix hinges on this: a fresh press forwards as
+        // wl_keyboard state=1, a key-repeat (state=2) as state=2 so rate-0
+        // clients (Chromium on KWin) see continuous-key.
+        let mut s = AdapterState::new();
+        assert_eq!(s.press_value(), 1, "default press = state 1");
+        s.forwarding_repeat = true;
+        assert_eq!(s.press_value(), 2, "repeat press = state 2");
+        s.forwarding_repeat = false;
+        assert_eq!(s.press_value(), 1, "back to state 1 once repeat clears");
+    }
+
+    #[test]
+    fn ctx_is_repeat_mirrors_state_flag() {
+        // The daemon reads ctx.is_repeat() to skip engine mutation; it must
+        // track forwarding_repeat exactly.
+        let mut s = AdapterState::new();
+        {
+            let ctx = AdapterCtx { state: &mut s };
+            assert!(!ctx.is_repeat());
+        }
+        s.forwarding_repeat = true;
+        let ctx = AdapterCtx { state: &mut s };
+        assert!(ctx.is_repeat());
     }
 }

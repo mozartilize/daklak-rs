@@ -691,4 +691,89 @@ mod tests {
             }
         }
     }
+
+    /// Key-REPEAT (wl_keyboard state=2) handling. A repeat must reach the
+    /// client for nav / shortcut keys (so Ctrl+Arrow, hold-Arrow move the
+    /// cursor on rate-0 clients like Chromium on KWin) but must never mutate
+    /// the compose engine or re-type a held letter. The adapter sets
+    /// `forwarding_repeat` on the state, which `ctx.is_repeat()` exposes.
+    mod key_repeat {
+        use super::super::{Daemon, NAV_KEYS};
+        use crate::composer::Composer;
+        use crate::config::Config;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use viet_ime_edit_strategy::{BackspaceMethod, KeyDecision, ModifierState};
+        use viet_ime_engine::InputMethod;
+        use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, AdapterState};
+
+        const KEY_A: u32 = 30;
+        const KEY_LEFT: u32 = 105;
+
+        fn v1_daemon() -> Daemon {
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
+            d.current_active = true;
+            d.composer = Some(Composer::new(
+                InputMethod::Telex,
+                BackspaceMethod::SurroundingText,
+                false,
+            ));
+            d
+        }
+
+        fn raw_word(d: &Daemon) -> String {
+            d.composer
+                .as_ref()
+                .map(|w| w.raw_word.clone())
+                .unwrap_or_default()
+        }
+
+        /// Drive the trait `on_key_pressed` with `forwarding_repeat = repeat`.
+        fn key(d: &mut Daemon, key: u32, ch: Option<char>, repeat: bool) -> KeyDecision {
+            let mut state = AdapterState::new();
+            state.forwarding_repeat = repeat;
+            let mut ctx = AdapterCtx { state: &mut state };
+            d.on_key_pressed(&mut ctx, 0, key, ch)
+        }
+
+        #[test]
+        fn compose_key_repeat_is_swallowed_and_does_not_grow_raw_word() {
+            let mut d = v1_daemon();
+            // Fresh press builds the raw word.
+            key(&mut d, KEY_A, Some('a'), false);
+            assert_eq!(raw_word(&d), "a", "press feeds the engine");
+            // Holding the letter must NOT re-type it: repeat is swallowed and
+            // the engine is untouched.
+            let decision = key(&mut d, KEY_A, Some('a'), true);
+            assert!(
+                matches!(decision, KeyDecision::Consumed), "compose-key repeat is swallowed"
+            );
+            assert_eq!(raw_word(&d), "a", "repeat must not grow raw_word");
+        }
+
+        #[test]
+        fn nav_key_repeat_is_consumed_and_forwarded() {
+            let mut d = v1_daemon();
+            key(&mut d, KEY_LEFT, None, false);
+            // A nav repeat is consumed (forwarded with state=2 via the ctx
+            // helper, not routed into the engine).
+            let decision = key(&mut d, KEY_LEFT, None, true);
+            assert!(
+                matches!(decision, KeyDecision::Consumed), "nav repeat forwards + consumes"
+            );
+            assert_eq!(NAV_KEYS.contains(&KEY_LEFT), true, "sanity: Left is a nav key");
+        }
+
+        #[test]
+        fn modifier_shortcut_repeat_is_consumed() {
+            let mut d = v1_daemon();
+            // Ctrl held → Ctrl+Left takes the modifier-shortcut branch, which
+            // sits above the compose-swallow so its repeats still forward.
+            d.modifiers = ModifierState::CTRL;
+            let decision = key(&mut d, KEY_LEFT, None, true);
+            assert!(
+                matches!(decision, KeyDecision::Consumed), "Ctrl+Left repeat forwards + consumes"
+            );
+        }
+    }
 }

@@ -151,17 +151,28 @@ impl AdapterHandler for Daemon {
         key: u32,
         ch: Option<char>,
     ) -> KeyDecision {
-        if let Some(w) = self.composer.as_mut() {
-            w.check_idle_reset();
+        // A key REPEAT (wl_keyboard state=2) is not a fresh keystroke: it must
+        // never mutate the compose engine or re-Apply a commit. We still run the
+        // forward decision so nav / modifier-shortcut repeats reach the client
+        // (forwarded with value=2 via the ctx helpers), but skip every engine
+        // side effect and swallow repeats of compose keys below.
+        let repeat = ctx.is_repeat();
+
+        if !repeat {
+            if let Some(w) = self.composer.as_mut() {
+                w.check_idle_reset();
+            }
         }
 
         let now_enabled = self.enabled.load(Ordering::Acquire);
-        if self.last_enabled && !now_enabled {
-            if let Some(w) = self.composer.as_mut() {
-                w.full_reset();
+        if !repeat {
+            if self.last_enabled && !now_enabled {
+                if let Some(w) = self.composer.as_mut() {
+                    w.full_reset();
+                }
             }
+            self.last_enabled = now_enabled;
         }
-        self.last_enabled = now_enabled;
         if !now_enabled {
             return KeyDecision::ForwardRaw;
         }
@@ -173,10 +184,12 @@ impl AdapterHandler for Daemon {
             // Same rationale as NAV: shortcuts (Ctrl+V paste, Ctrl+A select,
             // etc.) end the current composition. Roll the action clock back so
             // the next surrounding frame can re-seed from whatever word the
-            // cursor lands on.
-            if let Some(w) = self.composer.as_mut() {
-                w.full_reset();
-                w.defer_action();
+            // cursor lands on. (A repeat already did this on the initial press.)
+            if !repeat {
+                if let Some(w) = self.composer.as_mut() {
+                    w.full_reset();
+                    w.defer_action();
+                }
             }
             ctx.vk_key_press_unstamped(time, key);
             return KeyDecision::Consumed;
@@ -189,9 +202,11 @@ impl AdapterHandler for Daemon {
             // composition — the cursor is now elsewhere and the next char
             // should compose against whatever word the cursor lands on (killer
             // feature, multi-hop: "bò bo|" → arrows → "bò bof|" → composes).
-            if let Some(w) = self.composer.as_mut() {
-                w.full_reset();
-                w.defer_action();
+            if !repeat {
+                if let Some(w) = self.composer.as_mut() {
+                    w.full_reset();
+                    w.defer_action();
+                }
             }
             ctx.vk_key_press_unstamped(time, key);
             return KeyDecision::Consumed;
@@ -200,6 +215,15 @@ impl AdapterHandler for Daemon {
         if self.composer.is_none() {
             tracing::trace!(key, "key: no active window → forward");
             return KeyDecision::ForwardRaw;
+        }
+
+        // Past here keys feed the compose engine. A repeat must not: swallow it
+        // so a held letter / backspace doesn't re-type or re-delete through the
+        // engine. (Cursor-nav repeats already returned above via the forward
+        // paths; this only drops compose-key auto-repeat, which Vietnamese
+        // typing never relies on.)
+        if repeat {
+            return KeyDecision::Consumed;
         }
 
         if key == KEY_BACKSPACE {

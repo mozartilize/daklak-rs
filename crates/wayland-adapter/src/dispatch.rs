@@ -175,18 +175,22 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for WaylandAd
                 ..
             } => {
                 // wayland-protocols-misc types `state` as `WEnum<KeyState>`.
-                // Treat `Pressed` (and `Unknown(2)` per kime's compat hack
-                // for compositors that incorrectly send "repeated" here) as
-                // a press; everything else as release.
-                let pressed = matches!(
-                    key_state,
-                    WEnum::Value(wl_keyboard::KeyState::Pressed) | WEnum::Unknown(2)
-                );
-                tracing::trace!(key, pressed, "grab.Key");
-                if pressed {
-                    state.dispatch_key_press(time, key);
-                } else {
-                    state.dispatch_key_release(time, key);
+                // `Unknown(2)` is a key REPEAT (the enum has no Repeated
+                // variant): route it to dispatch_key_repeat so the client sees
+                // a value=2 repeat instead of a collapsed press. (wlroots
+                // clients self-repeat, so this rarely fires on v2, but keeping
+                // both dispatchers consistent avoids a latent divergence.)
+                tracing::trace!(key, ?key_state, "grab.Key");
+                match key_state {
+                    WEnum::Value(wl_keyboard::KeyState::Pressed) => {
+                        state.dispatch_key_press(time, key)
+                    }
+                    // KWin sends repeat as KeyState::Repeated; Unknown(2) is a
+                    // fallback for protocol versions lacking the variant.
+                    WEnum::Value(wl_keyboard::KeyState::Repeated) | WEnum::Unknown(2) => {
+                        state.dispatch_key_repeat(time, key)
+                    }
+                    _ => state.dispatch_key_release(time, key),
                 }
             }
 

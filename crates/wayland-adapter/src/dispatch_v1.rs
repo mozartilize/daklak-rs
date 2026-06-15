@@ -194,22 +194,29 @@ impl<H: AdapterHandler> Dispatch<WlKeyboard, ()> for WaylandAdapter<H> {
                 state: key_state,
                 ..
             } => {
-                let pressed = matches!(
-                    key_state,
-                    WEnum::Value(wl_keyboard::KeyState::Pressed) | WEnum::Unknown(2)
-                );
+                // KWin delivers server-side key REPEAT as state=2, surfaced
+                // here as `WEnum::Unknown(2)` (the enum has no Repeated variant
+                // in this protocol version). Route it to dispatch_key_repeat so
+                // the client sees a value=2 repeat — collapsing it into a press
+                // breaks continuous-key for rate-0 clients (Chromium on KWin).
                 tracing::trace!(
                     kbd_id = ?keyboard.id(),
                     key,
-                    pressed,
+                    ?key_state,
                     serial,
                     time,
                     "v1: wl_keyboard key"
                 );
-                if pressed {
-                    state.dispatch_key_press(time, key);
-                } else {
-                    state.dispatch_key_release(time, key);
+                match key_state {
+                    WEnum::Value(wl_keyboard::KeyState::Pressed) => {
+                        state.dispatch_key_press(time, key)
+                    }
+                    // KWin sends repeat as KeyState::Repeated; Unknown(2) is a
+                    // fallback for protocol versions lacking the variant.
+                    WEnum::Value(wl_keyboard::KeyState::Repeated) | WEnum::Unknown(2) => {
+                        state.dispatch_key_repeat(time, key)
+                    }
+                    _ => state.dispatch_key_release(time, key),
                 }
             }
 
