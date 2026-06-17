@@ -80,6 +80,10 @@ impl EditModel {
         detect_one_char_insertion(&self.prev_text, self.prev_cursor, text, cursor)
     }
 
+    fn deletion_since_prev(&self, text: &str, cursor: u32) -> bool {
+        detect_deletion(&self.prev_text, self.prev_cursor, text, cursor)
+    }
+
     fn is_duplicate_frame(&self, text: &str, cursor: u32, anchor: u32) -> bool {
         text == self.prev_text && cursor == self.prev_cursor && anchor == self.prev_anchor
     }
@@ -144,6 +148,7 @@ pub struct Composer {
     /// pop both 'u' and 's' from raw_word, not just one).
     pub raw_word_screen_widths: Vec<u8>,
     raw_word_from_surrounding: bool,
+    suppress_raw_word_seed_after_plain_backspace: bool,
 
     /// When true, `delete_surrounding_text` emits a CHAR count rather than the
     /// spec-compliant byte count. Set at activate when `app_id` matches
@@ -176,11 +181,22 @@ impl SurroundingObserver {
     fn observe(
         recent_action: bool,
         one_char_typed: bool,
+        deletion: bool,
         force_reseed: bool,
         has_selection: bool,
     ) -> SurroundingDecision {
+        // NOTE: `deletion` must NOT relax `trust`. A recent deletion frame is
+        // our own `delete_surrounding_text` echo (the intermediate shorter-than-
+        // shadow frame the compositor emits between our delete and our commit).
+        // Trusting it would (a) clobber the shadow via `on_surrounding_text` and
+        // (b) fire the deletion-reset branch's `engine.reset()`, wiping the
+        // in-progress composition — which dropped the first word on
+        // gedit/firefox (typing "word" committed "ửod": the invalid-syllable
+        // deconversion never ran because the engine was reset mid-word by the
+        // delete echo). Recent frames stay echoes; only a genuine external
+        // delete (`!recent_action`) reaches the deletion-reset branch below.
         let trust = !(recent_action && !one_char_typed && !force_reseed && !has_selection);
-        let reseed = force_reseed || (!one_char_typed && !recent_action);
+        let reseed = force_reseed || (!one_char_typed && !recent_action && !deletion);
         SurroundingDecision { trust, reseed }
     }
 }
@@ -200,6 +216,7 @@ impl Composer {
             raw_word: String::new(),
             raw_word_screen_widths: Vec::new(),
             raw_word_from_surrounding: false,
+            suppress_raw_word_seed_after_plain_backspace: false,
             delete_in_chars: false,
             debounce_barrier: false,
             last_action_at: Instant::now() - Duration::from_secs(60),
@@ -257,6 +274,7 @@ impl Composer {
         self.raw_word.clear();
         self.raw_word_screen_widths.clear();
         self.raw_word_from_surrounding = false;
+        self.suppress_raw_word_seed_after_plain_backspace = false;
     }
 
     /// Check 2-second idle heuristic. Returns true (and resets engine) if
@@ -288,6 +306,10 @@ impl Composer {
         self.feed_key_inner(ch, true)
     }
 
+    pub fn feed_key_without_client_insert(&mut self, ch: char) -> KeyDecision {
+        self.feed_key_inner(ch, false)
+    }
+
     /// `shadow_already_has_ch`: `true` for the v1/KWin + IBus surrounding-text
     /// path — the client already inserted the char, so shadow reflects
     /// post-insertion text. The word-boundary seed uses raw_word instead.
@@ -311,10 +333,11 @@ impl Composer {
                 self.raw_word.clear();
                 self.raw_word_screen_widths.clear();
                 self.raw_word_from_surrounding = false;
+                self.suppress_raw_word_seed_after_plain_backspace = false;
             }
             let prefix = self.raw_word.clone();
             self.engine.reset();
-            if !prefix.is_empty() {
+            if !self.suppress_raw_word_seed_after_plain_backspace && !prefix.is_empty() {
                 tracing::debug!(prefix, "seed engine from raw_word (v1 path)");
                 self.engine.feed_context_for_key(&prefix, ch);
             }
@@ -455,6 +478,7 @@ impl Composer {
         } else {
             tracing::trace!("BS not consumed → forward");
             self.edit.pop_forwarded_char();
+            self.suppress_raw_word_seed_after_plain_backspace = popped_width.unwrap_or(1) == 1;
             self.last_keystroke_at = Instant::now();
             KeyDecision::ForwardRaw
         }
@@ -535,6 +559,8 @@ impl Composer {
     fn apply_surrounding(&mut self, text: &str, cursor: u32, anchor: u32, force_reseed: bool) {
         let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
         let one_char_typed = self.edit.one_char_insertion_since_prev(text, cursor);
+        let shadow_confirmed = text_before_cursor(text, cursor) == self.edit.shadow_text();
+        let deletion = self.edit.deletion_since_prev(text, cursor) || shadow_confirmed;
         // A frame with an active selection (anchor ≠ cursor) carries the
         // Chromium autocomplete state the Tier-1 selection fallback depends on
         // (see surrounding::apply). VSCode's stale echoes are plain duplicated
@@ -547,6 +573,7 @@ impl Composer {
         let decision = SurroundingObserver::observe(
             recent_action,
             one_char_typed,
+            deletion,
             force_reseed,
             has_selection,
         );
@@ -555,11 +582,21 @@ impl Composer {
             return;
         }
 
+        let deletion_already_applied = shadow_confirmed;
         self.edit.on_surrounding_text(text, cursor, anchor);
 
-        if decision.reseed {
+        if deletion {
+            if !deletion_already_applied {
+                self.engine.reset();
+                self.raw_word.clear();
+                self.raw_word_screen_widths.clear();
+                self.raw_word_from_surrounding = false;
+                self.suppress_raw_word_seed_after_plain_backspace = false;
+            }
+        } else if decision.reseed {
             let word = current_word_before_insertion_point(text, cursor, anchor);
             self.engine.reset();
+            self.suppress_raw_word_seed_after_plain_backspace = false;
             if !word.is_empty() && self.engine.feed_context(word) {
                 tracing::debug!(word, "re-seed engine (activate or cursor jump)");
                 self.raw_word_screen_widths = vec![1u8; word.chars().count()];
@@ -626,12 +663,7 @@ fn char_to_byte_offset(text: &str, char_idx: u32) -> u32 {
 }
 
 pub fn current_word_before_cursor(text: &str, cursor: u32) -> &str {
-    let cursor = (cursor as usize).min(text.len());
-    let cursor = (0..=cursor)
-        .rev()
-        .find(|i| text.is_char_boundary(*i))
-        .unwrap_or(0);
-    let before = &text[..cursor];
+    let before = text_before_cursor(text, cursor);
     let start = before
         .char_indices()
         .rev()
@@ -639,6 +671,15 @@ pub fn current_word_before_cursor(text: &str, cursor: u32) -> &str {
         .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0);
     &before[start..]
+}
+
+fn text_before_cursor(text: &str, cursor: u32) -> &str {
+    let cursor = (cursor as usize).min(text.len());
+    let cursor = (0..=cursor)
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0);
+    &text[..cursor]
 }
 
 /// Detects whether the transition from (`prev_text`, `prev_cursor`) to
@@ -658,6 +699,19 @@ pub fn detect_one_char_insertion(
         && text.len() == prev_text.len() + 1
         && text.get(..prev_cur) == prev_text.get(..prev_cur)
         && text.get((cursor as usize)..) == prev_text.get(prev_cur..)
+}
+
+/// Detects whether text between the previous and current cursor was deleted.
+/// Handles end-of-text and mid-text deletions while preserving surrounding text.
+pub fn detect_deletion(prev_text: &str, prev_cursor: u32, text: &str, cursor: u32) -> bool {
+    let prev_cur = prev_cursor as usize;
+    let cur = cursor as usize;
+    cur <= prev_cur
+        && cur <= text.len()
+        && prev_cur <= prev_text.len()
+        && text.len() < prev_text.len()
+        && text.get(..cur) == prev_text.get(..cur)
+        && text.get(cur..) == prev_text.get(prev_cur..)
 }
 
 #[cfg(test)]
@@ -1001,15 +1055,363 @@ mod tests {
     }
 
     #[test]
+    fn recent_external_delete_reseeds_before_next_key() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+        c.observe_surrounding_bytes("work", ByteCursor(4), ByteCursor(4), true);
+        // An EXTERNAL delete is by definition not our own recent action — the
+        // user deleted via some other channel. Model that with `defer_action`
+        // (rolls the action clock back) so the delete frame is trusted and the
+        // engine/raw_word reset. A delete frame inside the recent-action window
+        // is instead our own delete_surrounding_text echo and must be dropped.
+        c.defer_action();
+        c.observe_surrounding_bytes("wor", ByteCursor(3), ByteCursor(3), false);
+
+        assert_eq!(c.shadow_text(), "wor");
+        assert_eq!(c.raw_word, "");
+        match c.feed_key('d') {
+            KeyDecision::ForwardRaw => {}
+            KeyDecision::Apply { backspaces, commit, .. } => {
+                panic!("expected raw 'd', got edit bs={backspaces} commit={commit:?}");
+            }
+            KeyDecision::Consumed => panic!("expected raw 'd', got consumed"),
+        }
+        assert_eq!(c.raw_word, "d");
+    }
+
+    #[test]
+    fn forwarded_backspace_echo_does_not_reseed_deleted_word() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+        c.observe_surrounding_bytes("work", ByteCursor(4), ByteCursor(4), true);
+        c.mark_action();
+        c.observe_surrounding_bytes("work", ByteCursor(4), ByteCursor(4), false);
+        assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+        c.observe_surrounding_bytes("wor", ByteCursor(3), ByteCursor(3), false);
+
+        assert_eq!(c.shadow_text(), "wor");
+        assert_eq!(c.raw_word, "wor");
+        match c.feed_key('d') {
+            KeyDecision::ForwardRaw => {}
+            KeyDecision::Apply { backspaces, commit, .. } => {
+                panic!("expected raw 'd', got edit bs={backspaces} commit={commit:?}");
+            }
+            KeyDecision::Consumed => panic!("expected raw 'd', got consumed"),
+        }
+        assert_eq!(c.raw_word, "word");
+    }
+
+    #[test]
+    fn forwarded_backspace_echo_with_stale_prev_text_does_not_reseed_deleted_word() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let mut sink = DeleteCaptureSink::default();
+
+        c.mark_action();
+        match c.feed_key('w') {
+            KeyDecision::Apply { backspaces, commit, .. } => {
+                c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+            }
+            _ => panic!("expected w transform"),
+        }
+        c.observe_surrounding_bytes("work", ByteCursor(4), ByteCursor(4), false);
+        assert_eq!(c.shadow_text(), "ư");
+        assert_eq!(c.raw_word, "w");
+
+        c.mark_action();
+        assert!(matches!(c.feed_key('o'), KeyDecision::ForwardRaw));
+        c.observe_surrounding_bytes("ưo", ByteCursor(3), ByteCursor(3), false);
+        c.mark_action();
+        match c.feed_key('r') {
+            KeyDecision::Apply { backspaces, commit, .. } => {
+                c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+            }
+            _ => panic!("expected r transform"),
+        }
+        c.observe_surrounding_bytes("ửo", ByteCursor(4), ByteCursor(4), false);
+        c.mark_action();
+        match c.feed_key('k') {
+            KeyDecision::Apply { backspaces, commit, .. } => {
+                c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+            }
+            _ => panic!("expected k transform"),
+        }
+        c.observe_surrounding_bytes("work", ByteCursor(4), ByteCursor(4), false);
+        assert_eq!(c.raw_word, "work");
+        assert_eq!(c.shadow_text(), "work");
+
+        c.defer_action();
+        assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+        c.observe_surrounding_bytes("wor", ByteCursor(3), ByteCursor(3), false);
+        assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+        c.observe_surrounding_bytes("wo", ByteCursor(2), ByteCursor(2), false);
+
+        c.mark_action();
+        assert!(matches!(c.feed_key('r'), KeyDecision::ForwardRaw));
+        c.observe_surrounding_bytes("wor", ByteCursor(3), ByteCursor(3), false);
+        c.mark_action();
+        match c.feed_key('d') {
+            KeyDecision::ForwardRaw => {}
+            KeyDecision::Apply { backspaces, commit, .. } => {
+                panic!("expected raw 'd', got edit bs={backspaces} commit={commit:?}");
+            }
+            KeyDecision::Consumed => panic!("expected raw 'd', got consumed"),
+        }
+    }
+
+    #[test]
+    fn retyping_english_after_plain_backspaces_stays_raw() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+        c.observe_surrounding_bytes("doesnt", ByteCursor(6), ByteCursor(6), true);
+        assert_eq!(c.raw_word, "doesnt");
+
+        for expected in ["doesn", "does", "doe"] {
+            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+            c.observe_surrounding_bytes(expected, ByteCursor(expected.len() as u32), ByteCursor(expected.len() as u32), false);
+        }
+
+        for ch in ['s', 'n', 't'] {
+            c.mark_action();
+            match c.feed_key(ch) {
+                KeyDecision::ForwardRaw => {}
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    panic!("expected raw {ch:?}, got edit bs={backspaces} commit={commit:?}");
+                }
+                KeyDecision::Consumed => panic!("expected raw {ch:?}, got consumed"),
+            }
+            let text = c.shadow_text().to_owned();
+            c.observe_surrounding_bytes(&text, ByteCursor(text.len() as u32), ByteCursor(text.len() as u32), false);
+        }
+
+        assert_eq!(c.raw_word, "doesnt");
+        assert_eq!(c.shadow_text(), "doesnt");
+    }
+
+    #[test]
+    fn retyping_typed_english_after_plain_backspaces_stays_raw() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let mut sink = DeleteCaptureSink::default();
+
+        for ch in "doesnt".chars() {
+            c.mark_action();
+            match c.feed_key(ch) {
+                KeyDecision::ForwardRaw => {}
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                KeyDecision::Consumed => {}
+            }
+            let text = c.shadow_text().to_owned();
+            c.observe_surrounding_bytes(&text, ByteCursor(text.len() as u32), ByteCursor(text.len() as u32), false);
+        }
+
+        for expected in ["doesn", "does", "doe"] {
+            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+            c.observe_surrounding_bytes(expected, ByteCursor(expected.len() as u32), ByteCursor(expected.len() as u32), false);
+        }
+
+        for ch in ['s', 'n', 't'] {
+            c.mark_action();
+            match c.feed_key(ch) {
+                KeyDecision::ForwardRaw => {}
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    panic!("expected raw {ch:?}, got edit bs={backspaces} commit={commit:?}");
+                }
+                KeyDecision::Consumed => panic!("expected raw {ch:?}, got consumed"),
+            }
+            let text = c.shadow_text().to_owned();
+            c.observe_surrounding_bytes(&text, ByteCursor(text.len() as u32), ByteCursor(text.len() as u32), false);
+        }
+
+        assert_eq!(c.shadow_text(), "doesnt");
+    }
+
+    #[test]
+    fn first_typed_english_word_stays_raw_on_reliable_surrounding_clients() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let mut sink = DeleteCaptureSink::default();
+
+        let mut visible = String::new();
+        for ch in "doesnt".chars() {
+            c.mark_action();
+            match c.feed_key(ch) {
+                KeyDecision::ForwardRaw => visible.push(ch),
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    for _ in 0..backspaces {
+                        visible.pop();
+                    }
+                    visible.push_str(&commit);
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                KeyDecision::Consumed => {}
+            }
+            c.observe_surrounding_bytes(&visible, ByteCursor(visible.len() as u32), ByteCursor(visible.len() as u32), false);
+        }
+
+        assert_eq!(visible, "doesnt");
+        assert_eq!(c.shadow_text(), "doesnt");
+    }
+
+    #[test]
+    fn first_typed_english_word_stays_raw_across_ibus_caps_upgrade() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::ForwardKey, false);
+        let mut sink = DeleteCaptureSink::default();
+
+        let mut visible = String::new();
+        for (idx, ch) in "word".chars().enumerate() {
+            c.mark_action();
+            match c.feed_key(ch) {
+                KeyDecision::ForwardRaw => visible.push(ch),
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    for _ in 0..backspaces {
+                        visible.pop();
+                    }
+                    visible.push_str(&commit);
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                KeyDecision::Consumed => {}
+            }
+
+            if idx == 0 {
+                c.set_method(BackspaceMethod::SurroundingText);
+            }
+            c.observe_surrounding_bytes(&visible, ByteCursor(visible.len() as u32), ByteCursor(visible.len() as u32), false);
+        }
+
+        assert_eq!(visible, "word");
+        assert_eq!(c.shadow_text(), "word");
+    }
+
+    #[test]
+    fn activation_stale_document_text_does_not_seed_new_first_word() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let mut sink = DeleteCaptureSink::default();
+
+        c.observe_surrounding_bytes("ửod word word ", ByteCursor(16), ByteCursor(16), true);
+        c.observe_surrounding_bytes("ửod word word ", ByteCursor(0), ByteCursor(0), false);
+
+        let mut visible = String::new();
+        for ch in "word".chars() {
+            c.mark_action();
+            match c.feed_key(ch) {
+                KeyDecision::ForwardRaw => visible.push(ch),
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    for _ in 0..backspaces {
+                        visible.pop();
+                    }
+                    visible.push_str(&commit);
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                KeyDecision::Consumed => {}
+            }
+            c.observe_surrounding_bytes(&visible, ByteCursor(visible.len() as u32), ByteCursor(visible.len() as u32), false);
+        }
+
+        assert_eq!(visible, "word");
+        assert_eq!(c.shadow_text(), "word");
+    }
+
+    /// Replays the exact wayland v2 (wlroots/sway) frame sequence logged for
+    /// gedit/firefox typing "word" as the FIRST word. Telex turns w→ư, o, r→
+    /// (hook) ử so the visible word becomes "ửo"; the final 'd' makes the
+    /// syllable invalid and the engine must deconvert the whole word back to
+    /// raw "word". The regression: our own delete_surrounding_text echo (the
+    /// intermediate "" frame after the 'r' delete+commit) was trusted, reset
+    /// the engine mid-word, and the deconversion never ran → "ửod".
+    ///
+    /// v2 path: keys arrive via `feed_key_without_client_insert`; each surrounding
+    /// frame the compositor echoes is replayed verbatim through the reseed gate.
+    #[test]
+    fn v2_first_word_invalid_syllable_deconverts_despite_delete_echo() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let mut sink = DeleteCaptureSink::default();
+        let mut visible = String::new();
+
+        // Activate frame: empty document, force reseed.
+        c.observe_surrounding_bytes("", ByteCursor(0), ByteCursor(0), true);
+
+        // Helper: feed a key the way the wayland glue does, update `visible`,
+        // and apply the edit to the shadow via the sink.
+        let mut press = |c: &mut Composer,
+                         sink: &mut DeleteCaptureSink,
+                         visible: &mut String,
+                         ch: char|
+         -> KeyDecision {
+            c.mark_action();
+            let d = c.feed_key_without_client_insert(ch);
+            match &d {
+                KeyDecision::ForwardRaw => visible.push(ch),
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    for _ in 0..*backspaces {
+                        visible.pop();
+                    }
+                    visible.push_str(commit);
+                    c.apply_to_sink(*backspaces, commit, 0, 0, sink);
+                }
+                KeyDecision::Consumed => {}
+            }
+            d
+        };
+
+        // w → ư
+        press(&mut c, &mut sink, &mut visible, 'w');
+        c.observe_surrounding_bytes("ư", ByteCursor(2), ByteCursor(2), false);
+        // o → ưo (forwarded raw)
+        press(&mut c, &mut sink, &mut visible, 'o');
+        c.observe_surrounding_bytes("ưo", ByteCursor(3), ByteCursor(3), false);
+        // r → ửo (delete "ưo" + commit "ửo"). The compositor echoes the
+        // intermediate delete frame ("" at cursor 0) BEFORE the commit frame.
+        press(&mut c, &mut sink, &mut visible, 'r');
+        assert_eq!(visible, "ửo");
+        c.observe_surrounding_bytes("", ByteCursor(0), ByteCursor(0), false); // delete echo
+        c.observe_surrounding_bytes("ửo", ByteCursor(4), ByteCursor(4), false); // commit echo
+
+        // d → invalid syllable, engine deconverts whole word to raw "word".
+        let d = press(&mut c, &mut sink, &mut visible, 'd');
+        match d {
+            KeyDecision::Apply { backspaces, commit, .. } => {
+                assert_eq!(backspaces, 2, "must delete the 2 composed screen chars 'ửo'");
+                assert_eq!(commit, "word");
+            }
+            KeyDecision::ForwardRaw => panic!("expected deconversion to 'word', got ForwardRaw (regression: 'ửod')"),
+            KeyDecision::Consumed => panic!("expected deconversion to 'word', got Consumed"),
+        }
+        assert_eq!(visible, "word");
+        // The delete must remove "ửo" (4 bytes / 2 chars), not 0 — proves the
+        // shadow survived the delete echo.
+        let (before_bytes, before_chars, _, _) = *sink.deletes.last().unwrap();
+        assert_eq!((before_bytes, before_chars), (4, 2));
+    }
+
+    #[test]
     fn surrounding_observer_trusts_mid_word_one_char_without_reseed() {
-        let decision = super::SurroundingObserver::observe(true, true, false, false);
+        let decision = super::SurroundingObserver::observe(true, true, false, false, false);
 
         assert_eq!(decision, super::SurroundingDecision { trust: true, reseed: false });
     }
 
     #[test]
     fn surrounding_observer_trusts_recent_selection_without_reseed() {
-        let decision = super::SurroundingObserver::observe(true, false, false, true);
+        let decision = super::SurroundingObserver::observe(true, false, false, false, true);
+
+        assert_eq!(decision, super::SurroundingDecision { trust: true, reseed: false });
+    }
+
+    #[test]
+    fn surrounding_observer_drops_recent_delete_echo() {
+        // A deletion within the recent-action window is our own
+        // delete_surrounding_text echo, not an external edit — drop it so the
+        // shadow and in-progress composition survive until the commit echo.
+        let decision = super::SurroundingObserver::observe(true, false, true, false, false);
+
+        assert_eq!(decision, super::SurroundingDecision { trust: false, reseed: false });
+    }
+
+    #[test]
+    fn surrounding_observer_trusts_external_delete_for_reset() {
+        // The same deletion outside the recent-action window IS an external
+        // edit — trust it so the deletion branch can reset the engine.
+        let decision = super::SurroundingObserver::observe(false, false, true, false, false);
 
         assert_eq!(decision, super::SurroundingDecision { trust: true, reseed: false });
     }
