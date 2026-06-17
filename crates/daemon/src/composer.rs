@@ -183,19 +183,28 @@ impl SurroundingObserver {
         one_char_typed: bool,
         deletion: bool,
         force_reseed: bool,
-        has_selection: bool,
+        shadow_confirmed: bool,
     ) -> SurroundingDecision {
-        // NOTE: `deletion` must NOT relax `trust`. A recent deletion frame is
-        // our own `delete_surrounding_text` echo (the intermediate shorter-than-
-        // shadow frame the compositor emits between our delete and our commit).
-        // Trusting it would (a) clobber the shadow via `on_surrounding_text` and
-        // (b) fire the deletion-reset branch's `engine.reset()`, wiping the
-        // in-progress composition — which dropped the first word on
-        // gedit/firefox (typing "word" committed "ửod": the invalid-syllable
-        // deconversion never ran because the engine was reset mid-word by the
-        // delete echo). Recent frames stay echoes; only a genuine external
-        // delete (`!recent_action`) reaches the deletion-reset branch below.
-        let trust = !(recent_action && !one_char_typed && !force_reseed && !has_selection);
+        // Within the recent-action window every frame is some echo of our own
+        // edit; the question is which to keep. `shadow_confirmed` (before-cursor
+        // text == our shadow) is the discriminator:
+        //
+        //  • A frame that MATCHES our shadow is the post-commit echo / a genuine
+        //    autocomplete-selection frame whose prefix is what the user typed
+        //    (Chromium "tra"→"tra|nslate"). Trust it — it syncs the selection
+        //    span the Tier-1 fallback needs and clears any stale one.
+        //  • A frame that does NOT match is junk: our intermediate
+        //    delete_surrounding_text echo (shorter than shadow — would reset the
+        //    engine mid-word and drop the first word "word"→"ửod"), a VSCode
+        //    duplicated-text stale echo, or a STALE Chromium-omnibox autocomplete
+        //    selection describing a prefix we already typed past (`haf`→`à`).
+        //    Drop it.
+        //
+        // `deletion` (incl. shadow-confirmed) drives only `reseed` + the reset
+        // branch below; it must NOT relax `trust`, and `has_selection` must NOT
+        // either (that blanket-trusted stale omnibox selections). Genuine
+        // external edits arrive `!recent_action` and are always trusted.
+        let trust = !(recent_action && !one_char_typed && !shadow_confirmed && !force_reseed);
         let reseed = force_reseed || (!one_char_typed && !recent_action && !deletion);
         SurroundingDecision { trust, reseed }
     }
@@ -561,21 +570,20 @@ impl Composer {
         let one_char_typed = self.edit.one_char_insertion_since_prev(text, cursor);
         let shadow_confirmed = text_before_cursor(text, cursor) == self.edit.shadow_text();
         let deletion = self.edit.deletion_since_prev(text, cursor) || shadow_confirmed;
-        // A frame with an active selection (anchor ≠ cursor) carries the
-        // Chromium autocomplete state the Tier-1 selection fallback depends on
-        // (see surrounding::apply). VSCode's stale echoes are plain duplicated
-        // text with the cursor collapsed to the start (anchor == cursor), so a
-        // selection distinguishes the frame we must record from the garbage we
-        // must drop. Let selection frames through — `should_reseed` stays false
-        // under `recent_action`, so we update the shadow without reseeding the
-        // engine and clobbering Telex state.
-        let has_selection = cursor != anchor;
+        // `shadow_confirmed` (not `has_selection`) gates trust within the
+        // recent-action window. A genuine Chromium autocomplete-selection frame
+        // has a before-cursor prefix equal to what the user typed (== shadow),
+        // so it is shadow_confirmed and trusted — the Tier-1 fallback still gets
+        // its selection span via `on_surrounding_text`. A STALE omnibox
+        // selection frame describes a prefix we already typed past, so it is NOT
+        // confirmed and is dropped (previously `has_selection` blanket-trusted
+        // it, re-arming a stale selection → `haf` committed `à`).
         let decision = SurroundingObserver::observe(
             recent_action,
             one_char_typed,
             deletion,
             force_reseed,
-            has_selection,
+            shadow_confirmed,
         );
         if !decision.trust {
             tracing::trace!(text, cursor, anchor, "skip recent surrounding_text echo");
@@ -1034,14 +1042,20 @@ mod tests {
 
     #[test]
     fn recent_selection_surrounding_frame_reaches_shadow() {
-        // Chromium omnibox autocomplete: user types into "tra", the omnibox
-        // expands to "translate" with "nslate" selected (cursor=3, anchor=9).
-        // That frame arrives within the post-keystroke `recent_action` window
-        // and is not a one-char insertion, but it carries the selection the
-        // Tier-1 fallback (surrounding::apply) needs. The stale-echo gate must
-        // NOT drop it. Regression for the bug reintroduced by the VSCode
-        // stale-echo guard.
+        // Chromium omnibox autocomplete: user types "tra", the omnibox expands
+        // to "translate" with "nslate" selected (cursor=3, anchor=9). That frame
+        // arrives within the post-keystroke `recent_action` window and is not a
+        // one-char insertion, but its before-cursor prefix "tra" == our shadow,
+        // so it is shadow_confirmed and must be trusted — it carries the
+        // selection the Tier-1 fallback (surrounding::apply) needs.
         let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+        // Type "tra" so the shadow holds the prefix the autocomplete selects past.
+        for ch in "tra".chars() {
+            c.mark_action();
+            assert!(matches!(c.feed_key_without_client_insert(ch), KeyDecision::ForwardRaw));
+        }
+        assert_eq!(c.shadow_text(), "tra");
 
         c.mark_action();
         c.observe_surrounding_bytes("translate", ByteCursor(3), ByteCursor(9), false);
@@ -1311,7 +1325,7 @@ mod tests {
         assert_eq!(c.shadow_text(), "word");
     }
 
-    /// Replays the exact wayland v2 (wlroots/sway) frame sequence logged for
+    /// Reproduces the wayland v2 (wlroots/sway) frame sequence seen on
     /// gedit/firefox typing "word" as the FIRST word. Telex turns w→ư, o, r→
     /// (hook) ử so the visible word becomes "ửo"; the final 'd' makes the
     /// syllable invalid and the engine must deconvert the whole word back to
@@ -1383,6 +1397,76 @@ mod tests {
         assert_eq!((before_bytes, before_chars), (4, 2));
     }
 
+    /// Chromium omnibox (purpose=5) first word `haf` → expect `hà`. The omnibox
+    /// emits STALE autocomplete-selection frames (e.g. "https://…" cursor=1
+    /// anchor=N) interleaved with the real ones. A stale selection frame that
+    /// describes a prefix we already typed past must be dropped — otherwise it
+    /// re-arms a selection span in the shadow, the real cleared-selection frame
+    /// is lost, and the next tone fires the ForwardKey-BS selection fallback,
+    /// deleting `ha` and committing only `à`.
+    #[test]
+    fn chromium_omnibox_stale_selection_does_not_eat_first_word() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let mut sink = DeleteCaptureSink::default();
+        let mut visible = String::new();
+
+        // The omnibox autocompletes 'h' → a URL beginning with 'h'; cursor sits
+        // after the typed 'h' (=1) with the rest selected to anchor=N.
+        let url = "https://invent.kde.org";
+        let n = url.len() as u32;
+
+        let mut press = |c: &mut Composer,
+                         sink: &mut DeleteCaptureSink,
+                         visible: &mut String,
+                         ch: char|
+         -> KeyDecision {
+            c.mark_action();
+            let d = c.feed_key_without_client_insert(ch);
+            match &d {
+                KeyDecision::ForwardRaw => visible.push(ch),
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    for _ in 0..*backspaces {
+                        visible.pop();
+                    }
+                    visible.push_str(commit);
+                    c.apply_to_sink(*backspaces, commit, 0, 0, sink);
+                }
+                KeyDecision::Consumed => {}
+            }
+            d
+        };
+
+        // h → raw 'h'; omnibox echoes its autocomplete selection (prefix "h"
+        // still matches shadow here, so it is confirmed and trusted).
+        press(&mut c, &mut sink, &mut visible, 'h');
+        c.observe_surrounding_bytes(url, ByteCursor(1), ByteCursor(n), false);
+        // a → raw 'a'. Now a STALE "h…" selection frame re-arrives (prefix "h"
+        // no longer matches shadow "ha") and must be dropped, then the real
+        // "ha" frame clears the selection.
+        press(&mut c, &mut sink, &mut visible, 'a');
+        c.observe_surrounding_bytes(url, ByteCursor(1), ByteCursor(n), false); // stale → dropped
+        c.observe_surrounding_bytes("ha", ByteCursor(2), ByteCursor(2), false); // real → clears sel
+        // f → huyền tone on a: bs=1 commit "à". Must use the plain
+        // delete_surrounding_text path, NOT the selection-active ForwardKey-BS
+        // fallback (which would delete "ha" and leave only "à").
+        let d = press(&mut c, &mut sink, &mut visible, 'f');
+        match d {
+            KeyDecision::Apply { backspaces, commit, .. } => {
+                assert_eq!(backspaces, 1);
+                assert_eq!(commit, "à");
+            }
+            other => panic!("expected tone Apply bs=1 'à', got {}", match other {
+                KeyDecision::ForwardRaw => "ForwardRaw",
+                KeyDecision::Consumed => "Consumed",
+                _ => "?",
+            }),
+        }
+        assert_eq!(visible, "hà");
+        // No virtual-keyboard backspaces: the stale selection was not honored.
+        assert!(sink.vk_keys.is_empty(), "stale selection must not trigger ForwardKey-BS fallback");
+        assert_eq!(*sink.deletes.last().unwrap(), (1, 1, 0, 0));
+    }
+
     #[test]
     fn surrounding_observer_trusts_mid_word_one_char_without_reseed() {
         let decision = super::SurroundingObserver::observe(true, true, false, false, false);
@@ -1391,10 +1475,23 @@ mod tests {
     }
 
     #[test]
-    fn surrounding_observer_trusts_recent_selection_without_reseed() {
+    fn surrounding_observer_trusts_recent_shadow_confirmed_without_reseed() {
+        // A recent frame whose before-cursor text matches our shadow (post-commit
+        // echo, or a Chromium autocomplete selection whose prefix is what we
+        // typed) is trusted — syncs the shadow/selection without reseeding.
         let decision = super::SurroundingObserver::observe(true, false, false, false, true);
 
         assert_eq!(decision, super::SurroundingDecision { trust: true, reseed: false });
+    }
+
+    #[test]
+    fn surrounding_observer_drops_recent_unconfirmed_selection() {
+        // A STALE Chromium-omnibox autocomplete selection (recent, not a one-char
+        // insert, before-cursor does NOT match shadow) must be dropped — trusting
+        // it re-armed a stale selection span and broke `haf`→`à`.
+        let decision = super::SurroundingObserver::observe(true, false, false, false, false);
+
+        assert_eq!(decision, super::SurroundingDecision { trust: false, reseed: false });
     }
 
     #[test]

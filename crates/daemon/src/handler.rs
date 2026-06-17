@@ -240,6 +240,13 @@ impl Daemon {
         }
     }
 
+    pub fn handle_char_without_client_insert(&mut self, _key: u32, ch: char) -> KeyDecision {
+        match self.composer.as_mut() {
+            Some(w) => w.feed_key_without_client_insert(ch),
+            None => KeyDecision::ForwardRaw,
+        }
+    }
+
     /// Test-only entry exposing the raw seed-path selector. `true` = v1/raw_word
     /// path, `false` = v2/wlroots key-grab path. Production always uses `true`
     /// (via [`handle_char`]); the `false` path is exercised only by the
@@ -577,6 +584,29 @@ mod tests {
         }
 
         #[test]
+        fn v2_wayland_public_path_does_not_use_raw_word_seed() {
+            let mut d = v1_daemon();
+            let mut visible = String::new();
+
+            for ch in "word".chars() {
+                let decision = d.handle_char_without_client_insert(0, ch);
+                match decision {
+                    viet_ime_wayland_adapter::KeyDecision::ForwardRaw => visible.push(ch),
+                    viet_ime_wayland_adapter::KeyDecision::Apply { backspaces, commit, .. } => {
+                        for _ in 0..backspaces {
+                            visible.pop();
+                        }
+                        visible.push_str(&commit);
+                    }
+                    viet_ime_wayland_adapter::KeyDecision::Consumed => {}
+                }
+            }
+
+            assert_eq!(visible, "word");
+            assert_eq!(raw_word(&d), "");
+        }
+
+        #[test]
         fn deactivate_drops_raw_word_via_window_drop() {
             // raw_word lives on the Composer — when composer = None, it dies
             // with it. No explicit clear needed in deactivate.
@@ -739,16 +769,17 @@ mod tests {
         #[test]
         fn compose_key_repeat_is_swallowed_and_does_not_grow_raw_word() {
             let mut d = v1_daemon();
-            // Fresh press builds the raw word.
+            // Wayland v2 public path does not use raw_word; the client has not
+            // inserted the char yet.
             key(&mut d, KEY_A, Some('a'), false);
-            assert_eq!(raw_word(&d), "a", "press feeds the engine");
+            assert_eq!(raw_word(&d), "", "v2 press must not grow raw_word");
             // Holding the letter must NOT re-type it: repeat is swallowed and
             // the engine is untouched.
             let decision = key(&mut d, KEY_A, Some('a'), true);
             assert!(
                 matches!(decision, KeyDecision::Consumed), "compose-key repeat is swallowed"
             );
-            assert_eq!(raw_word(&d), "a", "repeat must not grow raw_word");
+            assert_eq!(raw_word(&d), "", "repeat must not grow raw_word");
         }
 
         #[test]
