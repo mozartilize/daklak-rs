@@ -83,6 +83,17 @@ pub struct AdapterSink<'a> {
     /// KWin's forwardKeySym + kc 247 temp keymap and trigger foot's xkb
     /// recompile race.
     pub(crate) xkb: Option<&'a XkbState>,
+    /// Whether the focused client applies text-input-v3 `commit_string`.
+    /// `true` by default; flipped `false` at the ST→FK downgrade when the
+    /// client's surrounding-text proved dead (Google Docs / Firefox
+    /// contenteditable) — the same dead text-input-v3 contract drops
+    /// `commit_string` too. When `false`, `commit_via_keysym` routes the whole
+    /// commit through `vk_commit_char` (v2/sway) or `ctx.keysym` (v1/KWin)
+    /// instead of `commit_string`; on v1 this also keeps every char on the
+    /// single keysym channel so a contenteditable can't reorder a split commit
+    /// (`ếng` → `…nế…`). When `true`, v1 keeps the terminal split (Vietnamese
+    /// via keysym, ASCII via commit_string) and v2 falls back to commit_string.
+    pub(crate) commit_string_functional: bool,
     /// V2 only: flipped to true by `commit()` so `apply_done_frame` can
     /// detect whether daklak already acked the compositor's done event,
     /// and emit a bare heartbeat commit otherwise. See AdapterState field
@@ -128,12 +139,14 @@ impl OutputSink for AdapterSink<'_> {
                 );
                 let index = -(before as i32);
                 let length = before + after;
+                tracing::trace!(index, length, "delete_surrounding_text emit (text-input channel)");
                 ctx.delete_surrounding_text(index, length);
             }
         }
     }
 
     fn commit_string(&mut self, text: &str) {
+        tracing::trace!(text = %text, "commit_string emit (text-input channel)");
         match &self.text_ops {
             TextOpsTarget::V2 { im } => im.commit_string(text.to_owned()),
             TextOpsTarget::V1 { ctx, serial } => ctx.commit_string(*serial, text.to_owned()),
@@ -157,6 +170,12 @@ impl OutputSink for AdapterSink<'_> {
             KeyState::Released => 0,
         };
         // Standard keycode (BS / nav / forward) → forward_emitter.
+        // TRACE the wire order: on v1 this is ctx.key (wl_keyboard channel),
+        // emitted interleaved with commit_via_keysym's keysym (wl_keyboard) and
+        // commit_string (text-input-v3) channels. Lets a live log confirm
+        // whether ForwardKey backspaces actually fire and in what order vs the
+        // commit on a contenteditable that reorders the two channels.
+        tracing::trace!(key_code, value, "vk_key emit (forward channel)");
         self.forward_emitter.emit_key(time, key_code, value);
     }
 
@@ -204,12 +223,69 @@ impl OutputSink for AdapterSink<'_> {
     }
 
     fn commit_via_keysym(&mut self, serial: u32, time: u32, text: &str) -> bool {
-        // Only ImV1 implements this; V2 has no zwp_input_method_v2::keysym
-        // equivalent (it has commit_string + commit batching).
-        let TextOpsTarget::V1 { ctx, .. } = &self.text_ops else {
-            return false;
-        };
-        // wl_keyboard_key_state: 1=Pressed, 0=Released.
+        match &self.text_ops {
+            // ── ImV2 path: emit via virtual keyboard ──────────────────────
+            //
+            // ImV2 has no ctx.keysym(). Non-terminal clients (Firefox /
+            // Google Docs) ignore text-input-v3 commit_string, so the
+            // ForwardKey fallback to commit_string silently drops the
+            // entire commit. Route every char through the virtual
+            // keyboard instead: vk_commit_char uses the synth keymap
+            // (Vietnamese precomposed chars at levels 2-4, ASCII at
+            // base level) and already includes the held_user_kc
+            // prelude-release fix from emit_char_impl.
+            //
+            // Clients with a working commit_string (commit_string_functional
+            // = true, e.g. foot) keep the commit_string fallback below — they
+            // honor text-input-v3 and don't need the synth keymap path.
+            TextOpsTarget::V2 { .. } if !self.commit_string_functional => {
+                tracing::trace!(text = %text, "commit_via_keysym: enter (v2 vk path)");
+                let mut fallback_buf = String::new();
+                for c in text.chars() {
+                    if self.vk_commit_char(time, c) {
+                        if let Some(conn) = self.conn {
+                            let _ = conn.flush();
+                        }
+                        continue;
+                    }
+                    // Char not in synth keymap — buffer for commit_string.
+                    fallback_buf.push(c);
+                }
+                if !fallback_buf.is_empty() {
+                    tracing::trace!(
+                        text = %fallback_buf,
+                        "commit_via_keysym: fallback commit_string for chars outside synth keymap"
+                    );
+                    self.commit_string(&fallback_buf);
+                    self.commit(serial);
+                }
+                true
+            }
+
+            // ── ImV1 path: emit via ctx.keysym() ─────────────────────────
+            TextOpsTarget::V1 { ctx, .. } => {
+                self.commit_via_keysym_v1(ctx, serial, time, text)
+            }
+            // ImV2 with working commit_string: no keysym path, let
+            // forward_key fall back to commit_string.
+            TextOpsTarget::V2 { .. } => false,
+        }
+    }
+}
+
+impl AdapterSink<'_> {
+    /// ImV1 keysym-path commit. Splits ASCII (commit_string) from
+    /// Vietnamese (ctx.keysym) when commit_string_functional is true; keeps
+    /// every char on the keysym channel when it is false (contenteditable
+    /// clients with a dead commit_string that would reorder cross-channel
+    /// commits).
+    fn commit_via_keysym_v1(
+        &mut self,
+        ctx: &ZwpInputMethodContextV1,
+        serial: u32,
+        time: u32,
+        text: &str,
+    ) -> bool {
         const PRESSED: u32 = 1;
         const RELEASED: u32 = 0;
 
@@ -223,9 +299,15 @@ impl OutputSink for AdapterSink<'_> {
         // keycode is already in pressedKeys from the forwarded physical
         // press. commit_string() via text-input-v3 bypasses this
         // deduplication entirely.
+        tracing::trace!(text = %text, "commit_via_keysym: enter (v1 keysym path)");
         let mut ascii_buf = String::new();
         let flush_ascii = |buf: &mut String, ctx: &ZwpInputMethodContextV1, serial: u32| {
             if !buf.is_empty() {
+                // TRACE the channel split: ASCII runs go through text-input-v3
+                // commit_string while Vietnamese chars go through the keysym
+                // (wl_keyboard) channel — the suspected source of word reorder
+                // ("ếng" → keysym 'ế' + commit_string "ng") on contenteditable.
+                tracing::trace!(ascii = %buf, "commit_via_keysym: flush ASCII via commit_string (text-input channel)");
                 ctx.commit_string(serial, std::mem::take(buf));
             }
         };
@@ -235,7 +317,12 @@ impl OutputSink for AdapterSink<'_> {
                 Some(xkb) => xkb.char_to_keycode(c).is_none(),
                 None => true,
             };
-            if !is_unmapped {
+            // Clients with a dead commit_string keep every char on the keysym
+            // channel — see `commit_string_functional`. Mapped ASCII (a-z,
+            // telex tails) has a standard keysym present in the layout, so KWin
+            // forwards the real keycode (no kc 247 dance); single-channel
+            // ordering is preserved.
+            if !is_unmapped && self.commit_string_functional {
                 ascii_buf.push(c);
                 continue;
             }
@@ -243,6 +330,24 @@ impl OutputSink for AdapterSink<'_> {
             // Vietnamese (unmapped) char — flush pending ASCII first so
             // commit_string arrives before the keysym's keymap dance.
             flush_ascii(&mut ascii_buf, ctx, serial);
+
+            // Tail-char-drop fix: for mapped ASCII chars whose
+            // physical keycode the user is still holding, emit a
+            // prelude key-release through the forward channel so
+            // KWin's forwardKeySym pressedKeys dedup doesn't drop
+            // the synthetic keysym press.
+            if !is_unmapped {
+                if let Some(kc) = self.xkb.and_then(|xkb| xkb.char_to_keycode(c)) {
+                    if self.held_user_kc == Some(kc) {
+                        tracing::debug!(
+                            kc,
+                            char = %c,
+                            "commit_via_keysym: prelude release for still-held user key (tail-char-drop fix)"
+                        );
+                        self.forward_emitter.emit_key(time, kc, 0);
+                    }
+                }
+            }
 
             let sym = xkbcommon::xkb::utf32_to_keysym(c as u32);
             if sym.raw() == 0 {

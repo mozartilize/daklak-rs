@@ -65,6 +65,11 @@ impl AdapterHandler for Daemon {
                     "force_chars_delete_apps match → char-count delete + debounce barrier"
                 );
             }
+            // `commit_string_functional` starts true (the spec default: a v3
+            // client is obligated to apply commit_string). It is driven down
+            // ONLY by the runtime ST-liveness probe at the ST→FK downgrade —
+            // not by a purpose/capability guess, because text-input-v3 exposes
+            // no per-feature bit and the breakage is per-widget. See plan91.
             c.set_modifiers(self.modifiers);
             self.composer = Some(c);
         } else if deactivate {
@@ -94,6 +99,32 @@ impl AdapterHandler for Daemon {
                 raw_word = %w.raw_word,
                 "on_done_frame surrounding_text"
             );
+
+            // Runtime tier downgrade ST → FK. An app that advertises
+            // surrounding-text support but never reflects our commits (Google
+            // Docs / contenteditable in Firefox report text="" cursor=0 on
+            // every frame) silently no-ops delete_surrounding_text, so each
+            // correction's commit doubles the word ("Tiếng" → "Tieêngếng").
+            // Detect the dead-surrounding signature and fall back to ForwardKey,
+            // whose real Backspace keystrokes the client does honor. Symmetric
+            // to the late upgrade below but in the other direction; it must run
+            // BEFORE the duplicate-frame guard because every dead frame is
+            // byte-identical and would otherwise be swallowed there.
+            if !activate
+                && w.method() == BackspaceMethod::SurroundingText
+                && w.note_surrounding_liveness(text, *cursor)
+            {
+                tracing::info!(
+                    from = ?BackspaceMethod::SurroundingText,
+                    to = ?BackspaceMethod::ForwardKey,
+                    "surrounding text non-functional (empty frames despite commits) → downgrade tier"
+                );
+                w.set_method(BackspaceMethod::ForwardKey);
+                // Dead surrounding-text ⟹ dead text-input-v3 server contract
+                // ⟹ commit_string also silently dropped (common cause). Route
+                // ForwardKey commits through vk/keysym instead.
+                w.commit_string_functional = false;
+            }
 
             // Duplicate-frame guard. KWin re-emits the same SurroundingText
             // 2-3 times per keystroke. We've already processed this state —
@@ -294,7 +325,8 @@ impl AdapterHandler for Daemon {
         if let Some(w) = self.composer.as_mut() {
             tracing::debug!(method = ?w.method, backspaces, commit, "strategy.apply");
             let delete_in_chars = w.delete_in_chars;
-            ctx.with_sink(raw_mods, held_user_kc, delete_in_chars, |sink| {
+            let commit_string_functional = w.commit_string_functional;
+            ctx.with_sink(raw_mods, held_user_kc, delete_in_chars, commit_string_functional, |sink| {
                 w.apply_to_sink(backspaces, commit, serial, time, sink);
             });
         }

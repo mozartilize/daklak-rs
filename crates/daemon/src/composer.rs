@@ -118,6 +118,13 @@ impl EditModel {
 /// Per-text-input composition state + behavior. On wlroots/Sway, one instance
 /// at a time (compositor sends deactivate before new activate); ibus/evdev
 /// create one per active session.
+
+/// Consecutive "dead surrounding" frames (empty text + cursor 0 while our
+/// shadow holds committed content) that trip the SurroundingText→ForwardKey
+/// runtime downgrade. Two absorbs a one-off race; a functional client never
+/// produces even one (its surrounding always reflects at least our commits).
+const SURROUNDING_DEAD_STRIKE_LIMIT: u32 = 2;
+
 pub struct Composer {
     pub engine: EngineState,
     edit: EditModel,
@@ -162,11 +169,31 @@ pub struct Composer {
     /// to the delete unit above; firefox needs both, hence they were once fused.
     pub debounce_barrier: bool,
 
+    /// Whether the focused client actually applies text-input-v3
+    /// `commit_string`. Defaults `true`. Flipped to `false` at the ST→FK
+    /// downgrade: an app that advertised surrounding-text but reports it dead
+    /// (Google Docs / Firefox contenteditable: `text="" cursor=0` forever)
+    /// ignores the whole text-input-v3 server-event contract — `commit_string`
+    /// silently fails too (common cause, not feature coupling). When `false`,
+    /// the ForwardKey commit routes through the virtual keyboard (`vk_commit_char`
+    /// on v2/sway) or `ctx.keysym` (v1/KWin) instead of `commit_string`. There
+    /// is no connect-time probe for this — text-input-v3 has no per-feature
+    /// capability bit and the breakage is per-widget, so the ST-liveness symptom
+    /// is the only observable signal. See plan91 / [[project_v2_first_word_delete_echo]].
+    pub commit_string_functional: bool,
+
     /// Timestamp of the last user-keystroke action — used to distinguish
     /// "compositor echo of our action" (recent) from "user clicked mid-word"
     /// (not recent) in surrounding_text frames. Moved here from `Daemon`:
     /// the reseed gate is the only reader, and it lives on `Composer` now.
     last_action_at: Instant,
+
+    /// Consecutive surrounding_text frames that looked "dead" (empty text +
+    /// cursor 0 despite a non-empty shadow). Drives the runtime downgrade from
+    /// SurroundingText to ForwardKey for clients that advertise surrounding
+    /// support but never honor `delete_surrounding_text` (Google Docs /
+    /// contenteditable in Firefox). See `note_surrounding_liveness`.
+    surrounding_dead_strikes: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,7 +255,9 @@ impl Composer {
             suppress_raw_word_seed_after_plain_backspace: false,
             delete_in_chars: false,
             debounce_barrier: false,
+            commit_string_functional: true,
             last_action_at: Instant::now() - Duration::from_secs(60),
+            surrounding_dead_strikes: 0,
         }
     }
 
@@ -256,6 +285,37 @@ impl Composer {
     pub fn set_method(&mut self, m: BackspaceMethod) {
         self.edit.set_method(m);
         self.method = m;
+    }
+
+    /// Watchdog for clients that advertise surrounding-text support but never
+    /// actually maintain it. Google Docs (and any contenteditable widget in
+    /// Firefox) reports `text="" cursor=0` on every frame and silently no-ops
+    /// `delete_surrounding_text`, so on the SurroundingText tier each
+    /// correction's `commit_string` lands without its paired delete and the
+    /// word doubles (`Tiếng` → `Tieêngếng`).
+    ///
+    /// The signature is unambiguous: an empty surrounding frame *while our
+    /// shadow already holds committed content*. A functional client's
+    /// surrounding always reflects at least what we committed, so it never
+    /// produces this; a genuinely empty field leaves our shadow empty too.
+    /// After [`SURROUNDING_DEAD_STRIKE_LIMIT`] consecutive such frames, return
+    /// `true` so the caller can downgrade the tier to ForwardKey — whose real
+    /// Backspace keystrokes these clients do honor (raw key passthrough already
+    /// works on the same path). Any frame that does reflect content resets the
+    /// count. Call once per surrounding frame, *before* the duplicate-frame
+    /// guard (every dead frame is byte-identical, so the guard would otherwise
+    /// hide all but the first).
+    pub fn note_surrounding_liveness(&mut self, text: &str, cursor: u32) -> bool {
+        let dead = text.is_empty() && cursor == 0 && !self.edit.shadow_text().is_empty();
+        if dead {
+            self.surrounding_dead_strikes += 1;
+            self.surrounding_dead_strikes >= SURROUNDING_DEAD_STRIKE_LIMIT
+        } else {
+            if !text.is_empty() {
+                self.surrounding_dead_strikes = 0;
+            }
+            false
+        }
     }
 
     pub fn set_modifiers(&mut self, m: ModifierState) {
@@ -908,6 +968,38 @@ mod tests {
         c.set_window_quirks(false, true);
         assert!(!c.delete_in_chars);
         assert!(c.debounce_barrier);
+    }
+
+    #[test]
+    fn dead_surrounding_frames_signal_forward_key_downgrade() {
+        // Google Docs / Firefox contenteditable: advertises surrounding-text
+        // but every frame is text="" cursor=0 and delete_surrounding_text is a
+        // no-op, so SurroundingText commits double the word. The watchdog must
+        // flag the downgrade once shadow holds content but frames stay empty.
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+        // A genuinely empty widget (empty shadow) is NOT a strike.
+        assert!(!c.note_surrounding_liveness("", 0));
+
+        // Client reflected one commit, so our shadow now holds content.
+        c.observe_surrounding_bytes("T", ByteCursor(1), ByteCursor(1), false);
+        assert_eq!(c.shadow_text(), "T");
+
+        // Now it goes dead: empty frames despite committed shadow.
+        assert!(!c.note_surrounding_liveness("", 0)); // strike 1
+        assert!(c.note_surrounding_liveness("", 0)); // strike 2 → downgrade
+    }
+
+    #[test]
+    fn live_surrounding_frame_resets_dead_strikes() {
+        // A functional client reflects our commits; one such frame must clear
+        // the strike counter so a lone transient empty frame never downgrades.
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        c.observe_surrounding_bytes("ph", ByteCursor(2), ByteCursor(2), false);
+
+        assert!(!c.note_surrounding_liveness("", 0)); // strike 1
+        assert!(!c.note_surrounding_liveness("pho", 3)); // content seen → reset
+        assert!(!c.note_surrounding_liveness("", 0)); // back to strike 1, no downgrade
     }
 
     #[test]

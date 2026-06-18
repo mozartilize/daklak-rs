@@ -302,6 +302,7 @@ impl<'a> AdapterCtx<'a> {
         raw_mods: (u32, u32, u32, u32),
         held_user_kc: Option<u32>,
         delete_in_chars: bool,
+        commit_string_functional: bool,
         f: F,
     ) where
         F: FnOnce(&mut AdapterSink<'_>),
@@ -335,6 +336,7 @@ impl<'a> AdapterCtx<'a> {
                     raw_mods,
                     held_user_kc,
                     delete_in_chars,
+                    commit_string_functional,
                     conn,
                     xkb: self.state.xkb.as_ref(),
                     pending_im_commit_ack: &mut self.state.pending_im_commit_ack,
@@ -359,6 +361,7 @@ impl<'a> AdapterCtx<'a> {
                     raw_mods,
                     held_user_kc,
                     delete_in_chars,
+                    commit_string_functional,
                     conn,
                     xkb: self.state.xkb.as_ref(),
                     pending_im_commit_ack: &mut self.state.pending_im_commit_ack,

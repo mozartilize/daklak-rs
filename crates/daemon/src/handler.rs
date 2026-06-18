@@ -291,6 +291,27 @@ impl Daemon {
     #[cfg(feature = "ibus")]
     pub fn observe_surrounding(&mut self, text: &str, cursor: u32, anchor: u32) {
         if let Some(w) = self.composer.as_mut() {
+            // Runtime tier downgrade ST → FK. Same watchdog as the wayland
+            // path: clients that advertise surrounding-text but never honor it
+            // (Google Docs / Firefox contenteditable echo text="" cursor=0
+            // forever and no-op delete_surrounding_text, doubling each
+            // correction's commit). Must run BEFORE the duplicate-frame guard
+            // because every dead frame is byte-identical. Viable on GNOME now
+            // that the upstream mutter ForwardKey-drop fix is in play.
+            if w.method() == BackspaceMethod::SurroundingText
+                && w.note_surrounding_liveness(text, cursor)
+            {
+                tracing::info!(
+                    from = ?BackspaceMethod::SurroundingText,
+                    to = ?BackspaceMethod::ForwardKey,
+                    "surrounding text non-functional (empty frames despite commits) → downgrade tier"
+                );
+                w.set_method(BackspaceMethod::ForwardKey);
+                // Mirror the wayland path: dead ST ⟹ dead commit_string. The
+                // IBus sink doesn't read this flag today, but keep the composer
+                // state coherent across transports.
+                w.commit_string_functional = false;
+            }
             if w.is_duplicate_frame(text, cursor, anchor) {
                 return;
             }

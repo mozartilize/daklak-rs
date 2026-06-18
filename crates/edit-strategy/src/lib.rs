@@ -198,11 +198,15 @@ impl Strategy {
         self.method
     }
 
-    /// Late tier upgrade. Used when the activate frame had no surrounding
-    /// info (so Tier 1 was demoted to ForwardKey) but a later frame proves
-    /// the app actually supports surrounding-text. Caller is responsible
-    /// for the upgrade-only invariant: shadow state is preserved, no
-    /// downgrade is intended.
+    /// Runtime tier switch. Two callers, opposite directions:
+    ///   • Late upgrade — the activate frame had no surrounding info (Tier 1
+    ///     demoted to ForwardKey) but a later frame proves the app supports
+    ///     surrounding-text.
+    ///   • Late downgrade — the app advertised surrounding-text but never
+    ///     honors it (Google Docs / Firefox contenteditable), so Tier 1 is
+    ///     abandoned for ForwardKey after repeated dead frames.
+    /// Either way shadow state is preserved; ForwardKey derives its backspace
+    /// count from the engine, not the shadow, so a stale shadow is harmless.
     pub fn set_method(&mut self, m: BackspaceMethod) {
         self.method = m;
     }
