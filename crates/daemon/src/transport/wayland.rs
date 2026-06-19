@@ -96,7 +96,6 @@ impl AdapterHandler for Daemon {
                 cursor = *cursor,
                 prev_text = %prev_text,
                 prev_cursor,
-                raw_word = %w.raw_word,
                 "on_done_frame surrounding_text"
             );
 
@@ -128,7 +127,7 @@ impl AdapterHandler for Daemon {
 
             // Duplicate-frame guard. KWin re-emits the same SurroundingText
             // 2-3 times per keystroke. We've already processed this state —
-            // running the reseed logic again wipes raw_word and burns engine
+            // running the reseed logic again resets and burns engine
             // context. Skip if nothing changed (but never on activate/deactivate
             // framing, which must always re-evaluate).
             if !activate && !deactivate && w.is_duplicate_frame(text, *cursor, *anchor) {
@@ -276,7 +275,7 @@ impl AdapterHandler for Daemon {
             return KeyDecision::ForwardRaw;
         };
 
-        let decision = self.handle_char_without_client_insert(key, ch);
+        let decision = self.handle_char(key, ch);
 
         // v1/KWin ForwardKey: a passthrough char (engine didn't consume it, or
         // emitted it unchanged) is normally forwarded as a raw keycode. But

@@ -164,8 +164,8 @@ impl Daemon {
 
     /// Like wayland's `on_key_pressed` but without `AdapterCtx`. NAV and
     /// modifier-shortcut keys return `ForwardRaw` instead of `Consumed` (the
-    /// caller just passes through). Uses the v1/raw_word path — IBus intercepts
-    /// before the client receives the key, same shape as the v1/KWin path.
+    /// caller just passes through). Runs the engine continuously and seeds from
+    /// shadow at word start, same as the wayland path.
     #[cfg(feature = "ibus")]
     pub fn process_key(&mut self, key: u32, ch: Option<char>) -> KeyDecision {
         if let Some(w) = self.composer.as_mut() {
@@ -214,52 +214,25 @@ impl Daemon {
         let Some(ch) = ch else {
             // Non-printable key (Enter, Tab, Escape, …) ends the current word.
             // Clear the composition so the next char starts fresh and isn't
-            // seeded with this line's keystrokes (e.g. "hiếu"⏎ then typing must
-            // not re-seed raw_word="hieeus" → "hieeushi…").
+            // seeded with this line's word (e.g. after "hiếu"⏎ the next key must
+            // start a new word, not extend "hiếu").
             if let Some(w) = self.composer.as_mut() {
                 w.full_reset();
                 w.defer_action();
             }
             return KeyDecision::ForwardRaw;
         };
-        // IBus is a client-side-insertion + observe-surrounding transport, the
-        // same shape as the v1/KWin path: use the raw_word seed so the engine
-        // keeps vowel-cluster context across transforms (after `ee`→ê it would
-        // otherwise forget `iê` and mis-place a later tone, e.g. hiêu+s → hiêí
-        // instead of hiếu). NOT the v2 grab path, which relies on the engine's
-        // running state that ibus keystroke gaps + reseeds disturb.
         self.handle_char(key, ch)
     }
 
     // ── thin delegations to the Composer brain (trait surface + tests) ──────
 
+    /// Feed a printable char to the composer. The engine runs continuously
+    /// (no per-key reset) for every transport — wayland, IBus, evdev — building
+    /// on the prior key's state, with a render-gated shadow seed at word start.
     pub fn handle_char(&mut self, _key: u32, ch: char) -> KeyDecision {
         match self.composer.as_mut() {
             Some(w) => w.feed_key(ch),
-            None => KeyDecision::ForwardRaw,
-        }
-    }
-
-    pub fn handle_char_without_client_insert(&mut self, _key: u32, ch: char) -> KeyDecision {
-        match self.composer.as_mut() {
-            Some(w) => w.feed_key_without_client_insert(ch),
-            None => KeyDecision::ForwardRaw,
-        }
-    }
-
-    /// Test-only entry exposing the raw seed-path selector. `true` = v1/raw_word
-    /// path, `false` = v2/wlroots key-grab path. Production always uses `true`
-    /// (via [`handle_char`]); the `false` path is exercised only by the
-    /// raw_word_reset characterization tests.
-    #[cfg(test)]
-    pub(crate) fn handle_char_inner(
-        &mut self,
-        _key: u32,
-        ch: char,
-        shadow_already_has_ch: bool,
-    ) -> KeyDecision {
-        match self.composer.as_mut() {
-            Some(w) => w.feed_key_inner(ch, shadow_already_has_ch),
             None => KeyDecision::ForwardRaw,
         }
     }
@@ -521,10 +494,10 @@ mod tests {
         }
     }
 
-    // ── Ctrl+BS / NAV reset: raw_word lives on the Composer, must be cleared
-    //    alongside the rest of compose state. Bug is v1/KWin only — v2/wlroots
-    //    path (shadow_already_has_ch=false) never reads or writes raw_word.
-    mod raw_word_reset {
+    // ── Continuous-engine seed model: every transport (wayland, IBus, evdev)
+    //    runs the engine continuously and seeds from shadow at word start.
+    //    These pin that behavior at the routing surface.
+    mod continuous_seed {
         use super::super::Daemon;
         use crate::composer::Composer;
         use crate::config::Config;
@@ -532,9 +505,9 @@ mod tests {
         use std::sync::Arc;
         use viet_ime_edit_strategy::BackspaceMethod;
         use viet_ime_engine::InputMethod;
-        use viet_ime_evdev_adapter::EvdevHandler;
+        use viet_ime_wayland_adapter::KeyDecision;
 
-        fn v1_daemon() -> Daemon {
+        fn daemon() -> Daemon {
             let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
             d.current_active = true;
             d.composer = Some(Composer::new(
@@ -545,171 +518,31 @@ mod tests {
             d
         }
 
-        fn raw_word(d: &Daemon) -> &str {
-            d.composer
-                .as_ref()
-                .map(|w| w.raw_word.as_str())
-                .unwrap_or("")
-        }
-
         #[test]
-        fn v1_path_builds_raw_word_from_alpha_chars() {
-            let mut d = v1_daemon();
-            for ch in "xaxax".chars() {
-                d.handle_char_inner(0, ch, true);
-            }
-            assert_eq!(raw_word(&d), "xaxax");
-        }
-
-        #[test]
-        fn full_reset_window_clears_raw_word() {
-            let mut d = v1_daemon();
-            for ch in "xaxax".chars() {
-                d.handle_char_inner(0, ch, true);
-            }
-            assert_eq!(raw_word(&d), "xaxax");
-            d.full_reset_window();
-            assert_eq!(raw_word(&d), "", "full_reset_window must clear raw_word");
-        }
-
-        #[test]
-        fn next_alpha_after_reset_does_not_carry_stale_seed() {
-            // Repro of the gedit Ctrl+BS bug: type `xaxax`, simulate the
-            // word-delete reset path, type `x`. raw_word must be just "x".
-            let mut d = v1_daemon();
-            for ch in "xaxax".chars() {
-                d.handle_char_inner(0, ch, true);
-            }
-            d.full_reset_window();
-            d.handle_char_inner(0, 'x', true);
-            assert_eq!(
-                raw_word(&d),
-                "x",
-                "post-reset keystroke must not re-seed from deleted word"
-            );
-        }
-
-        #[test]
-        fn v2_path_never_touches_raw_word() {
-            // wlroots / v2: shadow_already_has_ch=false. raw_word remains
-            // untouched — bug is v1-specific.
-            let mut d = v1_daemon();
-            for ch in "xaxax".chars() {
-                d.handle_char_inner(0, ch, false);
-            }
-            assert_eq!(
-                raw_word(&d),
-                "",
-                "v2 path must not write raw_word — bug is v1-only"
-            );
-        }
-
-        #[test]
-        fn v2_wayland_public_path_does_not_use_raw_word_seed() {
-            let mut d = v1_daemon();
+        fn typing_english_word_stays_raw() {
+            // No surrounding text: "word" must come out verbatim, never
+            // recomposed into Vietnamese on the continuous path.
+            let mut d = daemon();
             let mut visible = String::new();
-
             for ch in "word".chars() {
-                let decision = d.handle_char_without_client_insert(0, ch);
-                match decision {
-                    viet_ime_wayland_adapter::KeyDecision::ForwardRaw => visible.push(ch),
-                    viet_ime_wayland_adapter::KeyDecision::Apply { backspaces, commit, .. } => {
+                match d.handle_char(0, ch) {
+                    KeyDecision::ForwardRaw => visible.push(ch),
+                    KeyDecision::Apply { backspaces, commit, .. } => {
                         for _ in 0..backspaces {
                             visible.pop();
                         }
                         visible.push_str(&commit);
                     }
-                    viet_ime_wayland_adapter::KeyDecision::Consumed => {}
+                    KeyDecision::Consumed => {}
                 }
             }
-
             assert_eq!(visible, "word");
-            assert_eq!(raw_word(&d), "");
-        }
-
-        #[test]
-        fn deactivate_drops_raw_word_via_window_drop() {
-            // raw_word lives on the Composer — when composer = None, it dies
-            // with it. No explicit clear needed in deactivate.
-            let mut d = v1_daemon();
-            for ch in "xaxax".chars() {
-                d.handle_char_inner(0, ch, true);
-            }
-            d.composer = None;
-            assert_eq!(raw_word(&d), "");
-        }
-
-        /// Regression: "work púh" + BS×2 + retype "ush" must produce "púh"
-        /// again, not "uúh". Root cause: after Telex 's' (tone mark) produces
-        /// bs=1 commit='ú', raw_word held "pus" for screen "pú". BS×1 popped
-        /// only 'h', BS×2 popped only 's' (not 'u'), leaving raw_word="pu"
-        /// for screen "p". Engine re-seeded with "pu" instead of "p".
-        #[test]
-        fn v1_bs_after_tone_pops_correct_raw_width() {
-            // Type "push" in v1 path:
-            //   'p' → ForwardRaw                raw_word="p",    widths=[1]
-            //   'u' → ForwardRaw                raw_word="pu",   widths=[1,1]
-            //   's' → Consumed (bs=1 commit='ú') raw_word="pus",  widths=[1,2]
-            //   'h' → ForwardRaw                raw_word="push", widths=[1,2,1]
-            let mut d = v1_daemon();
-            d.handle_char_inner(0, 'p', true);
-            d.handle_char_inner(0, 'u', true);
-            d.handle_char_inner(0, 's', true);
-            d.handle_char_inner(0, 'h', true);
-            assert_eq!(raw_word(&d), "push");
-
-            // BS×2: deletes screen chars 'h' then 'ú'.
-            // BS#1: pop width=1 → pop 1 raw ('h')   → raw_word="pus"
-            // BS#2: pop width=2 → pop 2 raw ('s','u') → raw_word="p"
-            d.handle_backspace();
-            d.handle_backspace();
-
-            assert_eq!(
-                raw_word(&d),
-                "p",
-                "after BS×2 over 'h' and 'ú' (raw 'u'+'s'), raw_word must be 'p' not 'pu'"
-            );
-        }
-
-        /// After the correct BS, retyping "ush" must seed with "p" not "pu",
-        /// so 's' fires bs=1 commit='ú' (not bs=2 commit='úu').
-        #[test]
-        fn v1_retype_after_bs_over_tone_char_seeds_correctly() {
-            let mut d = v1_daemon();
-            d.handle_char_inner(0, 'p', true);
-            d.handle_char_inner(0, 'u', true);
-            d.handle_char_inner(0, 's', true); // 'ú'
-            d.handle_char_inner(0, 'h', true);
-            d.handle_backspace(); // delete 'h'
-            d.handle_backspace(); // delete 'ú' (pops both 'u' and 's')
-
-            // Re-type 'u': engine seeded with "p" → process_key('u') → ForwardRaw
-            let r_u = d.handle_char_inner(0, 'u', true);
-            // 'u' after bare 'p' is ForwardRaw (no vowel-modify rule here)
-            assert!(
-                matches!(r_u, viet_ime_wayland_adapter::KeyDecision::ForwardRaw),
-                "re-typed 'u' must be ForwardRaw (seed was 'p', not 'pu')"
-            );
-
-            // Re-type 's': engine seeded with "pu" → process_key('s') → bs=1 commit='ú'
-            let r_s = d.handle_char_inner(0, 's', true);
-            match r_s {
-                viet_ime_wayland_adapter::KeyDecision::Apply {
-                    backspaces,
-                    ref commit,
-                    ..
-                } => {
-                    assert_eq!(backspaces, 1, "'s' must produce exactly 1 backspace");
-                    assert_eq!(commit, "ú", "'s' after 'pu' must commit 'ú'");
-                }
-                _other => panic!("expected Apply for 's', got something else"),
-            }
         }
 
         #[cfg(feature = "ibus")]
         #[test]
         fn ibus_escape_does_not_clear_current_word_context() {
-            let mut d = v1_daemon();
+            let mut d = daemon();
             d.process_key(35, Some('h'));
             d.process_key(24, Some('o'));
             d.process_key(49, Some('n'));
@@ -719,22 +552,14 @@ mod tests {
             d.process_key(1, None);
 
             match d.process_key(17, Some('w')) {
-                viet_ime_wayland_adapter::KeyDecision::Apply {
-                    backspaces,
-                    ref commit,
-                    ..
-                } => {
+                KeyDecision::Apply { backspaces, ref commit, .. } => {
                     assert_eq!(backspaces, 2);
                     assert_eq!(commit, "ơn");
                 }
                 _other => panic!("expected Apply for 'w' after hon + Esc"),
             }
             match d.process_key(31, Some('s')) {
-                viet_ime_wayland_adapter::KeyDecision::Apply {
-                    backspaces,
-                    ref commit,
-                    ..
-                } => {
+                KeyDecision::Apply { backspaces, ref commit, .. } => {
                     assert_eq!(backspaces, 2);
                     assert_eq!(commit, "ớn");
                 }
@@ -772,13 +597,6 @@ mod tests {
             d
         }
 
-        fn raw_word(d: &Daemon) -> String {
-            d.composer
-                .as_ref()
-                .map(|w| w.raw_word.clone())
-                .unwrap_or_default()
-        }
-
         /// Drive the trait `on_key_pressed` with `forwarding_repeat = repeat`.
         fn key(d: &mut Daemon, key: u32, ch: Option<char>, repeat: bool) -> KeyDecision {
             let mut state = AdapterState::new();
@@ -788,19 +606,16 @@ mod tests {
         }
 
         #[test]
-        fn compose_key_repeat_is_swallowed_and_does_not_grow_raw_word() {
+        fn compose_key_repeat_is_swallowed() {
             let mut d = v1_daemon();
-            // Wayland v2 public path does not use raw_word; the client has not
-            // inserted the char yet.
             key(&mut d, KEY_A, Some('a'), false);
-            assert_eq!(raw_word(&d), "", "v2 press must not grow raw_word");
-            // Holding the letter must NOT re-type it: repeat is swallowed and
-            // the engine is untouched.
+            // Holding the letter must NOT re-type it: the repeat is swallowed
+            // (Consumed) so the engine is untouched and 'a' isn't duplicated.
             let decision = key(&mut d, KEY_A, Some('a'), true);
             assert!(
-                matches!(decision, KeyDecision::Consumed), "compose-key repeat is swallowed"
+                matches!(decision, KeyDecision::Consumed),
+                "compose-key repeat is swallowed"
             );
-            assert_eq!(raw_word(&d), "", "repeat must not grow raw_word");
         }
 
         #[test]

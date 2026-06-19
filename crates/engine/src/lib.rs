@@ -61,6 +61,10 @@ pub struct ProcessResult {
 /// is tracking.
 pub struct EngineState {
     engine: Engine,
+    /// Kept so the render-gate can spin up a throwaway engine with the same
+    /// configuration to round-trip-check a reconstructed seed.
+    method: InputMethod,
+    bracket_shortcuts: bool,
 }
 
 impl EngineState {
@@ -76,7 +80,32 @@ impl EngineState {
             engine.input.set_user_key_map(&key_map);
         }
         engine.set_viet_mode(true);
-        Self { engine }
+        Self {
+            engine,
+            method,
+            bracket_shortcuts,
+        }
+    }
+
+    /// Render the visible string produced by typing `raw` from a clean state,
+    /// using this engine's configuration. Pure: runs on a throwaway engine and
+    /// does NOT touch `self`. Used by the render-gate to verify a reconstructed
+    /// telex seed actually round-trips back to the glyphs it came from.
+    fn render(&self, raw: &str) -> String {
+        let mut scratch = Self::new_with_options(self.method, self.bracket_shortcuts);
+        let mut screen = String::new();
+        for ch in raw.chars() {
+            let r = scratch.process_key(ch);
+            if r.consumed {
+                for _ in 0..r.backspaces {
+                    screen.pop();
+                }
+                screen.push_str(&r.commit);
+            } else {
+                screen.push(ch);
+            }
+        }
+        screen
     }
 
     /// Process a single character keystroke (ASCII printable expected for
@@ -113,13 +142,33 @@ impl EngineState {
     /// Seed engine with text before the cursor — enables retroactive word
     /// editing when the IME activates mid-word. Returns true if context
     /// was fed successfully.
+    ///
+    /// NOTE: this takes telex keystrokes OR composed glyphs interchangeably
+    /// (`telex_context_from_surrounding` passes ASCII through and reverses
+    /// diacritics), so callers seeding from raw accumulated keystrokes use it
+    /// directly. Callers seeding from *composed surrounding text* should use
+    /// [`feed_context_gated`], which round-trip-checks the reconstruction.
     pub fn feed_context(&mut self, text: &str) -> bool {
         let (context, _) = telex_context_from_surrounding(text);
         self.engine.feed_context(&context)
     }
 
-    pub fn feed_context_for_key(&mut self, text: &str, next_key: char) -> bool {
-        let context = telex_context_from_surrounding_for_key(text, next_key);
+    /// Seed from **composed** surrounding text, with a render-gate.
+    ///
+    /// The seed is reconstructed by reversing composed glyphs back into telex
+    /// keystrokes, which is lossy for a minority of inputs (e.g. multi-syllable
+    /// runs with no space: "ơiời" → "owiowfi"). Feeding a reconstruction that
+    /// does NOT render back to the original glyphs loads garbage engine state
+    /// and corrupts the next keystroke, so we round-trip-check first and refuse
+    /// to seed on mismatch — the engine stays untouched and the caller treats
+    /// the word as foreign text (retroactive editing disabled for it). For real
+    /// Vietnamese single syllables the reconstruction is faithful and the gate
+    /// is inert. Returns `true` only if the seed round-tripped AND was fed.
+    pub fn feed_context_gated(&mut self, text: &str) -> bool {
+        let (context, _) = telex_context_from_surrounding(text);
+        if self.render(&context) != text {
+            return false;
+        }
         self.engine.feed_context(&context)
     }
 
@@ -141,68 +190,6 @@ pub fn telex_context_from_surrounding(text: &str) -> (String, Vec<u8>) {
         }
     }
     (result, widths)
-}
-
-fn telex_context_from_surrounding_for_key(text: &str, next_key: char) -> String {
-    let preserve_vowel_shape = matches!(
-        next_key,
-        'a' | 'e'
-            | 'i'
-            | 'o'
-            | 'u'
-            | 'y'
-            | 's'
-            | 'f'
-            | 'r'
-            | 'x'
-            | 'j'
-            | 'w'
-            | 'A'
-            | 'E'
-            | 'I'
-            | 'O'
-            | 'U'
-            | 'Y'
-            | 'S'
-            | 'F'
-            | 'R'
-            | 'X'
-            | 'J'
-            | 'W'
-    );
-    let mut result = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if preserve_vowel_shape {
-            result.push_str(telex_chars_from_composed(ch));
-        } else {
-            result.push_str(telex_base_chars_from_composed(ch));
-        }
-    }
-    result
-}
-
-fn telex_base_chars_from_composed(ch: char) -> &'static str {
-    match ch {
-        'á' | 'à' | 'ả' | 'ã' | 'ạ' | 'ă' | 'ắ' | 'ằ' | 'ẳ' | 'ẵ' | 'ặ' | 'â' | 'ấ' | 'ầ' | 'ẩ'
-        | 'ẫ' | 'ậ' => "a",
-        'Á' | 'À' | 'Ả' | 'Ã' | 'Ạ' | 'Ă' | 'Ắ' | 'Ằ' | 'Ẳ' | 'Ẵ' | 'Ặ' | 'Â' | 'Ấ' | 'Ầ' | 'Ẩ'
-        | 'Ẫ' | 'Ậ' => "A",
-        'đ' => "d",
-        'Đ' => "D",
-        'é' | 'è' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ế' | 'ề' | 'ể' | 'ễ' | 'ệ' => "e",
-        'É' | 'È' | 'Ẻ' | 'Ẽ' | 'Ẹ' | 'Ê' | 'Ế' | 'Ề' | 'Ể' | 'Ễ' | 'Ệ' => "E",
-        'í' | 'ì' | 'ỉ' | 'ĩ' | 'ị' => "i",
-        'Í' | 'Ì' | 'Ỉ' | 'Ĩ' | 'Ị' => "I",
-        'ó' | 'ò' | 'ỏ' | 'õ' | 'ọ' | 'ô' | 'ố' | 'ồ' | 'ổ' | 'ỗ' | 'ộ' | 'ơ' | 'ớ' | 'ờ' | 'ở'
-        | 'ỡ' | 'ợ' => "o",
-        'Ó' | 'Ò' | 'Ỏ' | 'Õ' | 'Ọ' | 'Ô' | 'Ố' | 'Ồ' | 'Ổ' | 'Ỗ' | 'Ộ' | 'Ơ' | 'Ớ' | 'Ờ' | 'Ở'
-        | 'Ỡ' | 'Ợ' => "O",
-        'ú' | 'ù' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ứ' | 'ừ' | 'ử' | 'ữ' | 'ự' => "u",
-        'Ú' | 'Ù' | 'Ủ' | 'Ũ' | 'Ụ' | 'Ư' | 'Ứ' | 'Ừ' | 'Ử' | 'Ữ' | 'Ự' => "U",
-        'ý' | 'ỳ' | 'ỷ' | 'ỹ' | 'ỵ' => "y",
-        'Ý' | 'Ỳ' | 'Ỷ' | 'Ỹ' | 'Ỵ' => "Y",
-        _ => telex_chars_from_composed(ch),
-    }
 }
 
 fn telex_chars_from_composed(ch: char) -> &'static str {
@@ -442,12 +429,11 @@ mod tests {
         assert_eq!(type_str(&mut eng, "hieeus"), "hiếu");
     }
 
-    /// Regression for the IBus v1 raw_word seeding path: before every key the
-    /// daemon resets the engine and `feed_context`s the accumulated raw ASCII
-    /// prefix. A tone after a vowel-cluster transform (`ee`→ê then `s`) must
-    /// still land on the cluster vowel — i.e. produce `hiếu`, not `hiêí`. This
-    /// pins that `feed_context` rebuilds the cluster so the seed-per-key model
-    /// the IBus adapter relies on stays correct.
+    /// Pins that `feed_context` rebuilds a vowel cluster from raw ASCII: feeding
+    /// the accumulated prefix before each key and then the key, a tone after a
+    /// cluster transform (`ee`→ê then `s`) must still land on the cluster vowel —
+    /// `hiếu`, not `hiêí`. The continuous word-start seed relies on this
+    /// reconstruction being faithful.
     #[test]
     fn feed_context_per_key_preserves_vowel_cluster() {
         let mut eng = EngineState::new(InputMethod::Telex);
@@ -486,18 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn feed_context_for_key_preserves_vowel_shape_for_uppercase_tone_key() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert!(eng.feed_context_for_key("khôn", 'R'));
-
-        let r = eng.process_key('R');
-
-        assert!(r.consumed);
-        assert_eq!(r.backspaces, 2);
-        assert_eq!(r.commit, "ổn");
-    }
-
-    #[test]
     fn feed_context_accepts_composed_vietnamese_for_raw_restore() {
         let mut eng = EngineState::new(InputMethod::Telex);
         assert!(eng.feed_context("ră"));
@@ -507,30 +481,6 @@ mod tests {
         assert!(r.consumed);
         assert_eq!(r.backspaces, 1);
         assert_eq!(r.commit, "aw");
-    }
-
-    #[test]
-    fn feed_context_for_key_preserves_vowel_shape_for_uppercase_w_key() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert!(eng.feed_context_for_key("ră", 'W'));
-
-        let r = eng.process_key('W');
-
-        assert!(r.consumed);
-        assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "aW");
-    }
-
-    #[test]
-    fn feed_context_for_key_preserves_vowel_shape_for_live_vowel_update() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert!(eng.feed_context_for_key("lòn", 'o'));
-
-        let r = eng.process_key('o');
-
-        assert!(r.consumed);
-        assert_eq!(r.backspaces, 2);
-        assert_eq!(r.commit, "ồn");
     }
 
     #[test]
@@ -788,9 +738,8 @@ mod tests {
         // In Telex, 's' is Tone1 (sắc), so "push" produces "púh"
         // at the engine level.  Auto-restore does NOT fire because
         // 'h' is correctly accepted as a CVC final consonant in
-        // Vietnamese phonology.  The daklak handler must keep
-        // raw_word in sync on backspace so re-seeding doesn't
-        // double-count deleted characters.
+        // Vietnamese phonology, and auto-restore reverts the whole
+        // word when the composition becomes invalid.
         let mut eng = EngineState::new(InputMethod::Telex);
         let mut buf = type_str(&mut eng, "work");
         assert_eq!(buf, "work", "auto-restore should revert 'work'");
@@ -805,5 +754,30 @@ mod tests {
         let mut v = EngineState::new(InputMethod::Vni);
         assert_eq!(type_str(&mut t, "as"), "á");
         assert_eq!(type_str(&mut v, "as"), "as");
+    }
+
+    #[test]
+    fn feed_context_accepts_faithful_reconstruction() {
+        // A real single syllable reverse-telexes faithfully ("tiê" → "tiee" →
+        // renders "tiê"), so the gate passes and the engine is seeded: a tone
+        // key then edits the existing vowel instead of starting fresh.
+        let mut e = EngineState::new(InputMethod::Telex);
+        assert!(e.feed_context_gated("tiê"));
+        let r = e.process_key('s');
+        assert_eq!((r.backspaces, r.commit.as_str()), (1, "ế"));
+    }
+
+    #[test]
+    fn feed_context_rejects_lossy_reconstruction() {
+        // "ơiời" reverse-telexes to "owiowfi", which renders back to "owiowfi"
+        // (NOT "ơiời") — a lossy reconstruction. The render-gate must refuse to
+        // seed and leave the engine pristine, so a following key starts a fresh
+        // word rather than composing against corrupt state.
+        let mut e = EngineState::new(InputMethod::Telex);
+        assert!(!e.feed_context_gated("ơiời"));
+        assert!(
+            e.at_word_beginning(),
+            "rejected seed must leave the engine untouched"
+        );
     }
 }

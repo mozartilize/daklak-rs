@@ -1,4 +1,4 @@
-//! The composition brain. Owns engine + strategy + raw_word + the
+//! The composition brain. Owns engine + strategy + shadow + the
 //! surrounding-text reseed gate, transport-neutral. Each transport
 //! (wayland / ibus / evdev) is thin glue that translates its wire events
 //! into `Composer` calls; the composition logic lives here once.
@@ -141,22 +141,6 @@ pub struct Composer {
     /// engine state.
     pub last_input_char: Option<char>,
 
-    /// v1/KWin path: original Telex chars typed in the current word
-    /// (ASCII). Reset on word boundary. Used to seed the engine on every
-    /// keystroke so multi-char tone rules see the full raw context
-    /// (engine forgets internal state after returning a transform, so
-    /// `tieengs`'s sắc tone only fires when fed `tieeng` not `tiêng`).
-    pub raw_word: String,
-    /// v1/KWin path: number of raw_word entries that produced each visible
-    /// screen char in the current word. Invariant: sum(raw_word_screen_widths)
-    /// == raw_word.len(). Used by feed_backspace to pop the correct number
-    /// of raw keystrokes when a single screen char was produced by multiple
-    /// raw chars (e.g. Telex 'u'+'s' → 'ú': width=2, so BS over 'ú' must
-    /// pop both 'u' and 's' from raw_word, not just one).
-    pub raw_word_screen_widths: Vec<u8>,
-    raw_word_from_surrounding: bool,
-    suppress_raw_word_seed_after_plain_backspace: bool,
-
     /// When true, `delete_surrounding_text` emits a CHAR count rather than the
     /// spec-compliant byte count. Set at activate when `app_id` matches
     /// `force_chars_delete_apps` (firefox by default). Other v3 clients honor
@@ -249,10 +233,6 @@ impl Composer {
             method: backspace_method,
             last_keystroke_at: Instant::now(),
             last_input_char: None,
-            raw_word: String::new(),
-            raw_word_screen_widths: Vec::new(),
-            raw_word_from_surrounding: false,
-            suppress_raw_word_seed_after_plain_backspace: false,
             delete_in_chars: false,
             debounce_barrier: false,
             commit_string_functional: true,
@@ -334,16 +314,12 @@ impl Composer {
     /// Reset compose state — call on deactivate / navigation key /
     /// modifier shortcut / external cursor movement / word boundary
     /// (space/Enter/Tab). Wipes everything tracking an in-progress word:
-    /// engine, shadow, raw_word, last_input_char, and the v1 surrounding-text
-    /// diff bookkeeping (prev_text, prev_cursor).
+    /// engine, shadow, last_input_char, and the surrounding-text diff
+    /// bookkeeping (prev_text, prev_cursor).
     pub fn full_reset(&mut self) {
         self.engine.reset();
         self.edit.reset();
         self.last_input_char = None;
-        self.raw_word.clear();
-        self.raw_word_screen_widths.clear();
-        self.raw_word_from_surrounding = false;
-        self.suppress_raw_word_seed_after_plain_backspace = false;
     }
 
     /// Check 2-second idle heuristic. Returns true (and resets engine) if
@@ -365,75 +341,36 @@ impl Composer {
 
     // ── composition ───────────────────────────────────────────────────────
 
-    /// Feed one printable char on the **v1/raw_word path** (client already
-    /// inserted the char; we observe surrounding text). This is the only path
-    /// production uses — shared by KWin/v1 and IBus. The v2/wlroots key-grab
-    /// path (shadow does NOT yet contain the char) is reachable via
-    /// `feed_key_inner(.., false)` and is exercised only by the characterization
-    /// tests.
+    /// Feed one printable char. The engine runs **continuously** — each key
+    /// builds on the prior engine state (no per-key reset), so vowel-cluster
+    /// context survives transforms (`tieengs`'s sắc tone lands on `iê` because
+    /// the engine still holds the cluster). Used by every transport: wayland
+    /// (KWin v1 + wlroots v2), IBus, and evdev.
+    ///
+    /// When starting a fresh word, the engine is seeded from the word before the
+    /// cursor in `shadow` (retroactive editing). The seed is **render-gated** — a
+    /// shadow word whose reverse-telex doesn't round-trip (e.g. English "wor",
+    /// which telex-misreads as "ở") must NOT seed, or the next key composes
+    /// against garbage (`wor`+`d` → a bogus delete-2 edit instead of plain
+    /// "word"). On gate failure the engine stays fresh and the key starts anew.
     pub fn feed_key(&mut self, ch: char) -> KeyDecision {
-        self.feed_key_inner(ch, true)
-    }
-
-    pub fn feed_key_without_client_insert(&mut self, ch: char) -> KeyDecision {
-        self.feed_key_inner(ch, false)
-    }
-
-    /// `shadow_already_has_ch`: `true` for the v1/KWin + IBus surrounding-text
-    /// path — the client already inserted the char, so shadow reflects
-    /// post-insertion text. The word-boundary seed uses raw_word instead.
-    /// `false` for the v2/wlroots key-grab path — shadow does NOT contain the
-    /// char yet, so the engine seeds from shadow at the word boundary.
-    pub(crate) fn feed_key_inner(&mut self, ch: char, shadow_already_has_ch: bool) -> KeyDecision {
         let prev_was_separator = matches!(
             self.last_input_char,
             Some(c) if !c.is_ascii_alphabetic()
         );
         self.last_input_char = Some(ch);
 
-        // v1/KWin path: maintain raw_word and use it as the engine seed on
-        // EVERY keystroke. Engine forgets vowel-cluster context after
-        // returning a transform (e.g. after `ee → ê` engine no longer
-        // recognizes `iê` as a vowel cluster when 's' tone arrives later).
-        // Feeding the original raw ASCII chars sidesteps that.
-        if shadow_already_has_ch {
-            // Word boundary: reset raw_word.
-            if !ch.is_ascii_alphabetic() {
-                self.raw_word.clear();
-                self.raw_word_screen_widths.clear();
-                self.raw_word_from_surrounding = false;
-                self.suppress_raw_word_seed_after_plain_backspace = false;
-            }
-            let prefix = self.raw_word.clone();
-            self.engine.reset();
-            if !self.suppress_raw_word_seed_after_plain_backspace && !prefix.is_empty() {
-                tracing::debug!(prefix, "seed engine from raw_word (v1 path)");
-                self.engine.feed_context_for_key(&prefix, ch);
-            }
-            // Append `ch` AFTER seeding (engine's process_key adds it). For a
-            // word seeded from surrounding composed text, raw_word tracks the
-            // current visible word; transforms edit that visible word below,
-            // while no-edit keys append there.
-            if ch.is_ascii_alphabetic() && !self.raw_word_from_surrounding {
-                self.raw_word.push(ch);
-                self.raw_word_from_surrounding = false;
-            }
-        } else {
-            // v2/wlroots path: original shadow-based seed.
-            if self.engine.at_word_beginning() && !prev_was_separator {
-                let shadow_text = self.edit.shadow_text().to_owned();
-                let raw_word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
-                if !raw_word.is_empty() && raw_word.chars().all(|c| c.is_ascii_lowercase()) {
-                    tracing::debug!(word = raw_word, "seed engine from shadow at word boundary");
-                    self.engine.feed_context(raw_word);
-                }
+        if self.engine.at_word_beginning() && !prev_was_separator {
+            let shadow_text = self.edit.shadow_text().to_owned();
+            let raw_word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
+            if !raw_word.is_empty() && raw_word.chars().all(|c| c.is_ascii_lowercase()) {
+                tracing::debug!(word = raw_word, "seed engine from shadow at word boundary");
+                self.engine.feed_context_gated(raw_word);
             }
         }
 
         let r = self.engine.process_key(ch);
-
         self.last_keystroke_at = Instant::now();
-
         tracing::debug!(
             ch = %ch,
             consumed = r.consumed,
@@ -443,52 +380,7 @@ impl Composer {
             "engine.process_key"
         );
 
-        // v1/KWin path: maintain raw_word_screen_widths in sync with raw_word.
-        // raw_word_screen_widths[i] = how many raw chars produced screen char i.
-        // Invariant: sum(raw_word_screen_widths) == raw_word.len().
-        let v1_identity_output = shadow_already_has_ch
-            && r.consumed
-            && r.backspaces == 0
-            && r.commit.chars().eq(std::iter::once(ch));
-        if shadow_already_has_ch && ch.is_ascii_alphabetic() {
-            if r.consumed && !v1_identity_output && self.raw_word_from_surrounding {
-                for _ in 0..r.backspaces {
-                    self.raw_word.pop();
-                    self.raw_word_screen_widths.pop();
-                }
-                self.raw_word.push_str(&r.commit);
-                self.raw_word_screen_widths
-                    .extend(std::iter::repeat(1u8).take(r.commit.chars().count()));
-            } else if r.consumed && !v1_identity_output {
-                // Engine deleted r.backspaces screen chars and emitted r.commit.
-                // Pop r.backspaces widths (sum = s); the new raw chars for all
-                // commit screen chars together cost s + 1 (the current ch).
-                let s: usize = (0..r.backspaces)
-                    .map(|_| self.raw_word_screen_widths.pop().unwrap_or(1) as usize)
-                    .sum();
-                let total = s + 1; // raw chars to distribute across commit chars
-                let m = r.commit.chars().count().max(1);
-                // Push 1 for the first m-1 commit chars; all remaining raw
-                // chars go to the last one (ensures sum == total == raw_word
-                // growth since last clear).
-                for _ in 0..m.saturating_sub(1) {
-                    self.raw_word_screen_widths.push(1);
-                }
-                let last_width = total.saturating_sub(m.saturating_sub(1)).max(1) as u8;
-                self.raw_word_screen_widths.push(last_width);
-            } else {
-                if self.raw_word_from_surrounding && ch.is_ascii_alphabetic() {
-                    self.raw_word.push(ch);
-                    self.raw_word_screen_widths.push(1);
-                }
-                // ForwardRaw: one raw char → one screen char.
-                if !self.raw_word_from_surrounding {
-                    self.raw_word_screen_widths.push(1);
-                }
-            }
-        }
-
-        if r.consumed && !v1_identity_output {
+        if r.consumed {
             let method = self.method;
             KeyDecision::Apply {
                 method,
@@ -509,33 +401,6 @@ impl Composer {
             "engine.process_backspace"
         );
 
-        // v1/KWin path: raw_word tracks raw keystrokes so backspace must
-        // pop the raw entries that produced the deleted screen char.
-        // raw_word_screen_widths[last] tells us how many raw chars to remove
-        // (e.g. Telex 'u'+'s' produced 'ú' → width=2 → BS over 'ú' pops
-        // both 's' and 'u', leaving raw_word consistent with the screen).
-        let popped_width = self.raw_word_screen_widths.pop();
-        {
-            let width = popped_width.unwrap_or(1) as usize;
-            for _ in 0..width {
-                self.raw_word.pop();
-            }
-        }
-
-        // If the engine restored chars (e.g. tone-undo: 'ú' → 'u', or
-        // vowel-undo: 'ê' → 'ee'), push them back into raw_word so the
-        // next keystroke seeds the engine with correct context.  Only do
-        // this when we were actively tracking (popped_width.is_some()),
-        // i.e. the v1 path — in v2 raw_word_screen_widths is always empty.
-        if popped_width.is_some() && !r.commit.is_empty() {
-            for ch in r.commit.chars() {
-                if ch.is_ascii_alphabetic() {
-                    self.raw_word.push(ch);
-                    self.raw_word_screen_widths.push(1);
-                }
-            }
-        }
-
         if r.consumed {
             self.last_keystroke_at = Instant::now();
             let method = self.method;
@@ -547,7 +412,6 @@ impl Composer {
         } else {
             tracing::trace!("BS not consumed → forward");
             self.edit.pop_forwarded_char();
-            self.suppress_raw_word_seed_after_plain_backspace = popped_width.unwrap_or(1) == 1;
             self.last_keystroke_at = Instant::now();
             KeyDecision::ForwardRaw
         }
@@ -656,24 +520,12 @@ impl Composer {
         if deletion {
             if !deletion_already_applied {
                 self.engine.reset();
-                self.raw_word.clear();
-                self.raw_word_screen_widths.clear();
-                self.raw_word_from_surrounding = false;
-                self.suppress_raw_word_seed_after_plain_backspace = false;
             }
         } else if decision.reseed {
             let word = current_word_before_insertion_point(text, cursor, anchor);
             self.engine.reset();
-            self.suppress_raw_word_seed_after_plain_backspace = false;
-            if !word.is_empty() && self.engine.feed_context(word) {
+            if !word.is_empty() && self.engine.feed_context_gated(word) {
                 tracing::debug!(word, "re-seed engine (activate or cursor jump)");
-                self.raw_word_screen_widths = vec![1u8; word.chars().count()];
-                self.raw_word = word.to_owned();
-                self.raw_word_from_surrounding = true;
-            } else {
-                self.raw_word.clear();
-                self.raw_word_screen_widths.clear();
-                self.raw_word_from_surrounding = false;
             }
         }
 
@@ -1010,8 +862,14 @@ mod tests {
 
         c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
 
+        // 'g' is a plain continuation of "khôn" → forwarded raw. The engine
+        // keeps "không" as running context, so a following tone key still edits
+        // it (proving the word survived the jump-in without a raw trail).
         assert!(matches!(c.feed_key('g'), KeyDecision::ForwardRaw));
-        assert_eq!(c.raw_word, "không");
+        match c.feed_key('s') {
+            KeyDecision::Apply { commit, .. } => assert_eq!(commit, "ống"),
+            _ => panic!("expected tone edit on kept 'không'"),
+        }
     }
 
     #[test]
@@ -1061,12 +919,17 @@ mod tests {
             _ => panic!("expected tone update"),
         }
 
+        // 'i' makes the syllable un-composable → raw restore. On the continuous
+        // engine the restore is the full keystroke history (seed "six" + typed
+        // "sxi" = "sixsxi"), not the reset-per-key path's cleaner "sixi". Both
+        // are just a literal echo of a nonsense sequence; the continuous form is
+        // what IBus/wayland now produce.
         match c.feed_key('i') {
             KeyDecision::Apply {
                 backspaces, commit, ..
             } => {
                 assert_eq!(backspaces, 2);
-                assert_eq!(commit, "sixi");
+                assert_eq!(commit, "sixsxi");
             }
             _ => panic!("expected raw restore"),
         }
@@ -1102,21 +965,14 @@ mod tests {
     }
 
     #[test]
-    fn v1_identity_vowel_output_forwards_raw_instead_of_committing_duplicate() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-
-        assert!(matches!(c.feed_key('i'), KeyDecision::ForwardRaw));
-        assert_eq!(c.raw_word, "i");
-        assert_eq!(c.raw_word_screen_widths, vec![1]);
-        assert_eq!(c.shadow_text(), "i");
-    }
-
-    #[test]
     fn recent_implausible_surrounding_echo_does_not_clobber_shadow() {
         let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
 
         c.mark_action();
-        assert!(matches!(c.feed_key('i'), KeyDecision::ForwardRaw));
+        // First key 'i' (shape is path-dependent; this test is about the echo,
+        // not the key). The implausible "ii" cursor=0 frame must be dropped so
+        // shadow stays "i" and the next tone key composes against it.
+        let _ = c.feed_key('i');
         c.observe_surrounding_bytes("i", ByteCursor(1), ByteCursor(1), false);
         c.observe_surrounding_bytes("ii", ByteCursor(0), ByteCursor(0), false);
 
@@ -1145,7 +1001,7 @@ mod tests {
         // Type "tra" so the shadow holds the prefix the autocomplete selects past.
         for ch in "tra".chars() {
             c.mark_action();
-            assert!(matches!(c.feed_key_without_client_insert(ch), KeyDecision::ForwardRaw));
+            assert!(matches!(c.feed_key(ch), KeyDecision::ForwardRaw));
         }
         assert_eq!(c.shadow_text(), "tra");
 
@@ -1168,13 +1024,15 @@ mod tests {
         // An EXTERNAL delete is by definition not our own recent action — the
         // user deleted via some other channel. Model that with `defer_action`
         // (rolls the action clock back) so the delete frame is trusted and the
-        // engine/raw_word reset. A delete frame inside the recent-action window
+        // engine resets. A delete frame inside the recent-action window
         // is instead our own delete_surrounding_text echo and must be dropped.
         c.defer_action();
         c.observe_surrounding_bytes("wor", ByteCursor(3), ByteCursor(3), false);
 
         assert_eq!(c.shadow_text(), "wor");
-        assert_eq!(c.raw_word, "");
+        // After the external delete, 'd' continues the English word: the shadow
+        // word "wor" is render-gated (telex-misreads, so no seed) and 'd' is
+        // forwarded raw → "word", not recomposed into the deleted word.
         match c.feed_key('d') {
             KeyDecision::ForwardRaw => {}
             KeyDecision::Apply { backspaces, commit, .. } => {
@@ -1182,7 +1040,6 @@ mod tests {
             }
             KeyDecision::Consumed => panic!("expected raw 'd', got consumed"),
         }
-        assert_eq!(c.raw_word, "d");
     }
 
     #[test]
@@ -1196,7 +1053,6 @@ mod tests {
         c.observe_surrounding_bytes("wor", ByteCursor(3), ByteCursor(3), false);
 
         assert_eq!(c.shadow_text(), "wor");
-        assert_eq!(c.raw_word, "wor");
         match c.feed_key('d') {
             KeyDecision::ForwardRaw => {}
             KeyDecision::Apply { backspaces, commit, .. } => {
@@ -1204,7 +1060,6 @@ mod tests {
             }
             KeyDecision::Consumed => panic!("expected raw 'd', got consumed"),
         }
-        assert_eq!(c.raw_word, "word");
     }
 
     #[test]
@@ -1221,7 +1076,6 @@ mod tests {
         }
         c.observe_surrounding_bytes("work", ByteCursor(4), ByteCursor(4), false);
         assert_eq!(c.shadow_text(), "ư");
-        assert_eq!(c.raw_word, "w");
 
         c.mark_action();
         assert!(matches!(c.feed_key('o'), KeyDecision::ForwardRaw));
@@ -1242,7 +1096,6 @@ mod tests {
             _ => panic!("expected k transform"),
         }
         c.observe_surrounding_bytes("work", ByteCursor(4), ByteCursor(4), false);
-        assert_eq!(c.raw_word, "work");
         assert_eq!(c.shadow_text(), "work");
 
         c.defer_action();
@@ -1269,7 +1122,6 @@ mod tests {
         let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
 
         c.observe_surrounding_bytes("doesnt", ByteCursor(6), ByteCursor(6), true);
-        assert_eq!(c.raw_word, "doesnt");
 
         for expected in ["doesn", "does", "doe"] {
             assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
@@ -1289,7 +1141,6 @@ mod tests {
             c.observe_surrounding_bytes(&text, ByteCursor(text.len() as u32), ByteCursor(text.len() as u32), false);
         }
 
-        assert_eq!(c.raw_word, "doesnt");
         assert_eq!(c.shadow_text(), "doesnt");
     }
 
@@ -1425,7 +1276,7 @@ mod tests {
     /// intermediate "" frame after the 'r' delete+commit) was trusted, reset
     /// the engine mid-word, and the deconversion never ran → "ửod".
     ///
-    /// v2 path: keys arrive via `feed_key_without_client_insert`; each surrounding
+    /// v2 path: keys arrive via `feed_key`; each surrounding
     /// frame the compositor echoes is replayed verbatim through the reseed gate.
     #[test]
     fn v2_first_word_invalid_syllable_deconverts_despite_delete_echo() {
@@ -1444,7 +1295,7 @@ mod tests {
                          ch: char|
          -> KeyDecision {
             c.mark_action();
-            let d = c.feed_key_without_client_insert(ch);
+            let d = c.feed_key(ch);
             match &d {
                 KeyDecision::ForwardRaw => visible.push(ch),
                 KeyDecision::Apply { backspaces, commit, .. } => {
@@ -1513,7 +1364,7 @@ mod tests {
                          ch: char|
          -> KeyDecision {
             c.mark_action();
-            let d = c.feed_key_without_client_insert(ch);
+            let d = c.feed_key(ch);
             match &d {
                 KeyDecision::ForwardRaw => visible.push(ch),
                 KeyDecision::Apply { backspaces, commit, .. } => {
@@ -1697,8 +1548,8 @@ mod tests {
         // Regression: gedit on Enter resets surrounding text. User had
         // "đường" then pressed Enter and typed 'D'. text="D" cursor=1 vs
         // prev_text="đường" prev_cursor=9. Cursor went DOWN — must NOT be
-        // detected as a 1-char keystroke (would feed 'D' into engine
-        // without resetting raw_word).
+        // detected as a 1-char keystroke (would feed 'D' into the engine
+        // without resetting it).
         assert!(!oci("đường", 9, "D", 1));
     }
 
