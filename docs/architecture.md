@@ -11,6 +11,7 @@ flows from device to committed text.
 - [Workspace crates](#workspace-crates)
 - [The brain vs the transports](#the-brain-vs-the-transports)
 - [Data flow](#data-flow)
+- [Composition & seeding](#composition--seeding)
 - [Crate responsibilities](#crate-responsibilities)
 
 ## Guiding principle
@@ -91,6 +92,29 @@ A single composing keystroke, end to end:
    `BackSpace` keys, uinput injection, or the synthesized-keymap path — and then
    commits the corrected text.
 6. The shadow is updated to match.
+
+## Composition & seeding
+
+The Composer owns exactly **two** pieces of word state, with a strict division:
+
+- **the engine** owns the *composition* state — the in-progress syllable and the
+  raw keystrokes behind it (vnkey keeps its own keystroke buffer internally).
+- **the shadow** owns daklak's mirror of the **app's visible text** before the
+  cursor. It is the only thing daklak itself tracks per word.
+
+Daklak keeps no third copy. The engine runs **continuously**: every printable
+key is fed to it *without resetting it between keys*, so vowel-cluster context
+survives across transforms — typing `tieengs`, the sắc tone lands on `iê`
+because the engine still holds the cluster. All three transports (wayland IM
+v1/v2, IBus, evdev) use this one path, `Composer::feed_key`.
+
+Retroactive editing — the cursor jumping into existing text — is the only time
+the engine is **(re)seeded**: the word before the cursor is read from the shadow
+and fed back via `feed_context_gated`. That seed is **render-gated**: the
+reconstruction (composed glyphs → telex keystrokes) is replayed and must
+round-trip back to the original glyphs before it is trusted. A word that does
+not round-trip (e.g. English `wor`, which telex-reads as a Vietnamese vowel) is
+left unseeded and typed fresh — never seeded as garbage.
 
 ## Crate responsibilities
 
