@@ -22,6 +22,7 @@ use crate::config::Config;
 
 // Linux evdev code for Backspace.
 pub(crate) const KEY_BACKSPACE: u32 = 14;
+#[cfg(feature = "ibus")]
 pub(crate) const KEY_ESC: u32 = 1;
 // Navigation keys that move the cursor — trigger shadow reset.
 pub(crate) const NAV_KEYS: &[u32] = &[
@@ -312,7 +313,7 @@ impl Daemon {
                 // state coherent across transports.
                 w.commit_string_functional = false;
             }
-            if w.is_duplicate_frame(text, cursor, anchor) {
+            if w.should_skip_surrounding_frame(text, cursor, anchor, false, false) {
                 return;
             }
             w.observe_surrounding_chars(text, CharCursor(cursor), CharCursor(anchor));
@@ -338,11 +339,7 @@ impl Daemon {
 
     /// Create a composer session for a non-Wayland transport (IBus). Idempotent.
     #[cfg(feature = "ibus")]
-    pub fn activate_ibus(
-        &mut self,
-        method: viet_ime_edit_strategy::BackspaceMethod,
-        chars_for_delete: bool,
-    ) {
+    pub fn activate_ibus(&mut self, method: viet_ime_edit_strategy::BackspaceMethod) {
         if self.current_active {
             return;
         }
@@ -351,9 +348,6 @@ impl Daemon {
             method,
             self.config.bracket_shortcuts,
         );
-        // IBus has no Wayland apply-loop sleep, so the debounce barrier is moot
-        // here; only the delete unit matters.
-        c.set_window_quirks(chars_for_delete, false);
         c.set_modifiers(self.modifiers);
         self.composer = Some(c);
         self.current_active = true;
@@ -379,7 +373,6 @@ impl Daemon {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -555,7 +548,9 @@ mod tests {
             for ch in "word".chars() {
                 match d.handle_char(0, ch) {
                     KeyDecision::ForwardRaw => visible.push(ch),
-                    KeyDecision::Apply { backspaces, commit, .. } => {
+                    KeyDecision::Apply {
+                        backspaces, commit, ..
+                    } => {
                         for _ in 0..backspaces {
                             visible.pop();
                         }
@@ -580,14 +575,22 @@ mod tests {
             d.process_key(1, None);
 
             match d.process_key(17, Some('w')) {
-                KeyDecision::Apply { backspaces, ref commit, .. } => {
+                KeyDecision::Apply {
+                    backspaces,
+                    ref commit,
+                    ..
+                } => {
                     assert_eq!(backspaces, 2);
                     assert_eq!(commit, "ơn");
                 }
                 _other => panic!("expected Apply for 'w' after hon + Esc"),
             }
             match d.process_key(31, Some('s')) {
-                KeyDecision::Apply { backspaces, ref commit, .. } => {
+                KeyDecision::Apply {
+                    backspaces,
+                    ref commit,
+                    ..
+                } => {
                     assert_eq!(backspaces, 2);
                     assert_eq!(commit, "ớn");
                 }
@@ -654,9 +657,14 @@ mod tests {
             // helper, not routed into the engine).
             let decision = key(&mut d, KEY_LEFT, None, true);
             assert!(
-                matches!(decision, KeyDecision::Consumed), "nav repeat forwards + consumes"
+                matches!(decision, KeyDecision::Consumed),
+                "nav repeat forwards + consumes"
             );
-            assert_eq!(NAV_KEYS.contains(&KEY_LEFT), true, "sanity: Left is a nav key");
+            assert_eq!(
+                NAV_KEYS.contains(&KEY_LEFT),
+                true,
+                "sanity: Left is a nav key"
+            );
         }
 
         #[test]
@@ -667,7 +675,8 @@ mod tests {
             d.modifiers = ModifierState::CTRL;
             let decision = key(&mut d, KEY_LEFT, None, true);
             assert!(
-                matches!(decision, KeyDecision::Consumed), "Ctrl+Left repeat forwards + consumes"
+                matches!(decision, KeyDecision::Consumed),
+                "Ctrl+Left repeat forwards + consumes"
             );
         }
     }
@@ -720,7 +729,9 @@ mod tests {
             // Its base level for key 38 is 'l', so 'L' is level-shifted → on v1
             // it must be committed as text, not forwarded as a raw keycode.
             match key(&mut d, ImProtocol::ImV1, 'L') {
-                KeyDecision::Apply { backspaces, commit, .. } => {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
                     assert_eq!(backspaces, 0);
                     assert_eq!(commit, "L", "decoded char committed verbatim");
                 }

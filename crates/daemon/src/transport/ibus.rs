@@ -27,12 +27,8 @@ impl viet_ime_ibus_adapter::IbusHandler for Daemon {
             w.set_modifiers(m);
         }
     }
-    fn activate_ibus(
-        &mut self,
-        method: viet_ime_edit_strategy::BackspaceMethod,
-        chars_for_delete: bool,
-    ) {
-        Daemon::activate_ibus(self, method, chars_for_delete);
+    fn activate_ibus(&mut self, method: viet_ime_edit_strategy::BackspaceMethod) {
+        Daemon::activate_ibus(self, method);
     }
     fn deactivate_ibus(&mut self) {
         Daemon::deactivate_ibus(self);

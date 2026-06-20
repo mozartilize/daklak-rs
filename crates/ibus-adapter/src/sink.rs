@@ -8,7 +8,7 @@
 
 use viet_ime_edit_strategy::{KeyState, OutputSink};
 
-use crate::keyval::{evdev_to_keyval, XK_BACKSPACE, IBUS_FORWARD_MASK, IBUS_RELEASE_MASK};
+use crate::keyval::{evdev_to_keyval, IBUS_FORWARD_MASK, IBUS_RELEASE_MASK, XK_BACKSPACE};
 
 /// A pending delete_surrounding_text operation.
 /// offset: chars before cursor to delete (negative = before).
@@ -33,32 +33,23 @@ pub struct IbusSink {
     pub commits: Vec<String>,
     pub deletes: Vec<PendingDelete>,
     pub forwards: Vec<PendingForward>,
-    /// Use char counts for delete_surrounding_text (always true for IBus
-    /// since the IBus protocol measures in Unicode scalars, not bytes).
-    pub chars_for_delete: bool,
 }
 
 impl IbusSink {
-    pub fn new(chars_for_delete: bool) -> Self {
-        Self {
-            chars_for_delete,
-            ..Default::default()
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
 impl OutputSink for IbusSink {
     fn delete_surrounding_text(
         &mut self,
-        before_bytes: u32,
+        _before_bytes: u32,
         before_chars: u32,
-        after_bytes: u32,
+        _after_bytes: u32,
         after_chars: u32,
     ) {
         // IBus DeleteSurroundingText uses Unicode char counts.
-        // before_chars / after_chars are correct regardless of chars_for_delete flag —
-        // chars_for_delete only affects the wayland v1 sink (firefox byte/char issue).
-        let _ = (before_bytes, after_bytes);
         let offset = -(before_chars as i32);
         let n_chars = before_chars + after_chars;
         self.deletes.push(PendingDelete { offset, n_chars });
@@ -93,7 +84,11 @@ impl OutputSink for IbusSink {
             };
         // ForwardKeyEvent keycode follows ProcessKeyEvent input semantics: evdev.
         // IBus frontends that need X11 keycode do the +8 conversion themselves.
-        self.forwards.push(PendingForward { keyval, keycode: key_code, state: s });
+        self.forwards.push(PendingForward {
+            keyval,
+            keycode: key_code,
+            state: s,
+        });
     }
 
     fn vk_modifiers(&mut self, _depressed: u32, _latched: u32, _locked: u32, _group: u32) {
@@ -106,14 +101,17 @@ impl OutputSink for IbusSink {
         let kc = key_code as u32;
         let keyval = if kc == 14 { XK_BACKSPACE } else { return };
         let s = IBUS_FORWARD_MASK | if value == 0 { IBUS_RELEASE_MASK } else { 0 };
-        self.forwards.push(PendingForward { keyval, keycode: kc, state: s });
+        self.forwards.push(PendingForward {
+            keyval,
+            keycode: kc,
+            state: s,
+        });
     }
 
     fn vk_commit_char(&mut self, _time: u32, c: char) -> bool {
         self.commits.push(c.to_string());
         true
     }
-
 }
 
 #[cfg(test)]
@@ -133,7 +131,10 @@ mod tests {
         assert_eq!(sink.forwards[0].state, IBUS_FORWARD_MASK);
         assert_eq!(sink.forwards[1].keycode, 14);
         assert_eq!(sink.forwards[1].keyval, XK_BACKSPACE);
-        assert_eq!(sink.forwards[1].state, IBUS_FORWARD_MASK | IBUS_RELEASE_MASK);
+        assert_eq!(
+            sink.forwards[1].state,
+            IBUS_FORWARD_MASK | IBUS_RELEASE_MASK
+        );
     }
 
     #[test]
@@ -148,6 +149,9 @@ mod tests {
         assert_eq!(sink.forwards[0].state, IBUS_FORWARD_MASK);
         assert_eq!(sink.forwards[1].keycode, 14);
         assert_eq!(sink.forwards[1].keyval, XK_BACKSPACE);
-        assert_eq!(sink.forwards[1].state, IBUS_FORWARD_MASK | IBUS_RELEASE_MASK);
+        assert_eq!(
+            sink.forwards[1].state,
+            IBUS_FORWARD_MASK | IBUS_RELEASE_MASK
+        );
     }
 }

@@ -49,9 +49,9 @@ use wayland_protocols_misc::{
     zwp_input_method_v2::client::zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
     zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
 };
-use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
 #[cfg(feature = "kde")]
 use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_window_management::OrgKdePlasmaWindowManagement;
+use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
 
 use crate::focus::wlr::WlrForeignToplevelBackend;
 
@@ -204,13 +204,6 @@ pub trait AdapterHandler: 'static {
         app_id: Option<String>,
         is_xwayland: bool,
     );
-
-    /// Whether the active window needs a post-apply flush + sleep barrier so
-    /// compositor/client bridge echoes cannot batch with the next key. Delete
-    /// units are threaded separately through `apply_pending -> with_sink`.
-    fn window_debounce_barrier(&self) -> bool {
-        false
-    }
 }
 
 /// Context handed to handler callbacks. Borrows adapter state.
@@ -301,7 +294,6 @@ impl<'a> AdapterCtx<'a> {
         &mut self,
         raw_mods: (u32, u32, u32, u32),
         held_user_kc: Option<u32>,
-        delete_in_chars: bool,
         commit_string_functional: bool,
         f: F,
     ) where
@@ -335,7 +327,6 @@ impl<'a> AdapterCtx<'a> {
                     synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
                     raw_mods,
                     held_user_kc,
-                    delete_in_chars,
                     commit_string_functional,
                     conn,
                     xkb: self.state.xkb.as_ref(),
@@ -360,7 +351,6 @@ impl<'a> AdapterCtx<'a> {
                     synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
                     raw_mods,
                     held_user_kc,
-                    delete_in_chars,
                     commit_string_functional,
                     conn,
                     xkb: self.state.xkb.as_ref(),
@@ -391,7 +381,9 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         // focused app sees a balanced press/release pair.
         self.state.emit_forward_key(time, key, 0);
         self.state.last_forwarded_release = Some((key, Instant::now()));
-        let mut ctx = AdapterCtx { state: &mut self.state };
+        let mut ctx = AdapterCtx {
+            state: &mut self.state,
+        };
         self.handler.on_key_released(&mut ctx, time, key);
     }
 
@@ -405,7 +397,9 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         let ch = self.state.xkb.as_ref().and_then(|x| x.key_to_char(key));
 
         let decision = {
-            let mut ctx = AdapterCtx { state: &mut self.state };
+            let mut ctx = AdapterCtx {
+                state: &mut self.state,
+            };
             self.handler.on_key_pressed(&mut ctx, time, key, ch)
         };
 
@@ -437,18 +431,14 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 let held_user_kc = compute_held_user_kc(&self.state);
 
                 if method == BackspaceMethod::VkOnly {
-                    log_duplicate_tail_diagnostic(
-                        &self.state,
-                        &commit,
-                        backspaces,
-                        held_user_kc,
-                    );
+                    log_duplicate_tail_diagnostic(&self.state, &commit, backspaces, held_user_kc);
                 }
 
                 let raw_mods = self.state.raw_mods;
-                let debounce_barrier = self.handler.window_debounce_barrier();
                 {
-                    let mut ctx = AdapterCtx { state: &mut self.state };
+                    let mut ctx = AdapterCtx {
+                        state: &mut self.state,
+                    };
                     self.handler.apply_pending(
                         &mut ctx,
                         time,
@@ -458,24 +448,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                         raw_mods,
                         held_user_kc,
                     );
-                }
-
-                // Firefox v1↔v3 path debounces surrounding_text echoes
-                // and batches consecutive delete+commit pairs — when two
-                // such pairs arrive in the same render frame, firefox
-                // sums the deletes and keeps only the LAST commit_string,
-                // dropping the leading char of a syllable (`mợ`→`ợ`,
-                // `tự`→`ự`). Force a wayland roundtrip after each apply
-                // so KWin has flushed our events before the next user key
-                // arrives, giving firefox a chance to echo the post-
-                // commit surrounding_text and breaking the batch.
-                if debounce_barrier {
-                    if let Some(c) = &self.state.conn {
-                        let _ = c.flush();
-                    }
-                    tokio::task::block_in_place(|| {
-                        std::thread::sleep(Duration::from_millis(30));
-                    });
                 }
 
                 // (Tail-char drop on space-after-tone on Tier 2
@@ -522,7 +494,9 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
 
         self.state.forwarding_repeat = true;
         let decision = {
-            let mut ctx = AdapterCtx { state: &mut self.state };
+            let mut ctx = AdapterCtx {
+                state: &mut self.state,
+            };
             self.handler.on_key_pressed(&mut ctx, time, key, ch)
         };
 
@@ -589,7 +563,9 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         );
 
         {
-            let mut ctx = AdapterCtx { state: &mut self.state };
+            let mut ctx = AdapterCtx {
+                state: &mut self.state,
+            };
             self.handler.on_done_frame(&mut ctx, &snapshot);
         }
 
@@ -680,7 +656,9 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             }
         }
 
-        let mut ctx = AdapterCtx { state: &mut self.state };
+        let mut ctx = AdapterCtx {
+            state: &mut self.state,
+        };
         self.handler.on_modifiers(&mut ctx, m);
     }
 }
@@ -816,74 +794,76 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
     app.state.seat = Some(seat.clone());
 
     // ── Compositor backend detection: v2 (wlroots) or v1 (KWin/Mutter) ─────
-    let mut profile =
-        if let Ok(v2) = globals.bind::<ZwpInputMethodManagerV2, _, _>(&qh, 1..=1, ()) {
-            // ── v2 (wlroots) path ────────────────────────────────────────────────
-            app.state.im_manager = Some(v2.clone());
+    let mut profile = if let Ok(v2) = globals.bind::<ZwpInputMethodManagerV2, _, _>(&qh, 1..=1, ())
+    {
+        // ── v2 (wlroots) path ────────────────────────────────────────────────
+        app.state.im_manager = Some(v2.clone());
 
-            let vk_manager = globals
-                .bind::<ZwpVirtualKeyboardManagerV1, _, _>(&qh, 1..=1, ())
-                .context("bind zwp_virtual_keyboard_manager_v1")?;
-            app.state.vk_manager = Some(vk_manager.clone());
+        let vk_manager = globals
+            .bind::<ZwpVirtualKeyboardManagerV1, _, _>(&qh, 1..=1, ())
+            .context("bind zwp_virtual_keyboard_manager_v1")?;
+        app.state.vk_manager = Some(vk_manager.clone());
 
-            // Focus source is probed once, after protocol detection, in
-            // `probe_focus` — independent of v1/v2.
+        // Focus source is probed once, after protocol detection, in
+        // `probe_focus` — independent of v1/v2.
 
-            event_queue.roundtrip(&mut app).context("initial roundtrip")?;
+        event_queue
+            .roundtrip(&mut app)
+            .context("initial roundtrip")?;
 
-            let im = v2.get_input_method(&seat, &qh, ());
-            let grab = im.grab_keyboard(&qh, ());
-            let vk = vk_manager.create_virtual_keyboard(&seat, &qh, ());
-            tracing::info!("input method and virtual keyboard created (v2/wlroots)");
+        let im = v2.get_input_method(&seat, &qh, ());
+        let grab = im.grab_keyboard(&qh, ());
+        let vk = vk_manager.create_virtual_keyboard(&seat, &qh, ());
+        tracing::info!("input method and virtual keyboard created (v2/wlroots)");
 
-            // Pre-upload daklak synthetic keymap to vk
-            if let Some(km) = &app.state.daklak_keymap {
-                vk.keymap(1, km.fd.as_fd(), km.size);
-                app.state.keymap_init = true;
-                tracing::info!(
-                    size = km.size,
-                    "vk.keymap → daklak synthetic keymap (pre-uploaded at connect)"
-                );
-            } else {
-                tracing::warn!(
+        // Pre-upload daklak synthetic keymap to vk
+        if let Some(km) = &app.state.daklak_keymap {
+            vk.keymap(1, km.fd.as_fd(), km.size);
+            app.state.keymap_init = true;
+            tracing::info!(
+                size = km.size,
+                "vk.keymap → daklak synthetic keymap (pre-uploaded at connect)"
+            );
+        } else {
+            tracing::warn!(
                     "daklak keymap unavailable at connect; vk awaits compositor keymap passthrough via IM grab"
                 );
-            }
+        }
 
-            app.state.im = Some(im);
-            app.state.grab = Some(grab);
-            app.state.vk = Some(vk);
-            app.state.conn = Some(conn.clone());
+        app.state.im = Some(im);
+        app.state.grab = Some(grab);
+        app.state.vk = Some(vk);
+        app.state.conn = Some(conn.clone());
 
-            // v2/wlroots: vk_manager is bound above (required, errors otherwise)
-            // so the vk keyboard is always present.
-            TransportProfile::for_protocol(ImProtocol::ImV2)
+        // v2/wlroots: vk_manager is bound above (required, errors otherwise)
+        // so the vk keyboard is always present.
+        TransportProfile::for_protocol(ImProtocol::ImV2)
+    } else if let Ok(v1) = globals.bind::<ZwpInputMethodV1, _, _>(&qh, 1..=1, ()) {
+        // ── v1 (KWin/Mutter) path ────────────────────────────────────────────
+        app.state.im_v1 = Some(v1.clone());
+        app.state.conn = Some(conn.clone());
 
-        } else if let Ok(v1) = globals.bind::<ZwpInputMethodV1, _, _>(&qh, 1..=1, ()) {
-            // ── v1 (KWin/Mutter) path ────────────────────────────────────────────
-            app.state.im_v1 = Some(v1.clone());
-            app.state.conn = Some(conn.clone());
+        // Focus source is probed once, after protocol detection, in
+        // `probe_focus` — independent of v1/v2.
 
-            // Focus source is probed once, after protocol detection, in
-            // `probe_focus` — independent of v1/v2.
+        event_queue
+            .roundtrip(&mut app)
+            .context("initial roundtrip")?;
 
-            event_queue.roundtrip(&mut app).context("initial roundtrip")?;
-
-            tracing::info!("input method v1 bound (KWin/Mutter)");
-            TransportProfile::for_protocol(ImProtocol::ImV1)
-
-        } else {
-            anyhow::bail!(
-                "neither zwp_input_method_v2 nor zwp_input_method_v1 exposed by compositor"
-            );
-        };
+        tracing::info!("input method v1 bound (KWin/Mutter)");
+        TransportProfile::for_protocol(ImProtocol::ImV1)
+    } else {
+        anyhow::bail!("neither zwp_input_method_v2 nor zwp_input_method_v1 exposed by compositor");
+    };
 
     // Focus source — probed once, independent of the IM protocol.
     let (focus_source, backend) = probe_focus(&globals, &qh, &mut app);
     profile.focus = focus_source;
     app.state.profile = profile;
 
-    event_queue.roundtrip(&mut app).context("second roundtrip")?;
+    event_queue
+        .roundtrip(&mut app)
+        .context("second roundtrip")?;
 
     let raw = event_queue.as_fd().as_raw_fd();
     let wl_fd = AsyncFd::with_interest(crate::wayland_handle::WlRawFd(raw), Interest::READABLE)
@@ -1003,12 +983,6 @@ mod tests {
     }
 
     #[test]
-    fn adapter_handler_debounce_barrier_is_independent_from_delete_units() {
-        let h = NoopHandler;
-        assert!(!h.window_debounce_barrier());
-    }
-
-    #[test]
     fn press_value_is_2_only_while_forwarding_repeat() {
         // The whole repeat fix hinges on this: a fresh press forwards as
         // wl_keyboard state=1, a key-repeat (state=2) as state=2 so rate-0
@@ -1028,7 +1002,10 @@ mod tests {
         {
             let ctx = AdapterCtx { state: &mut s };
             assert!(!ctx.is_repeat());
-            assert!(!ctx.is_level_shifted(38, 'L'), "no keymap → not level-shifted");
+            assert!(
+                !ctx.is_level_shifted(38, 'L'),
+                "no keymap → not level-shifted"
+            );
         }
         // With a real us keymap, key 38 base = 'l'.
         s.xkb = Some(viet_ime_keymap::xkb::XkbState::us_for_test());

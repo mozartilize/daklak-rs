@@ -1,13 +1,13 @@
 pub mod capability;
 pub mod shadow;
 
-mod surrounding;
 mod forward_key;
+mod surrounding;
 mod uinput_backspace;
 pub mod uinput_device;
 mod vk_only;
 
-pub use capability::{CapabilityProbe, SurroundingFrame, detect_method};
+pub use capability::{detect_method, CapabilityProbe, SurroundingFrame};
 pub use shadow::ShadowBuffer;
 
 use bitflags::bitflags;
@@ -26,6 +26,12 @@ pub enum BackspaceMethod {
     /// `zwp_text_input_v3` — usable for clients that never advertise
     /// text-input-v3 (Qt5/XWayland-via-vk).
     VkOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteUnit {
+    Bytes,
+    Chars,
 }
 
 /// Daemon's decision after processing a single key press. Returned from
@@ -153,10 +159,19 @@ impl Strategy {
         serial: u32,
         time: u32,
         sink: &mut impl OutputSink,
+        delete_unit: DeleteUnit,
     ) {
         match self.method {
             BackspaceMethod::SurroundingText => {
-                surrounding::apply(&mut self.shadow, backspaces, commit, serial, time, sink);
+                surrounding::apply(
+                    &mut self.shadow,
+                    backspaces,
+                    commit,
+                    serial,
+                    time,
+                    sink,
+                    delete_unit,
+                );
             }
             BackspaceMethod::ForwardKey => {
                 forward_key::apply(&mut self.shadow, backspaces, commit, serial, time, sink);
@@ -261,7 +276,8 @@ mod tests {
             self.calls.push(Call::VkKey(time, key_code, state));
         }
         fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
-            self.calls.push(Call::VkModifiers(depressed, latched, locked, group));
+            self.calls
+                .push(Call::VkModifiers(depressed, latched, locked, group));
         }
         fn uinput_key(&mut self, key_code: u16, value: i32) {
             self.calls.push(Call::UinputKey(key_code, value));
@@ -279,12 +295,15 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("a");
         let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink);
-        assert_eq!(sink.calls, vec![
-            Call::DeleteSurroundingText(1, 1, 0, 0), // "a" = 1 byte = 1 char
-            Call::CommitString("â".to_owned()),
-            Call::Commit(1),
-        ]);
+        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
+        assert_eq!(
+            sink.calls,
+            vec![
+                Call::DeleteSurroundingText(1, 1, 0, 0), // "a" = 1 byte = 1 char
+                Call::CommitString("â".to_owned()),
+                Call::Commit(1),
+            ]
+        );
         assert_eq!(s.shadow.text(), "â");
     }
 
@@ -294,10 +313,24 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("â");
         let mut sink = MockSink::default();
-        s.apply(1, "ầ", 1, 0, &mut sink);
+        s.apply(1, "ầ", 1, 0, &mut sink, DeleteUnit::Bytes);
         assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 1, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("ầ".to_owned()));
         assert_eq!(s.shadow.text(), "ầ");
+    }
+
+    #[test]
+    fn tier1_multibyte_delete_can_emit_char_count_primary_length() {
+        // Firefox's stale ContentCacheInParent can interpret the primary
+        // delete length against stale ASCII text. Char mode emits 1 for the
+        // visible scalar even though the shadow char is 2 bytes.
+        let mut s = Strategy::new(BackspaceMethod::SurroundingText);
+        s.shadow.append("ư");
+        let mut sink = MockSink::default();
+        s.apply(1, "ự", 1, 0, &mut sink, DeleteUnit::Chars);
+        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(1, 1, 0, 0));
+        assert_eq!(sink.calls[1], Call::CommitString("ự".to_owned()));
+        assert_eq!(s.shadow.text(), "ự");
     }
 
     #[test]
@@ -309,7 +342,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("phơ");
         let mut sink = MockSink::default();
-        s.apply(1, "ở", 1, 0, &mut sink);
+        s.apply(1, "ở", 1, 0, &mut sink, DeleteUnit::Bytes);
         assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 1, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("ở".to_owned()));
         assert_eq!(s.shadow.text(), "phở");
@@ -322,7 +355,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("tieê");
         let mut sink = MockSink::default();
-        s.apply(4, "tiến", 1, 0, &mut sink);
+        s.apply(4, "tiến", 1, 0, &mut sink, DeleteUnit::Bytes);
         assert_eq!(sink.calls[0], Call::DeleteSurroundingText(5, 4, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("tiến".to_owned()));
     }
@@ -334,13 +367,16 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::ForwardKey);
         s.shadow.append("a");
         let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink);
-        assert_eq!(sink.calls, vec![
-            Call::VkKey(0, 14, KeyState::Pressed),
-            Call::VkKey(0, 14, KeyState::Released),
-            Call::CommitString("â".to_owned()),
-            Call::Commit(1),
-        ]);
+        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
+        assert_eq!(
+            sink.calls,
+            vec![
+                Call::VkKey(0, 14, KeyState::Pressed),
+                Call::VkKey(0, 14, KeyState::Released),
+                Call::CommitString("â".to_owned()),
+                Call::Commit(1),
+            ]
+        );
     }
 
     #[test]
@@ -348,7 +384,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::ForwardKey);
         s.shadow.append("abc");
         let mut sink = MockSink::default();
-        s.apply(3, "x", 2, 5, &mut sink);
+        s.apply(3, "x", 2, 5, &mut sink, DeleteUnit::Bytes);
         // 3×(Pressed,Released) = 6 calls, then CommitString, Commit
         assert_eq!(sink.calls.len(), 8);
         assert_eq!(sink.calls[0], Call::VkKey(5, 14, KeyState::Pressed));
@@ -366,7 +402,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::ForwardKey);
         s.shadow.append("abc");
         let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink);
+        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
         assert_eq!(s.shadow.text(), "abâ");
     }
 
@@ -378,15 +414,18 @@ mod tests {
         s.set_modifiers(ModifierState::empty());
         s.shadow.append("a");
         let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink);
-        assert_eq!(sink.calls, vec![
-            // No mod release (no mods held)
-            Call::UinputKey(14, 1), // BS press
-            Call::UinputKey(14, 0), // BS release
-            // No mod restore
-            Call::CommitString("â".to_owned()),
-            Call::Commit(1),
-        ]);
+        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
+        assert_eq!(
+            sink.calls,
+            vec![
+                // No mod release (no mods held)
+                Call::UinputKey(14, 1), // BS press
+                Call::UinputKey(14, 0), // BS release
+                // No mod restore
+                Call::CommitString("â".to_owned()),
+                Call::Commit(1),
+            ]
+        );
     }
 
     #[test]
@@ -396,15 +435,18 @@ mod tests {
         s.set_modifiers(ModifierState::SHIFT);
         s.shadow.append("a");
         let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink);
-        assert_eq!(sink.calls, vec![
-            Call::UinputKey(42, 0), // LEFTSHIFT release
-            Call::UinputKey(14, 1), // BS press
-            Call::UinputKey(14, 0), // BS release
-            Call::UinputKey(42, 1), // LEFTSHIFT restore
-            Call::CommitString("â".to_owned()),
-            Call::Commit(1),
-        ]);
+        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
+        assert_eq!(
+            sink.calls,
+            vec![
+                Call::UinputKey(42, 0), // LEFTSHIFT release
+                Call::UinputKey(14, 1), // BS press
+                Call::UinputKey(14, 0), // BS release
+                Call::UinputKey(42, 1), // LEFTSHIFT restore
+                Call::CommitString("â".to_owned()),
+                Call::Commit(1),
+            ]
+        );
     }
 
     #[test]
@@ -413,7 +455,7 @@ mod tests {
         s.set_modifiers(ModifierState::SHIFT | ModifierState::CTRL);
         s.shadow.append("a");
         let mut sink = MockSink::default();
-        s.apply(1, "x", 1, 0, &mut sink);
+        s.apply(1, "x", 1, 0, &mut sink, DeleteUnit::Bytes);
         let calls = &sink.calls;
         // Release phase: SHIFT(42)=0, CTRL(29)=0 — order by ModifierState::all_bits()
         assert!(calls.contains(&Call::UinputKey(42, 0)));
@@ -435,16 +477,20 @@ mod tests {
         s.set_modifiers(ModifierState::SHIFT);
         s.shadow.append("ab");
         let mut sink = MockSink::default();
-        s.apply(2, "x", 1, 0, &mut sink);
+        s.apply(2, "x", 1, 0, &mut sink, DeleteUnit::Bytes);
         // Count UinputKey(42, ...) calls — should be exactly 2 (1 release + 1 restore)
-        let shift_calls: Vec<_> = sink.calls.iter()
+        let shift_calls: Vec<_> = sink
+            .calls
+            .iter()
             .filter(|c| matches!(c, Call::UinputKey(42, _)))
             .collect();
         assert_eq!(shift_calls.len(), 2);
         assert_eq!(shift_calls[0], &Call::UinputKey(42, 0)); // release
         assert_eq!(shift_calls[1], &Call::UinputKey(42, 1)); // restore
-        // BS×2 = 4 events
-        let bs_calls: Vec<_> = sink.calls.iter()
+                                                             // BS×2 = 4 events
+        let bs_calls: Vec<_> = sink
+            .calls
+            .iter()
             .filter(|c| matches!(c, Call::UinputKey(14, _)))
             .collect();
         assert_eq!(bs_calls.len(), 4);
@@ -457,13 +503,19 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::VkOnly);
         s.shadow.append("a");
         let mut sink = MockSink::default();
-        s.apply(1, "â", 7, 42, &mut sink);
-        assert_eq!(sink.calls, vec![
-            Call::VkKey(42, 14, KeyState::Pressed),
-            Call::VkKey(42, 14, KeyState::Released),
-            Call::VkCommitChar(42, 'â'),
-        ]);
-        assert!(!sink.calls.iter().any(|c| matches!(c, Call::CommitString(_))));
+        s.apply(1, "â", 7, 42, &mut sink, DeleteUnit::Bytes);
+        assert_eq!(
+            sink.calls,
+            vec![
+                Call::VkKey(42, 14, KeyState::Pressed),
+                Call::VkKey(42, 14, KeyState::Released),
+                Call::VkCommitChar(42, 'â'),
+            ]
+        );
+        assert!(!sink
+            .calls
+            .iter()
+            .any(|c| matches!(c, Call::CommitString(_))));
         assert!(!sink.calls.iter().any(|c| matches!(c, Call::Commit(_))));
         assert_eq!(s.shadow.text(), "â");
     }
@@ -473,11 +525,11 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::VkOnly);
         s.shadow.append("ph");
         let mut sink = MockSink::default();
-        s.apply(0, "ởn", 0, 5, &mut sink);
-        assert_eq!(sink.calls, vec![
-            Call::VkCommitChar(5, 'ở'),
-            Call::VkCommitChar(5, 'n'),
-        ]);
+        s.apply(0, "ởn", 0, 5, &mut sink, DeleteUnit::Bytes);
+        assert_eq!(
+            sink.calls,
+            vec![Call::VkCommitChar(5, 'ở'), Call::VkCommitChar(5, 'n'),]
+        );
         assert_eq!(s.shadow.text(), "phởn");
     }
 
@@ -486,16 +538,19 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::VkOnly);
         s.shadow.append("abc");
         let mut sink = MockSink::default();
-        s.apply(3, "x", 1, 0, &mut sink);
-        assert_eq!(sink.calls, vec![
-            Call::VkKey(0, 14, KeyState::Pressed),
-            Call::VkKey(0, 14, KeyState::Released),
-            Call::VkKey(0, 14, KeyState::Pressed),
-            Call::VkKey(0, 14, KeyState::Released),
-            Call::VkKey(0, 14, KeyState::Pressed),
-            Call::VkKey(0, 14, KeyState::Released),
-            Call::VkCommitChar(0, 'x'),
-        ]);
+        s.apply(3, "x", 1, 0, &mut sink, DeleteUnit::Bytes);
+        assert_eq!(
+            sink.calls,
+            vec![
+                Call::VkKey(0, 14, KeyState::Pressed),
+                Call::VkKey(0, 14, KeyState::Released),
+                Call::VkKey(0, 14, KeyState::Pressed),
+                Call::VkKey(0, 14, KeyState::Released),
+                Call::VkKey(0, 14, KeyState::Pressed),
+                Call::VkKey(0, 14, KeyState::Released),
+                Call::VkCommitChar(0, 'x'),
+            ]
+        );
         assert_eq!(s.shadow.text(), "x");
     }
 
@@ -518,7 +573,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.on_surrounding_text("châ", 4, 4); // "châ" = 4 bytes
         let mut sink = MockSink::default();
-        s.apply(1, "ầ", 1, 0, &mut sink);
+        s.apply(1, "ầ", 1, 0, &mut sink, DeleteUnit::Bytes);
         assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 1, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("ầ".to_owned()));
     }
@@ -543,15 +598,18 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.on_surrounding_text("translate", 3, 9);
         let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink);
-        assert_eq!(sink.calls, vec![
-            Call::VkKey(0, 14, KeyState::Pressed),   // BS 1: clears selection "nslate"
-            Call::VkKey(0, 14, KeyState::Released),
-            Call::VkKey(0, 14, KeyState::Pressed),   // BS 2: deletes 'a'
-            Call::VkKey(0, 14, KeyState::Released),
-            Call::CommitString("â".to_owned()),
-            Call::Commit(1),
-        ]);
+        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
+        assert_eq!(
+            sink.calls,
+            vec![
+                Call::VkKey(0, 14, KeyState::Pressed), // BS 1: clears selection "nslate"
+                Call::VkKey(0, 14, KeyState::Released),
+                Call::VkKey(0, 14, KeyState::Pressed), // BS 2: deletes 'a'
+                Call::VkKey(0, 14, KeyState::Released),
+                Call::CommitString("â".to_owned()),
+                Call::Commit(1),
+            ]
+        );
         assert_eq!(s.shadow.text(), "trâ");
     }
 
