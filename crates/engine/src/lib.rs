@@ -96,7 +96,7 @@ impl EngineState {
     /// will treat non-ASCII as word-break).
     pub fn process_key(&mut self, ch: char) -> ProcessResult {
         let r = self.engine.process(ch as u32);
-        let commit = String::from_utf8(r.output).unwrap_or_default();
+        let commit = String::from_utf8(r.output).expect("vnkey-engine output must be valid UTF-8");
         ProcessResult {
             backspaces: r.backspaces,
             commit,
@@ -108,7 +108,7 @@ impl EngineState {
     /// to (or instead of) forwarding the backspace to the app.
     pub fn process_backspace(&mut self) -> ProcessResult {
         let r = self.engine.process_backspace();
-        let commit = String::from_utf8(r.output).unwrap_or_default();
+        let commit = String::from_utf8(r.output).expect("vnkey-engine output must be valid UTF-8");
         ProcessResult {
             backspaces: r.backspaces,
             commit,
