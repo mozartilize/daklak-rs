@@ -673,10 +673,20 @@ pub fn current_word_before_cursor(text: &str, cursor: u32) -> &str {
     let start = before
         .char_indices()
         .rev()
-        .find(|(_, c)| c.is_whitespace() || *c == '\0')
+        .find(|(_, c)| is_word_boundary(*c))
         .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0);
     &before[start..]
+}
+
+fn is_word_boundary(c: char) -> bool {
+    c.is_whitespace()
+        || c == '\0'
+        || matches!(
+            c,
+            '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | '“' | '”' | '‘' | '’' | '(' | ')'
+                | '[' | ']' | '{' | '}' | '/' | '\\' | '|' | '…'
+        )
 }
 
 fn text_before_cursor(text: &str, cursor: u32) -> &str {
@@ -820,6 +830,28 @@ mod tests {
     #[test]
     fn newline_separates_words() {
         assert_eq!(current_word_before_cursor("line1\nline2", 11), "line2");
+    }
+
+    #[test]
+    fn comma_separates_vietnamese_syllables() {
+        let text = "xin,chào";
+        assert_eq!(current_word_before_cursor(text, text.len() as u32), "chào");
+    }
+
+    #[test]
+    fn delimiters_separate_current_vietnamese_word() {
+        assert_eq!(
+            current_word_before_cursor("(tiếng", "(tiếng".len() as u32),
+            "tiếng"
+        );
+        assert_eq!(
+            current_word_before_cursor("anh/chị", "anh/chị".len() as u32),
+            "chị"
+        );
+        assert_eq!(
+            current_word_before_cursor("“đẹp", "“đẹp".len() as u32),
+            "đẹp"
+        );
     }
 
     #[test]
