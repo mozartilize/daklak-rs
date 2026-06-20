@@ -449,7 +449,7 @@ impl Composer {
         if self.engine.at_word_beginning() && !prev_was_separator {
             let shadow_text = self.edit.shadow_text().to_owned();
             let raw_word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
-            if !raw_word.is_empty() && raw_word.chars().all(|c| c.is_ascii_lowercase()) {
+            if !raw_word.is_empty() {
                 tracing::debug!(word = raw_word, "seed engine from shadow at word boundary");
                 self.engine.feed_context_gated(raw_word);
             }
@@ -673,10 +673,20 @@ pub fn current_word_before_cursor(text: &str, cursor: u32) -> &str {
     let start = before
         .char_indices()
         .rev()
-        .find(|(_, c)| c.is_whitespace() || *c == '\0')
+        .find(|(_, c)| is_word_boundary(*c))
         .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0);
     &before[start..]
+}
+
+fn is_word_boundary(c: char) -> bool {
+    c.is_whitespace()
+        || c == '\0'
+        || matches!(
+            c,
+            '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | '“' | '”' | '‘' | '’' | '(' | ')'
+                | '[' | ']' | '{' | '}' | '/' | '\\' | '|' | '…'
+        )
 }
 
 fn text_before_cursor(text: &str, cursor: u32) -> &str {
@@ -823,6 +833,28 @@ mod tests {
     }
 
     #[test]
+    fn comma_separates_vietnamese_syllables() {
+        let text = "xin,chào";
+        assert_eq!(current_word_before_cursor(text, text.len() as u32), "chào");
+    }
+
+    #[test]
+    fn delimiters_separate_current_vietnamese_word() {
+        assert_eq!(
+            current_word_before_cursor("(tiếng", "(tiếng".len() as u32),
+            "tiếng"
+        );
+        assert_eq!(
+            current_word_before_cursor("anh/chị", "anh/chị".len() as u32),
+            "chị"
+        );
+        assert_eq!(
+            current_word_before_cursor("“đẹp", "“đẹp".len() as u32),
+            "đẹp"
+        );
+    }
+
+    #[test]
     fn selection_after_word_prefix_seeds_prefix_for_both_directions() {
         let text = "the vietnamese";
         let selection_start = "the viet".len() as u32;
@@ -892,6 +924,31 @@ mod tests {
                 assert_eq!(commit, "ỏ");
             }
             _ => panic!("expected tone replacement edit"),
+        }
+    }
+
+    #[test]
+    fn idle_reset_seeds_composed_shadow_for_tone_replacement() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let text = "là";
+
+        c.observe_surrounding_bytes(
+            text,
+            ByteCursor(text.len() as u32),
+            ByteCursor(text.len() as u32),
+            true,
+        );
+        c.last_keystroke_at -= std::time::Duration::from_secs(3);
+
+        assert!(c.check_idle_reset());
+        match c.feed_key('s') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 1);
+                assert_eq!(commit, "á");
+            }
+            _ => panic!("expected tone replacement after idle reset"),
         }
     }
 
