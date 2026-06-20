@@ -44,27 +44,6 @@ impl AdapterHandler for Daemon {
                 method,
                 self.config.bracket_shortcuts,
             );
-            let chars_for_delete = self
-                .focused_app_id
-                .as_deref()
-                .map(|id| {
-                    let lower = id.trim().to_ascii_lowercase();
-                    self.config
-                        .force_chars_delete_apps
-                        .iter()
-                        .any(|t| t.eq_ignore_ascii_case(&lower))
-                })
-                .unwrap_or(false);
-            // firefox needs both the char-count delete AND the post-apply
-            // debounce; they are independent quirks that this app
-            // happens to require together.
-            c.set_window_quirks(chars_for_delete, chars_for_delete);
-            if chars_for_delete {
-                tracing::info!(
-                    app_id = ?self.focused_app_id,
-                    "force_chars_delete_apps match → char-count delete + debounce barrier"
-                );
-            }
             // `commit_string_functional` starts true (the spec default: a v3
             // client is obligated to apply commit_string). It is driven down
             // ONLY by the runtime ST-liveness probe at the ST→FK downgrade —
@@ -127,10 +106,10 @@ impl AdapterHandler for Daemon {
 
             // Duplicate-frame guard. KWin re-emits the same SurroundingText
             // 2-3 times per keystroke. We've already processed this state —
-            // running the reseed logic again resets and burns engine
-            // context. Skip if nothing changed (but never on activate/deactivate
-            // framing, which must always re-evaluate).
-            if !activate && !deactivate && w.is_duplicate_frame(text, *cursor, *anchor) {
+            // running the reseed logic again resets and burns engine context.
+            // Let Composer keep duplicate frames that are still meaningful for
+            // pending correction-echo checks.
+            if w.should_skip_surrounding_frame(text, *cursor, *anchor, activate, deactivate) {
                 return;
             }
 
@@ -323,9 +302,8 @@ impl AdapterHandler for Daemon {
         let serial = ctx.serial();
         if let Some(w) = self.composer.as_mut() {
             tracing::debug!(method = ?w.method, backspaces, commit, "strategy.apply");
-            let delete_in_chars = w.delete_in_chars;
             let commit_string_functional = w.commit_string_functional;
-            ctx.with_sink(raw_mods, held_user_kc, delete_in_chars, commit_string_functional, |sink| {
+            ctx.with_sink(raw_mods, held_user_kc, commit_string_functional, |sink| {
                 w.apply_to_sink(backspaces, commit, serial, time, sink);
             });
         }
@@ -405,9 +383,5 @@ impl AdapterHandler for Daemon {
         } else if !self.synthetic_active && matched {
             tracing::trace!("focus_changed skipped: already active via IM");
         }
-    }
-
-    fn window_debounce_barrier(&self) -> bool {
-        self.composer.as_ref().map(|w| w.debounce_barrier).unwrap_or(false)
     }
 }

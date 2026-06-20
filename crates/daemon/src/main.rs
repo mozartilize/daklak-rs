@@ -20,18 +20,10 @@ fn print_help() {
     println!("Usage: daklak [SUBCOMMAND]");
     println!();
     println!("Subcommands:");
-    println!(
-        "  toggle       Toggle the input method on or off."
-    );
-    println!(
-        "  enable       Turn the input method on."
-    );
-    println!(
-        "  disable      Turn the input method off."
-    );
-    println!(
-        "  status       Print 'on' or 'off' and exit."
-    );
+    println!("  toggle       Toggle the input method on or off.");
+    println!("  enable       Turn the input method on.");
+    println!("  disable      Turn the input method off.");
+    println!("  status       Print 'on' or 'off' and exit.");
     println!(
         "  gen-keymap   Print daklak's synthetic xkb keymap to stdout and exit.\n\
          \x20              Pipe to a file then load it into your compositor manually:\n\
@@ -51,8 +43,7 @@ fn ipc_send(cmd: &str) -> Result<String> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
-    let path = ipc::socket_path()
-        .ok_or_else(|| anyhow::anyhow!("XDG_RUNTIME_DIR not set"))?;
+    let path = ipc::socket_path().ok_or_else(|| anyhow::anyhow!("XDG_RUNTIME_DIR not set"))?;
 
     let mut stream = UnixStream::connect(&path)
         .map_err(|e| anyhow::anyhow!("cannot connect to daklak socket {}: {e}", path.display()))?;
@@ -147,10 +138,8 @@ fn main() -> Result<()> {
 
         #[cfg(feature = "ibus")]
         if config.enable_ibus {
-            let chars_delete_apps = config.force_chars_delete_apps.clone();
             let daemon = handler::Daemon::new(config, enabled.clone());
-            return viet_ime_ibus_adapter::IbusAdapter::run(daemon, enabled, chars_delete_apps)
-                .await;
+            return viet_ime_ibus_adapter::IbusAdapter::run(daemon, enabled).await;
         }
 
         #[cfg(feature = "wayland")]

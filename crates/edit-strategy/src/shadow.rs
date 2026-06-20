@@ -43,11 +43,10 @@ impl ShadowBuffer {
     }
 
     /// Pop `n` chars from the end of the shadow. Returns `(bytes, chars)`
-    /// — the byte count is what wlroots v2/v3 IM (and most v3 clients on
-    /// KWin) want for `delete_surrounding_text(before_length)`; the char
-    /// count is what firefox specifically wants on its KWin v1↔v3 path
-    /// (see `force_chars_delete_apps` config). `chars` may be less than
-    /// the requested `n` if the shadow runs out.
+    /// — the byte count is what text-input-v3 wants for
+    /// `delete_surrounding_text(before_length)`; the char count is what
+    /// IBus wants for its char-indexed equivalent. `chars` may be less
+    /// than the requested `n` if the shadow runs out.
     pub fn pop_chars(&mut self, n: usize) -> (u32, u32) {
         let mut byte_count: u32 = 0;
         let mut char_count: u32 = 0;
@@ -115,11 +114,8 @@ impl ShadowBuffer {
             .find(|i| text.is_char_boundary(*i))
             .unwrap_or(0);
 
-        let unexpected_move = !self.pending_commit
-            && self
-                .last_cursor
-                .map(|last| last != cursor)
-                .unwrap_or(false);
+        let unexpected_move =
+            !self.pending_commit && self.last_cursor.map(|last| last != cursor).unwrap_or(false);
 
         // Sync shadow to compositor's view of text before cursor.
         self.text.clear();

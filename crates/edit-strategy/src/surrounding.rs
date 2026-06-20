@@ -1,4 +1,4 @@
-use crate::{KeyState, OutputSink, ShadowBuffer};
+use crate::{DeleteUnit, KeyState, OutputSink, ShadowBuffer};
 
 /// Linux evdev keycode for Backspace.
 const KEY_BACKSPACE: u32 = 14;
@@ -27,6 +27,7 @@ pub fn apply(
     serial: u32,
     time: u32,
     sink: &mut impl OutputSink,
+    delete_unit: DeleteUnit,
 ) {
     let (before_bytes, before_chars, after_bytes, after_chars) = shadow.pop_delete_span(backspaces);
 
@@ -56,11 +57,27 @@ pub fn apply(
     tracing::debug!(
         before_bytes,
         before_chars,
+        ?delete_unit,
         commit,
         serial,
         "surrounding tier: emit delete_surrounding_text + commit_string"
     );
-    sink.delete_surrounding_text(before_bytes, before_chars, after_bytes, after_chars);
+    let (emit_before, emit_after) = match delete_unit {
+        DeleteUnit::Bytes => (before_bytes, after_bytes),
+        DeleteUnit::Chars => (before_chars, after_chars),
+    };
+    if delete_unit == DeleteUnit::Chars {
+        tracing::info!(
+            before_bytes,
+            before_chars,
+            after_bytes,
+            after_chars,
+            emit_before,
+            emit_after,
+            "surrounding tier: emitting char-count delete fallback"
+        );
+    }
+    sink.delete_surrounding_text(emit_before, before_chars, emit_after, after_chars);
     sink.commit_string(commit);
     sink.commit(serial);
     shadow.append(commit);

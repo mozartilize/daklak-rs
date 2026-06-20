@@ -10,8 +10,8 @@
 //! - ProcessKeyEvent emits all output signals BEFORE returning the bool so that
 //!   D-Bus message ordering guarantees signals arrive before the method reply.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -78,37 +78,19 @@ pub struct EngineState<D> {
     /// focus-in so a *stale* caps=9 from a prior defocus (gedit) doesn't block
     /// that client's legitimate late upgrade.
     caps_cleared_surrounding: bool,
-    /// app_id from FocusInId (lowercase). Used to detect Firefox for
-    /// chars_for_delete.
+    /// app_id from FocusInId (lowercase). Kept for debug tracing.
     client_app_id: Option<String>,
-    /// Default chars_for_delete apps list (from daemon config).
-    chars_delete_apps: Vec<String>,
 }
 
 impl<D> EngineState<D> {
-    pub fn new(daemon: D, enabled: Arc<AtomicBool>, chars_delete_apps: Vec<String>) -> Self {
+    pub fn new(daemon: D, enabled: Arc<AtomicBool>) -> Self {
         Self {
             daemon,
             enabled,
             has_surrounding: true, // optimistic default for GNOME
             caps_cleared_surrounding: false,
             client_app_id: None,
-            chars_delete_apps,
         }
-    }
-
-    fn chars_for_delete(&self) -> bool {
-        // chars_for_delete is a per-app wayland quirk (Firefox v1); for IBus
-        // we always use char counts since IBus protocol uses Unicode scalars.
-        // We keep the flag for future per-app workarounds if needed.
-        self.client_app_id
-            .as_deref()
-            .map(|id| {
-                self.chars_delete_apps
-                    .iter()
-                    .any(|a| a.eq_ignore_ascii_case(id))
-            })
-            .unwrap_or(false)
     }
 }
 
@@ -134,11 +116,14 @@ impl<D: IbusHandler + Send + 'static> Factory<D> {
         #[zbus(object_server)] server: &ObjectServer,
         engine_name: &str,
     ) -> zbus::fdo::Result<zbus::zvariant::OwnedObjectPath> {
-        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let path = format!("/org/freedesktop/IBus/Engine/{id}");
-        let op: zbus::zvariant::OwnedObjectPath = zbus::zvariant::ObjectPath::try_from(path.clone())
-            .map_err(|e| zbus::fdo::Error::Failed(format!("bad path: {e}")))?
-            .into();
+        let op: zbus::zvariant::OwnedObjectPath =
+            zbus::zvariant::ObjectPath::try_from(path.clone())
+                .map_err(|e| zbus::fdo::Error::Failed(format!("bad path: {e}")))?
+                .into();
         let engine = Engine {
             state: self.state.clone(),
         };
@@ -160,7 +145,7 @@ pub trait IbusHandler: Send {
     fn apply_with_sink(&mut self, backspaces: usize, commit: &str, time: u32, sink: &mut IbusSink);
     fn observe_surrounding(&mut self, text: &str, cursor: u32, anchor: u32);
     fn set_modifiers(&mut self, m: viet_ime_edit_strategy::ModifierState);
-    fn activate_ibus(&mut self, method: BackspaceMethod, chars_for_delete: bool);
+    fn activate_ibus(&mut self, method: BackspaceMethod);
     fn deactivate_ibus(&mut self);
     /// React to a routing change mid-session.
     fn update_method(&mut self, method: BackspaceMethod);
@@ -191,9 +176,13 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
             let mut s = self.state.lock().await;
             s.daemon.set_modifiers(mods);
             let decision = s.daemon.process_key(evdev, ch);
-            let sink_opt = if let KeyDecision::Apply { ref backspaces, ref commit, .. } = decision {
-                let chars_for_delete = s.chars_for_delete();
-                let mut sink = IbusSink::new(chars_for_delete);
+            let sink_opt = if let KeyDecision::Apply {
+                ref backspaces,
+                ref commit,
+                ..
+            } = decision
+            {
+                let mut sink = IbusSink::new();
                 s.daemon.apply_with_sink(*backspaces, commit, 0, &mut sink);
                 Some(sink)
             } else {
@@ -227,13 +216,9 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
                         state = fwd.state,
                         "emit ForwardKeyEvent D-Bus signal"
                     );
-                    if let Err(e) = Engine::<D>::forward_key_event(
-                        &emitter,
-                        fwd.keyval,
-                        fwd.keycode,
-                        fwd.state,
-                    )
-                    .await
+                    if let Err(e) =
+                        Engine::<D>::forward_key_event(&emitter, fwd.keyval, fwd.keycode, fwd.state)
+                            .await
                     {
                         tracing::warn!("ForwardKeyEvent failed: {e}");
                     }
@@ -271,7 +256,11 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
         client: &str,
     ) {
         tracing::debug!(object_path, client, "D-Bus FocusInId");
-        let app_id = if client.is_empty() { None } else { Some(client.to_ascii_lowercase()) };
+        let app_id = if client.is_empty() {
+            None
+        } else {
+            Some(client.to_ascii_lowercase())
+        };
         self.do_focus_in(app_id, &emitter).await;
     }
 
@@ -312,7 +301,8 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
         s.caps_cleared_surrounding = !has_surrounding;
         // FocusIn may have latched ForwardKey from a transient caps=9; upgrade
         // now that we know surrounding text is available.
-        s.daemon.update_method(method_for_capability(has_surrounding));
+        s.daemon
+            .update_method(method_for_capability(has_surrounding));
     }
 
     async fn set_cursor_location(&self, _x: i32, _y: i32, _w: i32, _h: i32) {}
@@ -350,7 +340,8 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
                  (Docs-style frame; delete_surrounding_text would be dropped)"
             );
         }
-        s.daemon.observe_surrounding(&text_str, cursor_pos, anchor_pos);
+        s.daemon
+            .observe_surrounding(&text_str, cursor_pos, anchor_pos);
     }
 
     async fn property_activate(&self, _name: &str, _state: u32) {}
@@ -412,14 +403,12 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
             // surrounding frame arrives.
             s.caps_cleared_surrounding = false;
             let method = method_for_capability(s.has_surrounding);
-            let chars_for_delete = s.chars_for_delete();
             tracing::debug!(
                 app_id = ?s.client_app_id,
                 ?method,
-                chars_for_delete,
                 "FocusIn → activate_ibus"
             );
-            s.daemon.activate_ibus(method, chars_for_delete);
+            s.daemon.activate_ibus(method);
             // lock dropped before the .await below
         }
         // Re-assert that we consume surrounding text so the client (re)starts
@@ -463,7 +452,9 @@ fn extract_ibus_text_string(v: &Value<'_>) -> Option<String> {
         Value::Value(boxed) => boxed.as_ref(),
         other => other,
     };
-    let Value::Structure(s) = inner else { return None };
+    let Value::Structure(s) = inner else {
+        return None;
+    };
     let fields = s.fields();
     // Field 0: type name "IBusText"; field 1: attachments; field 2: the string
     if fields.len() < 3 {
@@ -480,7 +471,6 @@ fn extract_ibus_text_string(v: &Value<'_>) -> Option<String> {
 pub async fn run<D: IbusHandler + Send + 'static>(
     daemon: D,
     enabled: Arc<AtomicBool>,
-    chars_delete_apps: Vec<String>,
 ) -> Result<()> {
     let addr = crate::bus::resolve_ibus_address()?;
     tracing::info!(%addr, "connecting to ibus-daemon");
@@ -490,9 +480,7 @@ pub async fn run<D: IbusHandler + Send + 'static>(
         .await
         .map_err(|e| anyhow::anyhow!("connecting to ibus-daemon: {e}"))?;
 
-    let state = Arc::new(tokio::sync::Mutex::new(
-        EngineState::new(daemon, enabled, chars_delete_apps),
-    ));
+    let state = Arc::new(tokio::sync::Mutex::new(EngineState::new(daemon, enabled)));
 
     conn.object_server()
         .at("/org/freedesktop/IBus/Factory", Factory::new(state))

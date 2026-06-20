@@ -70,10 +70,6 @@ pub struct AdapterSink<'a> {
     /// release for that keycode before the normal press/release pair,
     /// transitioning X's state to UP first.
     pub(crate) held_user_kc: Option<u32>,
-    /// Per-window override: when true, `delete_surrounding_text` emits a CHAR
-    /// count rather than the spec-compliant byte count. Independent from the
-    /// post-apply debounce barrier; firefox happens to need both.
-    pub(crate) delete_in_chars: bool,
     /// Wayland connection — used by `commit_via_keysym` to flush after
     /// the batch of emissions so they reach the compositor in one round.
     pub(crate) conn: Option<&'a wayland_client::Connection>,
@@ -105,41 +101,24 @@ impl OutputSink for AdapterSink<'_> {
     fn delete_surrounding_text(
         &mut self,
         before_bytes: u32,
-        before_chars: u32,
+        _before_chars: u32,
         after_bytes: u32,
-        after_chars: u32,
+        _after_chars: u32,
     ) {
         match &self.text_ops {
-            // v2/wlroots: spec says bytes, but firefox's v3 client
-            // counts in chars/ASCII-units and stops at the first
-            // multibyte boundary (e.g. del 3 bytes over "án"=3 bytes
-            // only removes the trailing ASCII 'n', leaving 'á' →
-            // result "tráans" instead of "trans"). Gated per-window
-            // via delete_in_chars (config: force_chars_delete_apps).
+            // v2/wlroots and v1/KWin both use UTF-8 byte counts per the
+            // text-input-v3 spec.
             TextOpsTarget::V2 { im } => {
-                let (before, after) = select_delete_units(
-                    self.delete_in_chars,
-                    before_bytes,
-                    before_chars,
-                    after_bytes,
-                    after_chars,
-                );
-                im.delete_surrounding_text(before, after);
+                im.delete_surrounding_text(before_bytes, after_bytes);
             }
-            // v1: spec is bytes (text-input-unstable-v1.xml), but
-            // firefox's v3 client on KWin's bridge expects chars —
-            // gated per-window via delete_in_chars.
             TextOpsTarget::V1 { ctx, .. } => {
-                let (before, after) = select_delete_units(
-                    self.delete_in_chars,
-                    before_bytes,
-                    before_chars,
-                    after_bytes,
-                    after_chars,
+                let index = -(before_bytes as i32);
+                let length = before_bytes + after_bytes;
+                tracing::trace!(
+                    index,
+                    length,
+                    "delete_surrounding_text emit (text-input channel)"
                 );
-                let index = -(before as i32);
-                let length = before + after;
-                tracing::trace!(index, length, "delete_surrounding_text emit (text-input channel)");
                 ctx.delete_surrounding_text(index, length);
             }
         }
@@ -263,9 +242,7 @@ impl OutputSink for AdapterSink<'_> {
             }
 
             // ── ImV1 path: emit via ctx.keysym() ─────────────────────────
-            TextOpsTarget::V1 { ctx, .. } => {
-                self.commit_via_keysym_v1(ctx, serial, time, text)
-            }
+            TextOpsTarget::V1 { ctx, .. } => self.commit_via_keysym_v1(ctx, serial, time, text),
             // ImV2 with working commit_string: no keysym path, let
             // forward_key fall back to commit_string.
             TextOpsTarget::V2 { .. } => false,
@@ -373,34 +350,5 @@ impl AdapterSink<'_> {
             let _ = conn.flush();
         }
         true
-    }
-}
-
-fn select_delete_units(
-    delete_in_chars: bool,
-    before_bytes: u32,
-    before_chars: u32,
-    after_bytes: u32,
-    after_chars: u32,
-) -> (u32, u32) {
-    if delete_in_chars {
-        (before_chars, after_chars)
-    } else {
-        (before_bytes, after_bytes)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::select_delete_units;
-
-    #[test]
-    fn delete_in_chars_selects_char_counts_without_implying_debounce() {
-        assert_eq!(select_delete_units(true, 6, 2, 3, 1), (2, 1));
-    }
-
-    #[test]
-    fn byte_delete_keeps_spec_byte_counts() {
-        assert_eq!(select_delete_units(false, 6, 2, 3, 1), (6, 3));
     }
 }

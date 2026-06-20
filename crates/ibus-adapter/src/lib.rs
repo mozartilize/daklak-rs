@@ -6,7 +6,7 @@
 //!
 //! Usage from daemon main:
 //! ```ignore
-//! IbusAdapter::run(daemon, enabled, chars_delete_apps).await?;
+//! IbusAdapter::run(daemon, enabled).await?;
 //! ```
 
 pub mod bus;
@@ -27,8 +27,7 @@ impl IbusAdapter {
     pub async fn run<D: IbusHandler + Send + 'static>(
         daemon: D,
         enabled: Arc<AtomicBool>,
-        chars_delete_apps: Vec<String>,
     ) -> Result<()> {
-        engine::run(daemon, enabled, chars_delete_apps).await
+        engine::run(daemon, enabled).await
     }
 }
