@@ -449,7 +449,7 @@ impl Composer {
         if self.engine.at_word_beginning() && !prev_was_separator {
             let shadow_text = self.edit.shadow_text().to_owned();
             let raw_word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
-            if !raw_word.is_empty() && raw_word.chars().all(|c| c.is_ascii_lowercase()) {
+            if !raw_word.is_empty() {
                 tracing::debug!(word = raw_word, "seed engine from shadow at word boundary");
                 self.engine.feed_context_gated(raw_word);
             }
