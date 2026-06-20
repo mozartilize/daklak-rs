@@ -125,6 +125,26 @@ impl EditModel {
 /// produces even one (its surrounding always reflects at least our commits).
 const SURROUNDING_DEAD_STRIKE_LIMIT: u32 = 2;
 
+/// Consecutive SurroundingText corrections (delete + commit, `backspaces > 0`)
+/// whose `delete_surrounding_text` drew NO `SetSurroundingText` echo back,
+/// before the SurroundingText→ForwardKey downgrade fires.
+///
+/// A functional surrounding client round-trips every edit: after our
+/// delete+commit it sends a SetSurroundingText reflecting the new buffer
+/// (gedit echoes `kh`→`khô` etc.). A client that advertises surrounding but
+/// silently no-ops the delete (Google Docs under IBus) emits the commit and
+/// sends nothing back, so the word doubles (`Tiếng` → `Tieêngếng`). Capability
+/// bits are NOT a reliable discriminator — Docs flaps caps=9 and caps=41 in one
+/// focus sequence — but the echo (or its absence) is observable and decisive.
+///
+/// One: the first correction may double once before we have a prior correction
+/// to judge; the second echo-less correction downgrades. A functional client
+/// always echoes within the inter-keystroke gap (its echo is synchronous), so
+/// it never accrues a strike. Complements [`SURROUNDING_DEAD_STRIKE_LIMIT`],
+/// which handles clients that echo *dead* (`text="" cursor=0`) frames.
+#[cfg(feature = "ibus")]
+const SURROUNDING_NO_ECHO_LIMIT: u32 = 1;
+
 pub struct Composer {
     pub engine: EngineState,
     edit: EditModel,
@@ -178,6 +198,28 @@ pub struct Composer {
     /// support but never honor `delete_surrounding_text` (Google Docs /
     /// contenteditable in Firefox). See `note_surrounding_liveness`.
     surrounding_dead_strikes: u32,
+
+    /// Whether a surrounding_text frame has arrived SINCE the last
+    /// SurroundingText correction we emitted. Reset to false when we emit a
+    /// correction (arming the echo window), set true on any received frame.
+    /// A functional client echoes our edit → true before the next correction;
+    /// a client that drops `delete_surrounding_text` (Google Docs) stays false.
+    /// Drives the echo-based downgrade in `note_surrounding_correction`.
+    #[cfg(feature = "ibus")]
+    surrounding_echo_since_correction: bool,
+
+    /// Whether we've emitted at least one SurroundingText correction this
+    /// session — so the first correction (which has no predecessor to judge)
+    /// never counts as a missed echo.
+    #[cfg(feature = "ibus")]
+    surrounding_saw_correction: bool,
+
+    /// Consecutive SurroundingText corrections whose delete drew no echo back.
+    /// Drives the SurroundingText→ForwardKey downgrade. See
+    /// `note_surrounding_correction`.
+    #[cfg(feature = "ibus")]
+    surrounding_corrections_without_echo: u32,
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +280,12 @@ impl Composer {
             commit_string_functional: true,
             last_action_at: Instant::now() - Duration::from_secs(60),
             surrounding_dead_strikes: 0,
+            #[cfg(feature = "ibus")]
+            surrounding_echo_since_correction: false,
+            #[cfg(feature = "ibus")]
+            surrounding_saw_correction: false,
+            #[cfg(feature = "ibus")]
+            surrounding_corrections_without_echo: 0,
         }
     }
 
@@ -296,6 +344,44 @@ impl Composer {
             }
             false
         }
+    }
+
+    /// Record that a surrounding_text frame arrived (any content). On the
+    /// SurroundingText tier this is the client echoing our edit back, i.e.
+    /// proof it honored `delete_surrounding_text`. Marks the echo window open
+    /// for the in-flight correction so `note_surrounding_correction` won't
+    /// strike it. Call once per received frame, before any early-return guard.
+    #[cfg(feature = "ibus")]
+    pub fn mark_surrounding_frame_seen(&mut self) {
+        self.surrounding_echo_since_correction = true;
+    }
+
+    /// Echo-based SurroundingText→ForwardKey downgrade. A functional client
+    /// round-trips every delete+commit as a fresh SetSurroundingText (gedit
+    /// echoes `kh`→`khô`); a client that advertises surrounding but silently
+    /// no-ops the delete (Google Docs under IBus) emits nothing back, so each
+    /// correction's commit lands undeleted and the word doubles
+    /// (`Tiếng` → `Tieêngếng`). Capability bits can't tell them apart — Docs
+    /// flaps caps=9/caps=41 in one focus sequence — but the echo can.
+    ///
+    /// Call once per SurroundingText correction that issues a delete
+    /// (`backspaces > 0`), *before* applying it. If no frame arrived since the
+    /// previous correction, that previous correction went unechoed → count a
+    /// strike; on the [`SURROUNDING_NO_ECHO_LIMIT`]-th strike return `true` so
+    /// the caller downgrades to ForwardKey (whose real Backspaces these clients
+    /// do honor). Any echo resets the count. The first correction never strikes
+    /// (no predecessor to judge); it then arms the window for the next one.
+    #[cfg(feature = "ibus")]
+    pub fn note_surrounding_correction(&mut self) -> bool {
+        if self.surrounding_echo_since_correction {
+            self.surrounding_corrections_without_echo = 0;
+        } else if self.surrounding_saw_correction {
+            // The previous correction drew no echo before this one.
+            self.surrounding_corrections_without_echo += 1;
+        }
+        self.surrounding_saw_correction = true;
+        self.surrounding_echo_since_correction = false;
+        self.surrounding_corrections_without_echo >= SURROUNDING_NO_ECHO_LIMIT
     }
 
     pub fn set_modifiers(&mut self, m: ModifierState) {
@@ -852,6 +938,32 @@ mod tests {
         assert!(!c.note_surrounding_liveness("", 0)); // strike 1
         assert!(!c.note_surrounding_liveness("pho", 3)); // content seen → reset
         assert!(!c.note_surrounding_liveness("", 0)); // back to strike 1, no downgrade
+    }
+
+    #[cfg(feature = "ibus")]
+    #[test]
+    fn unechoed_surrounding_corrections_signal_forward_key_downgrade() {
+        // Google Docs under IBus: advertises surrounding-text but silently
+        // no-ops the delete and echoes nothing back. The first correction has
+        // no predecessor to judge (no strike); the second, still echo-less,
+        // signals the downgrade.
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        assert!(!c.note_surrounding_correction()); // first correction: no strike yet
+        assert!(c.note_surrounding_correction()); // second, still no echo → downgrade
+    }
+
+    #[cfg(feature = "ibus")]
+    #[test]
+    fn echoed_surrounding_corrections_never_downgrade() {
+        // A functional client (gedit) echoes every edit back before the next
+        // correction; each echo resets the strike, so no downgrade ever fires.
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        c.mark_surrounding_frame_seen();
+        assert!(!c.note_surrounding_correction()); // echoed
+        c.mark_surrounding_frame_seen();
+        assert!(!c.note_surrounding_correction()); // echoed again
+        c.mark_surrounding_frame_seen();
+        assert!(!c.note_surrounding_correction());
     }
 
     #[test]

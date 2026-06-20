@@ -32,10 +32,13 @@ text-input action channel only covers submit-style actions, not delete/backspace
 clutter_event_key_new: assertion 'CLUTTER_IS_INPUT_DEVICE (source_device)' failed
 ```
 
-**Decision:** Do not route GNOME/IBus clients to ForwardKey as a deletion
-fallback. Prefer surrounding-text delete plus commit text when the client
-provides surrounding text. If a client does not provide usable surrounding text,
-there is no in-IBus GNOME fallback that preserves daklak's no-preedit model.
+**Decision:** Default GNOME/IBus routing still prefers surrounding-text delete
+plus commit text when the client provides surrounding text. The blanket "no
+ForwardKey fallback on GNOME/IBus" rule above no longer holds: with the
+upstream Mutter ForwardKeyEvent fix and our `IBUS_FORWARD_MASK` on every
+forwarded BackSpace, real key events do reach native Wayland clients on GNOME.
+daklak may still downgrade to ForwardKey at runtime when surrounding-text proves
+non-functional (for example repeated empty frames or unechoed corrections).
 
 **Rejected alternatives:** Commit-only appends without deleting the old tail;
 preedit conflicts with daklak's direct-commit design; synthetic keyboard/device

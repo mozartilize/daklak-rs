@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use anyhow::Result;
 use zbus::object_server::{ObjectServer, SignalEmitter};
@@ -26,6 +27,37 @@ use crate::sink::IbusSink;
 /// IBus capability bits. We only care about surrounding-text.
 const IBUS_CAP_SURROUNDING_TEXT: u32 = 1 << 5;
 
+/// Delay between the forwarded BackSpace key events and the CommitText of a
+/// single Telex correction on the ForwardKey tier.
+///
+/// Symptom (Google Docs in Firefox/Chrome): emitted back-to-back, each Telex
+/// correction non-deterministically doubles or drops its diacritic
+/// (`Tiếng` → `Tieng` / `Tiêến`) even though our shadow is correct — a delivery
+/// race between the forwarded BackSpaces and the commit.
+///
+/// Root cause (confirmed in ibus + GTK im-module source): a client that hasn't
+/// enabled post-process-key-event (Firefox/GTK) has ibus-daemon relay our
+/// ForwardKeyEvent and CommitText as immediate, separate D-Bus signals. The
+/// GTK im-module then commits text *synchronously* (inserts now) but routes a
+/// ForwardKeyEvent through the GDK event queue (`gdk_event_put`), processed
+/// *later* by the main loop. Emitted back-to-back, both signals arrive in one
+/// client main-loop wakeup: the commit inserts the corrected letters while the
+/// BackSpaces still sit queued → delete runs after insert → the word doubles.
+///
+/// The fix is to delay our CommitText so the client processes the
+/// ForwardKeyEvent signal in an *earlier* main-loop iteration (draining the
+/// queued BackSpaces) before the commit arrives. It must be a
+/// `tokio::time::sleep` — even `0` ms — because that engages tokio's timer
+/// driver and yields a real reactor-cycle gap; a bare `tokio::task::yield_now()`
+/// adds no wall-clock gap, both signals still land in the same client wakeup,
+/// and the bug returns (verified by elimination: remove → bug; `yield_now` →
+/// bug; `sleep(0)` → fixed). NOT a zbus-flush issue — zbus already writes each
+/// signal as a separate, fully-flushed, ordered `sendmsg(2)`.
+///
+/// Raise the duration if a slower client still races. The durable alternative
+/// is preedit-based composition (no forwarded BackSpaces, no reorder).
+const FORWARD_COMMIT_BARRIER: Duration = Duration::from_millis(0);
+
 /// State shared between Factory and Engine instances.
 /// Wrapped in Arc<Mutex> so zbus interface futures are Send.
 /// Lock is never held across .await points — only during sync daemon calls.
@@ -33,6 +65,19 @@ pub struct EngineState<D> {
     pub daemon: D,
     pub enabled: Arc<AtomicBool>,
     has_surrounding: bool,
+    /// Whether the client *explicitly* cleared the surrounding-text capability
+    /// bit via SetCapabilities **in the current focus session**. Distinct from
+    /// `has_surrounding == false`, which is also the optimistic-default state
+    /// before any caps arrive and can linger as a stale focus-flap artifact.
+    ///
+    /// When true, a subsequent SetSurroundingText frame must NOT upgrade the
+    /// tier back to SurroundingText: the client declared it has none, and some
+    /// clients (Google Docs in Firefox) still emit a frame reflecting existing
+    /// document text yet silently drop `delete_surrounding_text` — trusting the
+    /// frame there re-breaks composition (`Tiếng` → `Tieêngếng`). Reset on
+    /// focus-in so a *stale* caps=9 from a prior defocus (gedit) doesn't block
+    /// that client's legitimate late upgrade.
+    caps_cleared_surrounding: bool,
     /// app_id from FocusInId (lowercase). Used to detect Firefox for
     /// chars_for_delete.
     client_app_id: Option<String>,
@@ -46,6 +91,7 @@ impl<D> EngineState<D> {
             daemon,
             enabled,
             has_surrounding: true, // optimistic default for GNOME
+            caps_cleared_surrounding: false,
             client_app_id: None,
             chars_delete_apps,
         }
@@ -90,10 +136,12 @@ impl<D: IbusHandler + Send + 'static> Factory<D> {
     ) -> zbus::fdo::Result<zbus::zvariant::OwnedObjectPath> {
         let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let path = format!("/org/freedesktop/IBus/Engine/{id}");
-        let op = zbus::zvariant::ObjectPath::try_from(path.clone())
+        let op: zbus::zvariant::OwnedObjectPath = zbus::zvariant::ObjectPath::try_from(path.clone())
             .map_err(|e| zbus::fdo::Error::Failed(format!("bad path: {e}")))?
             .into();
-        let engine = Engine { state: self.state.clone() };
+        let engine = Engine {
+            state: self.state.clone(),
+        };
         server.at(&op, engine).await?;
         tracing::info!(engine_name, path, "CreateEngine");
         Ok(op)
@@ -190,6 +238,16 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
                         tracing::warn!("ForwardKeyEvent failed: {e}");
                     }
                 }
+                // Browser-race barrier between the forwarded BackSpaces and the
+                // CommitText (see FORWARD_COMMIT_BARRIER). Without this sleep,
+                // Google Docs reorders commit-before-delete and each correction
+                // doubles/drops its diacritic. Must be `sleep` (timer-driver
+                // round-trip), not `yield_now` — both removal and a yield_now
+                // swap were verified to regress. Only a delete+commit correction
+                // races; raw forwards or bare commits don't.
+                if !sink.forwards.is_empty() && !sink.commits.is_empty() {
+                    tokio::time::sleep(FORWARD_COMMIT_BARRIER).await;
+                }
                 for text in &sink.commits {
                     tracing::debug!(commit = %text, "emit CommitText D-Bus signal");
                     if let Err(e) = Engine::<D>::commit_text(&emitter, ibus_text(text)).await {
@@ -249,6 +307,9 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
         tracing::debug!(caps, has_surrounding, "SetCapabilities");
         let mut s = self.state.lock().await;
         s.has_surrounding = has_surrounding;
+        // Remember an explicit "no surrounding" declaration so a later stray
+        // SetSurroundingText frame can't override it (Google Docs/Firefox).
+        s.caps_cleared_surrounding = !has_surrounding;
         // FocusIn may have latched ForwardKey from a transient caps=9; upgrade
         // now that we know surrounding text is available.
         s.daemon.update_method(method_for_capability(has_surrounding));
@@ -277,12 +338,17 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
         // has_surrounding sticky-true and upgrade the method (no-op if already
         // SurroundingText). Mirrors the wayland "late tier upgrade on first
         // surrounding_text".
-        if !s.has_surrounding {
+        if should_upgrade_on_surrounding(s.has_surrounding, s.caps_cleared_surrounding) {
             tracing::info!(
                 "SetSurroundingText while has_surrounding=false → upgrade method (caps race)"
             );
             s.has_surrounding = true;
             s.daemon.update_method(BackspaceMethod::SurroundingText);
+        } else if s.caps_cleared_surrounding {
+            tracing::debug!(
+                "SetSurroundingText ignored for tier: client explicitly cleared surrounding caps \
+                 (Docs-style frame; delete_surrounding_text would be dropped)"
+            );
         }
         s.daemon.observe_surrounding(&text_str, cursor_pos, anchor_pos);
     }
@@ -339,6 +405,12 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
         {
             let mut s = self.state.lock().await;
             s.client_app_id = app_id;
+            // New focus session: forget any prior caps=9 declaration so a stale
+            // defocus artifact (gedit) doesn't block this client's legitimate
+            // SetSurroundingText upgrade. The client re-declares caps after
+            // FocusIn; an in-session caps=9 (Docs) re-arms the guard before its
+            // surrounding frame arrives.
+            s.caps_cleared_surrounding = false;
             let method = method_for_capability(s.has_surrounding);
             let chars_for_delete = s.chars_for_delete();
             tracing::debug!(
@@ -371,6 +443,16 @@ fn method_for_capability(has_surrounding: bool) -> BackspaceMethod {
     } else {
         BackspaceMethod::ForwardKey
     }
+}
+
+/// Whether an incoming SetSurroundingText frame should upgrade the tier back to
+/// SurroundingText. Only when we currently believe there's no surrounding AND
+/// the client hasn't *explicitly* cleared the capability this session. The
+/// explicit-clear case is Google Docs/Firefox: it declares `caps=9` then still
+/// emits a frame for existing document text while dropping
+/// `delete_surrounding_text`, so trusting the frame re-breaks composition.
+fn should_upgrade_on_surrounding(has_surrounding: bool, caps_cleared_surrounding: bool) -> bool {
+    !has_surrounding && !caps_cleared_surrounding
 }
 
 /// Extract the plain string from an IBusText variant value.
@@ -450,5 +532,21 @@ mod tests {
     #[test]
     fn method_selection_falls_back_to_forward_key() {
         assert_eq!(method_for_capability(false), BackspaceMethod::ForwardKey);
+    }
+
+    #[test]
+    fn surrounding_frame_upgrades_only_without_explicit_caps_clear() {
+        // Stale focus-flap caps=9 (not explicitly cleared this session): a
+        // surrounding frame proves the client is alive → upgrade. (gedit)
+        assert!(should_upgrade_on_surrounding(false, false));
+
+        // Client explicitly declared caps=9 this session (Google Docs/Firefox):
+        // the frame is for existing doc text but deletes are dropped → DON'T
+        // upgrade; stay on ForwardKey.
+        assert!(!should_upgrade_on_surrounding(false, true));
+
+        // Already on surrounding → nothing to upgrade, regardless of the flag.
+        assert!(!should_upgrade_on_surrounding(true, false));
+        assert!(!should_upgrade_on_surrounding(true, true));
     }
 }

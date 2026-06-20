@@ -22,6 +22,13 @@ pub const IBUS_LOCK_MASK: u32 = 1 << 1;
 pub const IBUS_CONTROL_MASK: u32 = 1 << 2;
 pub const IBUS_MOD1_MASK: u32 = 1 << 3; // Alt
 pub const IBUS_MOD4_MASK: u32 = 1 << 6; // Super / Win
+/// Marks a key event as engine-forwarded. The client delivers it straight to
+/// the application and MUST NOT round-trip it back through ProcessKeyEvent.
+/// Omitting it makes Firefox's GTK IBus client re-inject every forwarded
+/// BackSpace as a fresh key event, which re-enters the engine — a re-entrant
+/// storm that overflows the client's pending-event queue ("Events queue
+/// growing too big, will start to drop") and freezes input.
+pub const IBUS_FORWARD_MASK: u32 = 1 << 25;
 pub const IBUS_RELEASE_MASK: u32 = 1 << 30;
 
 /// Convert an X11 keysym to a Unicode char for engine consumption.

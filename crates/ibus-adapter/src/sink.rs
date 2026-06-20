@@ -8,7 +8,7 @@
 
 use viet_ime_edit_strategy::{KeyState, OutputSink};
 
-use crate::keyval::{evdev_to_keyval, XK_BACKSPACE, IBUS_RELEASE_MASK};
+use crate::keyval::{evdev_to_keyval, XK_BACKSPACE, IBUS_FORWARD_MASK, IBUS_RELEASE_MASK};
 
 /// A pending delete_surrounding_text operation.
 /// offset: chars before cursor to delete (negative = before).
@@ -84,10 +84,13 @@ impl OutputSink for IbusSink {
         if keyval == 0 {
             return;
         }
-        let s = match state {
-            KeyState::Pressed => 0u32,
-            KeyState::Released => IBUS_RELEASE_MASK,
-        };
+        // IBUS_FORWARD_MASK keeps the client from round-tripping our synthetic
+        // BackSpace back into ProcessKeyEvent (Firefox queue-overflow freeze).
+        let s = IBUS_FORWARD_MASK
+            | match state {
+                KeyState::Pressed => 0u32,
+                KeyState::Released => IBUS_RELEASE_MASK,
+            };
         // ForwardKeyEvent keycode follows ProcessKeyEvent input semantics: evdev.
         // IBus frontends that need X11 keycode do the +8 conversion themselves.
         self.forwards.push(PendingForward { keyval, keycode: key_code, state: s });
@@ -102,7 +105,7 @@ impl OutputSink for IbusSink {
         // but handle backspace gracefully just in case.
         let kc = key_code as u32;
         let keyval = if kc == 14 { XK_BACKSPACE } else { return };
-        let s = if value == 0 { IBUS_RELEASE_MASK } else { 0 };
+        let s = IBUS_FORWARD_MASK | if value == 0 { IBUS_RELEASE_MASK } else { 0 };
         self.forwards.push(PendingForward { keyval, keycode: kc, state: s });
     }
 
@@ -126,10 +129,11 @@ mod tests {
         assert_eq!(sink.forwards.len(), 2);
         assert_eq!(sink.forwards[0].keycode, 14);
         assert_eq!(sink.forwards[0].keyval, XK_BACKSPACE);
-        assert_eq!(sink.forwards[0].state, 0);
+        // Press carries IBUS_FORWARD_MASK so the client won't re-inject it.
+        assert_eq!(sink.forwards[0].state, IBUS_FORWARD_MASK);
         assert_eq!(sink.forwards[1].keycode, 14);
         assert_eq!(sink.forwards[1].keyval, XK_BACKSPACE);
-        assert_eq!(sink.forwards[1].state, IBUS_RELEASE_MASK);
+        assert_eq!(sink.forwards[1].state, IBUS_FORWARD_MASK | IBUS_RELEASE_MASK);
     }
 
     #[test]
@@ -141,9 +145,9 @@ mod tests {
         assert_eq!(sink.forwards.len(), 2);
         assert_eq!(sink.forwards[0].keycode, 14);
         assert_eq!(sink.forwards[0].keyval, XK_BACKSPACE);
-        assert_eq!(sink.forwards[0].state, 0);
+        assert_eq!(sink.forwards[0].state, IBUS_FORWARD_MASK);
         assert_eq!(sink.forwards[1].keycode, 14);
         assert_eq!(sink.forwards[1].keyval, XK_BACKSPACE);
-        assert_eq!(sink.forwards[1].state, IBUS_RELEASE_MASK);
+        assert_eq!(sink.forwards[1].state, IBUS_FORWARD_MASK | IBUS_RELEASE_MASK);
     }
 }

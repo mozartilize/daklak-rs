@@ -254,6 +254,27 @@ impl Daemon {
         sink: &mut S,
     ) {
         if let Some(w) = self.composer.as_mut() {
+            // Echo-based ST → FK downgrade for clients that advertise
+            // surrounding-text but silently no-op DeleteSurroundingText (Google
+            // Docs under IBus), doubling each correction (`Tiếng` →
+            // `Tieêngếng`). A functional client echoes every edit back as a
+            // SetSurroundingText; Docs sends nothing. Capability bits can't
+            // tell them apart (Docs flaps caps=9/caps=41 in one focus
+            // sequence), but the missing echo can. Check BEFORE applying so the
+            // offending correction routes through ForwardKey (real BackSpace
+            // ForwardKeyEvents + CommitText, both honored by Docs). Only
+            // corrections that delete (`backspaces > 0`) can double a word.
+            if backspaces > 0
+                && w.method() == BackspaceMethod::SurroundingText
+                && w.note_surrounding_correction()
+            {
+                tracing::info!(
+                    from = ?BackspaceMethod::SurroundingText,
+                    to = ?BackspaceMethod::ForwardKey,
+                    "surrounding-text corrections drew no echo (delete not honored) → downgrade tier"
+                );
+                w.set_method(BackspaceMethod::ForwardKey);
+            }
             w.apply(backspaces, commit, time, sink);
         }
     }
@@ -264,6 +285,12 @@ impl Daemon {
     #[cfg(feature = "ibus")]
     pub fn observe_surrounding(&mut self, text: &str, cursor: u32, anchor: u32) {
         if let Some(w) = self.composer.as_mut() {
+            // A frame arrived → the client echoed our edit, i.e. it honored
+            // delete_surrounding_text. Opens the echo window so the echo-based
+            // downgrade (`note_surrounding_correction`, in `apply_with_sink`)
+            // won't strike the in-flight correction. Mark before any
+            // early-return guard so every frame counts.
+            w.mark_surrounding_frame_seen();
             // Runtime tier downgrade ST → FK. Same watchdog as the wayland
             // path: clients that advertise surrounding-text but never honor it
             // (Google Docs / Firefox contenteditable echo text="" cursor=0
@@ -352,6 +379,7 @@ impl Daemon {
             }
         }
     }
+
 }
 
 #[cfg(test)]
