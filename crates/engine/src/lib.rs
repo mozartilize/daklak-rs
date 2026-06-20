@@ -4,27 +4,10 @@
 //! to commit and the count of preceding chars to delete. Hides the internal
 //! state machine of vnkey-engine.
 
-use vnkey_engine::input::{KeyEvType, TELEX_MAPPING, VNE_COUNT};
-use vnkey_engine::{Engine, InputMethod as VnkeyIm};
+mod telex;
+mod vni;
 
-fn telex_key_map(bracket_shortcuts: bool) -> [i32; 256] {
-    let mut key_map = [KeyEvType::Normal as i32; 256];
-    for entry in TELEX_MAPPING {
-        if !bracket_shortcuts && matches!(entry.key, b'[' | b']' | b'{' | b'}') {
-            continue;
-        }
-        key_map[entry.key as usize] = entry.action;
-        if entry.action < VNE_COUNT {
-            let ch = entry.key;
-            if ch.is_ascii_lowercase() {
-                key_map[ch.to_ascii_uppercase() as usize] = entry.action;
-            } else if ch.is_ascii_uppercase() {
-                key_map[ch.to_ascii_lowercase() as usize] = entry.action;
-            }
-        }
-    }
-    key_map
-}
+use vnkey_engine::{Engine, InputMethod as VnkeyIm};
 
 /// Vietnamese input method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +59,7 @@ impl EngineState {
         let mut engine = Engine::new();
         engine.set_input_method(method.to_vnkey());
         if method == InputMethod::Telex && !bracket_shortcuts {
-            let key_map = telex_key_map(false);
+            let key_map = telex::telex_key_map(false);
             engine.input.set_user_key_map(&key_map);
         }
         engine.set_viet_mode(true);
@@ -143,29 +126,31 @@ impl EngineState {
     /// editing when the IME activates mid-word. Returns true if context
     /// was fed successfully.
     ///
-    /// NOTE: this takes telex keystrokes OR composed glyphs interchangeably
-    /// (`telex_context_from_surrounding` passes ASCII through and reverses
-    /// diacritics), so callers seeding from raw accumulated keystrokes use it
-    /// directly. Callers seeding from *composed surrounding text* should use
-    /// [`feed_context_gated`], which round-trip-checks the reconstruction.
+    /// NOTE: this takes method keystrokes OR composed glyphs interchangeably
+    /// (`context_from_surrounding` passes ASCII through and reverses
+    /// diacritics for the engine's active input method), so callers seeding
+    /// from raw accumulated keystrokes use it directly. Callers seeding from
+    /// *composed surrounding text* should use [`feed_context_gated`], which
+    /// round-trip-checks the reconstruction.
     pub fn feed_context(&mut self, text: &str) -> bool {
-        let (context, _) = telex_context_from_surrounding(text);
+        let (context, _) = context_from_surrounding(text, self.method);
         self.engine.feed_context(&context)
     }
 
     /// Seed from **composed** surrounding text, with a render-gate.
     ///
-    /// The seed is reconstructed by reversing composed glyphs back into telex
-    /// keystrokes, which is lossy for a minority of inputs (e.g. multi-syllable
-    /// runs with no space: "ơiời" → "owiowfi"). Feeding a reconstruction that
-    /// does NOT render back to the original glyphs loads garbage engine state
-    /// and corrupts the next keystroke, so we round-trip-check first and refuse
-    /// to seed on mismatch — the engine stays untouched and the caller treats
-    /// the word as foreign text (retroactive editing disabled for it). For real
+    /// The seed is reconstructed by reversing composed glyphs back into
+    /// keystrokes for the engine's active input method, which is lossy for a
+    /// minority of inputs (e.g. multi-syllable runs with no space, Telex:
+    /// "ơiời" → "owiowfi"). Feeding a reconstruction that does NOT render
+    /// back to the original glyphs loads garbage engine state and corrupts
+    /// the next keystroke, so we round-trip-check first and refuse to seed on
+    /// mismatch — the engine stays untouched and the caller treats the word
+    /// as foreign text (retroactive editing disabled for it). For real
     /// Vietnamese single syllables the reconstruction is faithful and the gate
     /// is inert. Returns `true` only if the seed round-tripped AND was fed.
     pub fn feed_context_gated(&mut self, text: &str) -> bool {
-        let (context, _) = telex_context_from_surrounding(text);
+        let (context, _) = context_from_surrounding(text, self.method);
         if self.render(&context) != text {
             return false;
         }
@@ -179,208 +164,36 @@ impl EngineState {
     }
 }
 
+/// Reconstruct input-method keystrokes from composed surrounding text for the
+/// Telex method. Returns the keystroke string and a per-glyph byte-width vector.
 pub fn telex_context_from_surrounding(text: &str) -> (String, Vec<u8>) {
+    context_from_surrounding(text, InputMethod::Telex)
+}
+
+/// Reconstruct input-method keystrokes from composed surrounding text for the
+/// VNI method. Returns the keystroke string and a per-glyph byte-width vector.
+pub fn vni_context_from_surrounding(text: &str) -> (String, Vec<u8>) {
+    context_from_surrounding(text, InputMethod::Vni)
+}
+
+fn context_from_surrounding(text: &str, method: InputMethod) -> (String, Vec<u8>) {
     let mut result = String::with_capacity(text.len());
     let mut widths = Vec::with_capacity(text.chars().count());
     for ch in text.chars() {
-        let telex = telex_chars_from_composed(ch);
-        if !telex.is_empty() {
-            widths.push(telex.len() as u8);
-            result.push_str(telex);
+        let keys = chars_from_composed(ch, method);
+        if !keys.is_empty() {
+            widths.push(keys.len() as u8);
+            result.push_str(keys);
         }
     }
     (result, widths)
 }
 
-fn telex_chars_from_composed(ch: char) -> &'static str {
-    match ch {
-        'á' => "as",
-        'à' => "af",
-        'ả' => "ar",
-        'ã' => "ax",
-        'ạ' => "aj",
-        'Á' => "AS",
-        'À' => "AF",
-        'Ả' => "AR",
-        'Ã' => "AX",
-        'Ạ' => "AJ",
-        'ă' => "aw",
-        'ắ' => "aws",
-        'ằ' => "awf",
-        'ẳ' => "awr",
-        'ẵ' => "awx",
-        'ặ' => "awj",
-        'Ă' => "AW",
-        'Ắ' => "AWS",
-        'Ằ' => "AWF",
-        'Ẳ' => "AWR",
-        'Ẵ' => "AWX",
-        'Ặ' => "AWJ",
-        'â' => "aa",
-        'ấ' => "aas",
-        'ầ' => "aaf",
-        'ẩ' => "aar",
-        'ẫ' => "aax",
-        'ậ' => "aaj",
-        'Â' => "AA",
-        'Ấ' => "AAS",
-        'Ầ' => "AAF",
-        'Ẩ' => "AAR",
-        'Ẫ' => "AAX",
-        'Ậ' => "AAJ",
-        'đ' => "dd",
-        'Đ' => "DD",
-        'é' => "es",
-        'è' => "ef",
-        'ẻ' => "er",
-        'ẽ' => "ex",
-        'ẹ' => "ej",
-        'É' => "ES",
-        'È' => "EF",
-        'Ẻ' => "ER",
-        'Ẽ' => "EX",
-        'Ẹ' => "EJ",
-        'ê' => "ee",
-        'ế' => "ees",
-        'ề' => "eef",
-        'ể' => "eer",
-        'ễ' => "eex",
-        'ệ' => "eej",
-        'Ê' => "EE",
-        'Ế' => "EES",
-        'Ề' => "EEF",
-        'Ể' => "EER",
-        'Ễ' => "EEX",
-        'Ệ' => "EEJ",
-        'í' => "is",
-        'ì' => "if",
-        'ỉ' => "ir",
-        'ĩ' => "ix",
-        'ị' => "ij",
-        'Í' => "IS",
-        'Ì' => "IF",
-        'Ỉ' => "IR",
-        'Ĩ' => "IX",
-        'Ị' => "IJ",
-        'ó' => "os",
-        'ò' => "of",
-        'ỏ' => "or",
-        'õ' => "ox",
-        'ọ' => "oj",
-        'Ó' => "OS",
-        'Ò' => "OF",
-        'Ỏ' => "OR",
-        'Õ' => "OX",
-        'Ọ' => "OJ",
-        'ô' => "oo",
-        'ố' => "oos",
-        'ồ' => "oof",
-        'ổ' => "oor",
-        'ỗ' => "oox",
-        'ộ' => "ooj",
-        'Ô' => "OO",
-        'Ố' => "OOS",
-        'Ồ' => "OOF",
-        'Ổ' => "OOR",
-        'Ỗ' => "OOX",
-        'Ộ' => "OOJ",
-        'ơ' => "ow",
-        'ớ' => "ows",
-        'ờ' => "owf",
-        'ở' => "owr",
-        'ỡ' => "owx",
-        'ợ' => "owj",
-        'Ơ' => "OW",
-        'Ớ' => "OWS",
-        'Ờ' => "OWF",
-        'Ở' => "OWR",
-        'Ỡ' => "OWX",
-        'Ợ' => "OWJ",
-        'ú' => "us",
-        'ù' => "uf",
-        'ủ' => "ur",
-        'ũ' => "ux",
-        'ụ' => "uj",
-        'Ú' => "US",
-        'Ù' => "UF",
-        'Ủ' => "UR",
-        'Ũ' => "UX",
-        'Ụ' => "UJ",
-        'ư' => "uw",
-        'ứ' => "uws",
-        'ừ' => "uwf",
-        'ử' => "uwr",
-        'ữ' => "uwx",
-        'ự' => "uwj",
-        'Ư' => "UW",
-        'Ứ' => "UWS",
-        'Ừ' => "UWF",
-        'Ử' => "UWR",
-        'Ữ' => "UWX",
-        'Ự' => "UWJ",
-        'ý' => "ys",
-        'ỳ' => "yf",
-        'ỷ' => "yr",
-        'ỹ' => "yx",
-        'ỵ' => "yj",
-        'Ý' => "YS",
-        'Ỳ' => "YF",
-        'Ỷ' => "YR",
-        'Ỹ' => "YX",
-        'Ỵ' => "YJ",
-        'A' => "A",
-        'B' => "B",
-        'C' => "C",
-        'D' => "D",
-        'E' => "E",
-        'F' => "F",
-        'G' => "G",
-        'H' => "H",
-        'I' => "I",
-        'J' => "J",
-        'K' => "K",
-        'L' => "L",
-        'M' => "M",
-        'N' => "N",
-        'O' => "O",
-        'P' => "P",
-        'Q' => "Q",
-        'R' => "R",
-        'S' => "S",
-        'T' => "T",
-        'U' => "U",
-        'V' => "V",
-        'W' => "W",
-        'X' => "X",
-        'Y' => "Y",
-        'Z' => "Z",
-        'a' => "a",
-        'b' => "b",
-        'c' => "c",
-        'd' => "d",
-        'e' => "e",
-        'f' => "f",
-        'g' => "g",
-        'h' => "h",
-        'i' => "i",
-        'j' => "j",
-        'k' => "k",
-        'l' => "l",
-        'm' => "m",
-        'n' => "n",
-        'o' => "o",
-        'p' => "p",
-        'q' => "q",
-        'r' => "r",
-        's' => "s",
-        't' => "t",
-        'u' => "u",
-        'v' => "v",
-        'w' => "w",
-        'x' => "x",
-        'y' => "y",
-        'z' => "z",
-        _ => "",
+fn chars_from_composed(ch: char, method: InputMethod) -> &'static str {
+    match method {
+        InputMethod::Telex => telex::telex_chars_from_composed(ch),
+        InputMethod::Vni => vni::vni_chars_from_composed(ch),
+        InputMethod::Viqr => telex::telex_chars_from_composed(ch),
     }
 }
 
@@ -594,6 +407,98 @@ mod tests {
     fn vni_u7_to_uhorn() {
         let mut eng = EngineState::new(InputMethod::Vni);
         assert_eq!(type_str(&mut eng, "u7"), "ư");
+    }
+
+    #[test]
+    fn vni_a61_to_acircumflex_acute() {
+        let mut eng = EngineState::new(InputMethod::Vni);
+        assert_eq!(type_str(&mut eng, "a61"), "ấ");
+    }
+
+    #[test]
+    fn vni_o61_to_ocircumflex_acute() {
+        let mut eng = EngineState::new(InputMethod::Vni);
+        assert_eq!(type_str(&mut eng, "o61"), "ố");
+    }
+
+    #[test]
+    fn vni_word_tieng() {
+        let mut eng = EngineState::new(InputMethod::Vni);
+        assert_eq!(type_str(&mut eng, "tie61ng"), "tiếng");
+    }
+
+    // ===== VNI feed_context (retroactive editing) =====
+
+    #[test]
+    fn vni_feed_context_per_key_preserves_vowel_cluster() {
+        let mut eng = EngineState::new(InputMethod::Vni);
+        let mut raw = String::new();
+        let mut screen = String::new();
+        for ch in "hie61u".chars() {
+            let prefix = raw.clone();
+            eng.reset();
+            if !prefix.is_empty() {
+                eng.feed_context(&prefix);
+            }
+            raw.push(ch);
+            let r = eng.process_key(ch);
+            if r.consumed {
+                for _ in 0..r.backspaces {
+                    screen.pop();
+                }
+                screen.push_str(&r.commit);
+            } else {
+                screen.push(ch);
+            }
+        }
+        assert_eq!(screen, "hiếu");
+    }
+
+    #[test]
+    fn vni_feed_context_accepts_composed_vietnamese_for_tone_replacement() {
+        let mut eng = EngineState::new(InputMethod::Vni);
+        assert!(eng.feed_context("nó"));
+
+        let r = eng.process_key('3');
+
+        assert!(r.consumed);
+        assert_eq!(r.backspaces, 1);
+        assert_eq!(r.commit, "ỏ");
+    }
+
+    #[test]
+    fn vni_feed_context_accepts_composed_vietnamese_inside_word() {
+        let mut eng = EngineState::new(InputMethod::Vni);
+
+        assert!(eng.feed_context("pho"));
+        let r = eng.process_key('7');
+        assert!(r.consumed);
+        assert_eq!(r.commit, "ơ");
+
+        eng.reset();
+        assert!(eng.feed_context("phơ"));
+        let r = eng.process_key('3');
+        assert!(r.consumed);
+        assert_eq!(r.backspaces, 1);
+        assert_eq!(r.commit, "ở");
+    }
+
+    #[test]
+    fn vni_feed_context_accepts_faithful_reconstruction() {
+        let mut e = EngineState::new(InputMethod::Vni);
+        assert!(e.feed_context_gated("tiê"));
+        let r = e.process_key('1');
+        assert_eq!((r.backspaces, r.commit.as_str()), (1, "ế"));
+    }
+
+    #[test]
+    fn vni_feed_context_rejects_lossy_reconstruction() {
+        let mut e = EngineState::new(InputMethod::Vni);
+        assert!(!e.feed_context_gated("ơiời"));
+        assert!(
+            e.at_word_beginning(),
+            "rejected seed must leave the engine untouched"
+        );
     }
 
     // ===== Backspace mid-word =====
