@@ -896,6 +896,31 @@ mod tests {
     }
 
     #[test]
+    fn idle_reset_seeds_composed_shadow_for_tone_replacement() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let text = "là";
+
+        c.observe_surrounding_bytes(
+            text,
+            ByteCursor(text.len() as u32),
+            ByteCursor(text.len() as u32),
+            true,
+        );
+        c.last_keystroke_at -= std::time::Duration::from_secs(3);
+
+        assert!(c.check_idle_reset());
+        match c.feed_key('s') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 1);
+                assert_eq!(commit, "á");
+            }
+            _ => panic!("expected tone replacement after idle reset"),
+        }
+    }
+
+    #[test]
     fn window_quirks_store_delete_units_and_debounce_independently() {
         let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
 
