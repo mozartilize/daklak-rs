@@ -301,7 +301,7 @@ impl AdapterHandler for Daemon {
         let _ = method;
         let serial = ctx.serial();
         if let Some(w) = self.composer.as_mut() {
-            tracing::debug!(method = ?w.method, backspaces, commit, "strategy.apply");
+            tracing::debug!(method = ?w.method(), backspaces, commit, "strategy.apply");
             let commit_string_functional = w.commit_string_functional;
             ctx.with_sink(raw_mods, held_user_kc, commit_string_functional, |sink| {
                 w.apply_to_sink(backspaces, commit, serial, time, sink);
