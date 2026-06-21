@@ -807,13 +807,20 @@ pub fn detect_one_char_insertion(
     cursor: u32,
 ) -> bool {
     let prev_cur = prev_cursor as usize;
-    prev_cur <= prev_text.len()
-        && cursor > prev_cursor
-        && cursor == prev_cursor + 1
-        && text.len() > prev_text.len()
-        && text.len() == prev_text.len() + 1
-        && text.get(..prev_cur) == prev_text.get(..prev_cur)
-        && text.get((cursor as usize)..) == prev_text.get(prev_cur..)
+    let cur = cursor as usize;
+    if prev_cur > prev_text.len()
+        || cur > text.len()
+        || prev_cur >= cur
+        || !prev_text.is_char_boundary(prev_cur)
+        || !text.is_char_boundary(cur)
+        || !text.is_char_boundary(prev_cur)
+    {
+        return false;
+    }
+
+    text.get(..prev_cur) == prev_text.get(..prev_cur)
+        && text.get(cur..) == prev_text.get(prev_cur..)
+        && text[prev_cur..cur].chars().count() == 1
 }
 
 /// Detects whether text between the previous and current cursor was deleted.
@@ -1983,6 +1990,13 @@ mod tests {
         // shadow "tiê" (4 bytes, 3 chars). cursor at byte 4. Type 'n' →
         // "tiên" (5 bytes), cursor at byte 5. Must detect as keystroke.
         assert!(oci("tiê", 4, "tiên", 5));
+    }
+
+    #[test]
+    fn oci_append_direct_multibyte_scalar() {
+        // Direct app-visible insertion of one Vietnamese scalar advances the
+        // byte cursor by that scalar's UTF-8 width, not by exactly one byte.
+        assert!(oci("ti", 2, "tiế", "tiế".len() as u32));
     }
 
     #[test]
