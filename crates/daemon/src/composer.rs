@@ -828,12 +828,20 @@ pub fn detect_one_char_insertion(
 pub fn detect_deletion(prev_text: &str, prev_cursor: u32, text: &str, cursor: u32) -> bool {
     let prev_cur = prev_cursor as usize;
     let cur = cursor as usize;
-    cur <= prev_cur
-        && cur <= text.len()
-        && prev_cur <= prev_text.len()
-        && text.len() < prev_text.len()
+    if cur > prev_cur
+        || cur > text.len()
+        || prev_cur > prev_text.len()
+        || !text.is_char_boundary(cur)
+        || !prev_text.is_char_boundary(cur)
+        || !prev_text.is_char_boundary(prev_cur)
+    {
+        return false;
+    }
+
+    text.len() < prev_text.len()
         && text.get(..cur) == prev_text.get(..cur)
         && text.get(cur..) == prev_text.get(prev_cur..)
+        && !prev_text[cur..prev_cur].is_empty()
 }
 
 #[cfg(test)]
@@ -1973,6 +1981,7 @@ mod tests {
 
     // ── detect_one_char_insertion ──────────────────────────────────────
 
+    use super::detect_deletion as del;
     use super::detect_one_char_insertion as oci;
 
     #[test]
@@ -2067,6 +2076,19 @@ mod tests {
         // User types second 'D' → text="DD" cursor=2. MUST be detected as
         // 1-char keystroke so handle_char fires and `DD→Đ` rule runs.
         assert!(oci("D", 1, "DD", 2));
+    }
+
+    #[test]
+    fn deletion_rejects_cursor_inside_multibyte_char() {
+        // Cursor offsets are byte offsets. When both offsets land inside 'ế',
+        // slicing returns None on both sides; that must not be accepted as a
+        // real external deletion.
+        assert!(!del("aếb", 2, "aế", 2));
+    }
+
+    #[test]
+    fn deletion_accepts_multibyte_char_span() {
+        assert!(del("aếb", "aế".len() as u32, "ab", 1));
     }
 }
 
