@@ -150,7 +150,6 @@ const SURROUNDING_NO_ECHO_LIMIT: u32 = 1;
 pub struct Composer {
     pub engine: EngineState,
     edit: EditModel,
-    pub method: BackspaceMethod,
     pub last_keystroke_at: Instant,
 
     /// Last printable user keystroke fed to `feed_key`. Tracks user
@@ -276,7 +275,6 @@ impl Composer {
         Self {
             engine: EngineState::new_with_options(input_method, bracket_shortcuts),
             edit: EditModel::new(backspace_method),
-            method: backspace_method,
             last_keystroke_at: Instant::now(),
             last_input_char: None,
             commit_string_functional: true,
@@ -316,7 +314,6 @@ impl Composer {
 
     pub fn set_method(&mut self, m: BackspaceMethod) {
         self.edit.set_method(m);
-        self.method = m;
     }
 
     /// Watchdog for clients that advertise surrounding-text support but never
@@ -473,7 +470,7 @@ impl Composer {
         );
 
         if r.consumed {
-            let method = self.method;
+            let method = self.method();
             KeyDecision::Apply {
                 method,
                 backspaces: r.backspaces,
@@ -499,7 +496,7 @@ impl Composer {
 
         if r.consumed {
             self.last_keystroke_at = Instant::now();
-            let method = self.method;
+            let method = self.method();
             KeyDecision::Apply {
                 method,
                 backspaces: r.backspaces,
