@@ -215,6 +215,12 @@ pub struct Composer {
     /// stale client cache and arms char-count delete for the next correction.
     expected_echo: Option<PendingEcho>,
 
+    /// True after the engine was seeded from already-visible context instead of
+    /// live keystrokes. Retroactive edits should track the latest visible word;
+    /// otherwise repeated tone toggles accumulate reconstructed raw history that
+    /// leaks on a later raw restore.
+    retroactive_context: bool,
+
     /// Current delete unit for this word/composition. It starts as bytes, is
     /// armed to chars by one stale echo, and is consumed by the next correction.
     delete_unit: DeleteUnit,
@@ -287,6 +293,7 @@ impl Composer {
             #[cfg(feature = "ibus")]
             surrounding_corrections_without_echo: 0,
             expected_echo: None,
+            retroactive_context: false,
             delete_unit: DeleteUnit::Bytes,
         }
     }
@@ -400,12 +407,23 @@ impl Composer {
         self.engine.reset();
         self.edit.reset();
         self.last_input_char = None;
+        self.retroactive_context = false;
         self.reset_delete_unit();
     }
 
     fn reset_delete_unit(&mut self) {
         self.expected_echo = None;
         self.delete_unit = DeleteUnit::Bytes;
+    }
+
+    fn refresh_retroactive_context_after_apply(&mut self, backspaces: usize) {
+        if backspaces == 0 || !self.retroactive_context {
+            return;
+        }
+
+        let word = self.edit.shadow_text().to_owned();
+        self.engine.reset();
+        self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(&word);
     }
 
     /// Check 2-second idle heuristic. Returns true (and resets engine) if
@@ -445,6 +463,7 @@ impl Composer {
             Some(c) if !c.is_ascii_alphabetic()
         );
         if !ch.is_ascii_alphabetic() {
+            self.retroactive_context = false;
             self.reset_delete_unit();
         }
         self.last_input_char = Some(ch);
@@ -454,7 +473,7 @@ impl Composer {
             let raw_word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
             if !raw_word.is_empty() {
                 tracing::debug!(word = raw_word, "seed engine from shadow at word boundary");
-                self.engine.feed_context_gated(raw_word);
+                self.retroactive_context = self.engine.feed_context_gated(raw_word);
             }
         }
 
@@ -524,6 +543,7 @@ impl Composer {
     ) {
         self.edit
             .apply(backspaces, commit, 0, time, sink, DeleteUnit::Bytes);
+        self.refresh_retroactive_context_after_apply(backspaces);
     }
 
     pub fn apply_to_sink<S: viet_ime_edit_strategy::OutputSink>(
@@ -552,6 +572,7 @@ impl Composer {
         if delete_unit == DeleteUnit::Chars {
             self.delete_unit = DeleteUnit::Bytes;
         }
+        self.refresh_retroactive_context_after_apply(backspaces);
         if backspaces > 0 && self.method() == BackspaceMethod::SurroundingText {
             self.expected_echo = Some(PendingEcho {
                 expected: self.edit.shadow_text().to_owned(),
@@ -635,14 +656,40 @@ impl Composer {
             } else if before_cursor == expected_echo.delete_echo {
                 // Legitimate delete-only echo; keep waiting for the commit echo.
             } else if recent_action {
-                tracing::info!(
-                    expected = %expected_echo.expected,
-                    delete_echo = %expected_echo.delete_echo,
-                    actual = %before_cursor,
-                    "stale surrounding echo detected; arming char-count delete for current composition"
-                );
+                // Stale pre-edit echo. Firefox's cross-process contenteditable
+                // cache (Bug 1905481) returns text shorter than the real DOM, so
+                // a byte-count delete over-deletes and eats the preceding
+                // consonant (the `tự` first-char drop). Arm char-count delete for
+                // the next correction to compensate.
+                //
+                // Exception: during a retroactive edit where the cursor has left
+                // the word (sits on a word boundary), the surrounding text is the
+                // real buffer, not a stale-short cache — keep byte counts so the
+                // multibyte vowel is deleted whole.
+                let retroactive_cursor_left_word = self.retroactive_context
+                    && before_cursor
+                        .chars()
+                        .last()
+                        .map(is_word_boundary)
+                        .unwrap_or(false);
+                if retroactive_cursor_left_word {
+                    tracing::info!(
+                        expected = %expected_echo.expected,
+                        delete_echo = %expected_echo.delete_echo,
+                        actual = %before_cursor,
+                        "stale surrounding echo during retroactive edit; keeping byte delete"
+                    );
+                    self.delete_unit = DeleteUnit::Bytes;
+                } else {
+                    tracing::info!(
+                        expected = %expected_echo.expected,
+                        delete_echo = %expected_echo.delete_echo,
+                        actual = %before_cursor,
+                        "stale surrounding echo detected; arming char-count delete for current composition"
+                    );
+                    self.delete_unit = DeleteUnit::Chars;
+                }
                 self.expected_echo = None;
-                self.delete_unit = DeleteUnit::Chars;
             } else {
                 self.expected_echo = None;
                 self.delete_unit = DeleteUnit::Bytes;
@@ -660,11 +707,13 @@ impl Composer {
         if deletion {
             if !deletion_already_applied {
                 self.engine.reset();
+                self.retroactive_context = false;
             }
         } else if decision.reseed {
             let word = current_word_before_insertion_point(text, cursor, anchor);
             self.engine.reset();
-            if !word.is_empty() && self.engine.feed_context_gated(word) {
+            self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(word);
+            if self.retroactive_context {
                 tracing::debug!(word, "re-seed engine (activate or cursor jump)");
             }
         }
@@ -888,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_surrounding_echo_arms_char_delete_for_next_correction_only() {
+    fn stale_surrounding_echo_arms_char_delete_for_composed_chars() {
         let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
         let mut sink = DeleteCaptureSink::default();
 
@@ -900,14 +949,17 @@ mod tests {
             Some("tư")
         );
 
-        // Firefox contenteditable stale cache: after tu+w -> tư, the echo still
-        // reports the old ASCII text. This should arm char-count deletion.
+        // Firefox contenteditable stale cache (Bug 1905481): after tu+w -> tư,
+        // the echo still reports the old shorter text. A byte-count delete would
+        // over-delete and eat the preceding consonant (the `tự` first-char drop),
+        // so arm char-count deletion for the next correction.
         c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
         assert_eq!(c.delete_unit, DeleteUnit::Chars);
 
         c.mark_action();
         c.apply_to_sink(1, "ự", 2, 0, &mut sink);
 
+        // char-count delete emits before_chars = 1 into the length slot.
         assert_eq!(sink.deletes[1], (1, 1, 0, 0));
         assert_eq!(c.delete_unit, DeleteUnit::Bytes);
         assert_eq!(
@@ -932,6 +984,7 @@ mod tests {
         c.mark_action();
         c.apply_to_sink(1, "ự", 2, 0, &mut sink);
 
+        // Stale echo armed char-count delete → before_chars = 1 in length slot.
         assert_eq!(sink.deletes[1], (1, 1, 0, 0));
     }
 
@@ -959,8 +1012,10 @@ mod tests {
         c.mark_action();
         c.apply_to_sink(1, "ư", 1, 0, &mut sink);
         c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
+        // Stale echo arms char-count delete.
         assert_eq!(c.delete_unit, DeleteUnit::Chars);
 
+        // Crossing a word boundary (space) resets back to byte deletes.
         assert!(matches!(c.feed_key(' '), KeyDecision::ForwardRaw));
 
         assert_eq!(c.delete_unit, DeleteUnit::Bytes);
@@ -985,6 +1040,7 @@ mod tests {
         }
 
         c.mark_action();
+        // doe + s in Telex: backspaces=1, commit="é" → shadow becomes "doé"
         match c.feed_key('s') {
             KeyDecision::Apply {
                 backspaces, commit, ..
@@ -992,8 +1048,11 @@ mod tests {
             _ => panic!("expected stale-echo setup tone edit"),
         }
         c.observe_surrounding_bytes("doe", ByteCursor(3), ByteCursor(3), false);
+        // Stale echo arms char-count delete.
         assert_eq!(c.delete_unit, DeleteUnit::Chars);
 
+        // A forwarded raw key changes the buffer, so the one-shot char-count
+        // assumption no longer applies — reset to byte deletes.
         c.mark_action();
         assert!(matches!(c.feed_key('n'), KeyDecision::ForwardRaw));
         assert_eq!(c.delete_unit, DeleteUnit::Bytes);
@@ -1326,6 +1385,105 @@ mod tests {
             }
             _ => panic!("expected raw restore"),
         }
+    }
+
+    #[test]
+    fn retroactive_tone_toggle_then_consonant_restores_last_raw_form_only() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let mut sink = DeleteCaptureSink::default();
+        let suffix = " lá la";
+        let mut word = "là".to_owned();
+
+        c.observe_surrounding_bytes(
+            "là lá la",
+            ByteCursor(word.len() as u32),
+            ByteCursor(word.len() as u32),
+            false,
+        );
+
+        for (ch, expected_word) in [
+            ('r', "lả"),
+            ('j', "lạ"),
+            ('f', "là"),
+            ('j', "lạ"),
+            ('r', "lả"),
+            ('s', "lá"),
+            ('j', "lạ"),
+            ('r', "lả"),
+            ('f', "là"),
+        ] {
+            c.mark_action();
+            match c.feed_key(ch) {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                    word = expected_word.to_owned();
+                    let text = format!("{word}{suffix}");
+                    c.observe_surrounding_bytes(
+                        &text,
+                        ByteCursor(word.len() as u32),
+                        ByteCursor(word.len() as u32),
+                        false,
+                    );
+                }
+                _ => panic!("expected tone update for {ch:?}"),
+            }
+        }
+
+        c.mark_action();
+        match c.feed_key('d') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 2);
+                assert_eq!(commit, "lafd");
+            }
+            _ => panic!("expected raw restore for final consonant"),
+        }
+    }
+
+    #[test]
+    fn retroactive_stale_echo_keeps_byte_delete_for_multibyte_tone_updates() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        let mut sink = DeleteCaptureSink::default();
+        let text = "cà phê";
+        let cursor = "cà".len() as u32;
+
+        c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
+
+        c.mark_action();
+        match c.feed_key('r') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 1);
+                assert_eq!(commit, "ả");
+                c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+            }
+            _ => panic!("expected retroactive tone replacement"),
+        }
+
+        // Firefox contenteditable can echo the old surrounding buffer with the
+        // cursor shifted past the edit. This must not switch retroactive edits
+        // to char-count deletion, because the v1 path still needs byte counts
+        // to delete the multibyte Vietnamese character before committing again.
+        c.observe_surrounding_bytes(text, ByteCursor("cà ".len() as u32), ByteCursor("cà ".len() as u32), false);
+
+        c.mark_action();
+        match c.feed_key('j') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                assert_eq!(backspaces, 1);
+                assert_eq!(commit, "ạ");
+                c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+            }
+            _ => panic!("expected second retroactive tone replacement"),
+        }
+
+        assert_eq!(sink.deletes[1], (3, 1, 0, 0));
     }
 
     #[test]
