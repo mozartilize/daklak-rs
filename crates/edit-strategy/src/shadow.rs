@@ -117,9 +117,13 @@ impl ShadowBuffer {
         let unexpected_move =
             !self.pending_commit && self.last_cursor.map(|last| last != cursor).unwrap_or(false);
 
-        // Sync shadow to compositor's view of text before cursor.
+        // Sync shadow to compositor's view of text before the insertion
+        // point.  When anchor < cursor (selection before the cursor) the
+        // selected text replaces on the next keystroke, so the effective
+        // pre-cursor text is text[..anchor] not text[..cursor].
+        let effective_boundary = cursor_boundary.min(anchor_boundary);
         self.text.clear();
-        self.text.push_str(&text[..cursor_boundary]);
+        self.text.push_str(&text[..effective_boundary]);
 
         // Track selection span relative to cursor.
         if anchor_boundary < cursor_boundary {
