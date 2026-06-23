@@ -16,24 +16,24 @@ use crate::handler::{Daemon, KEY_BACKSPACE, NAV_KEYS};
 
 impl AdapterHandler for Daemon {
     fn on_done_frame(&mut self, ctx: &mut AdapterCtx<'_>, frame: &FrameSnapshot) {
-        if frame.activate && self.synthetic_active {
+        if frame.activate && self.router.synthetic_active {
             tracing::info!(
                 "real Activate received while synthetic session active → drop synthetic"
             );
-            self.current_active = false;
-            self.synthetic_active = false;
-            self.composer = None;
-            self.focused_app_id = None;
+            self.router.current_active = false;
+            self.router.synthetic_active = false;
+            self.router.composer = None;
+            self.router.focused_app_id = None;
         }
 
-        let activate = frame.activate && !self.current_active;
-        let deactivate = frame.deactivate && self.current_active;
+        let activate = frame.activate && !self.router.current_active;
+        let deactivate = frame.deactivate && self.router.current_active;
 
         if activate {
             let app_id = frame.app_id.clone();
             tracing::info!(app_id = ?app_id, "activate");
-            self.current_active = true;
-            self.focused_app_id = app_id;
+            self.router.current_active = true;
+            self.router.focused_app_id = app_id;
 
             // VkOnly→UInput when the transport has no vk keyboard is clamped
             // inside detect_method now (no inline backend-name check — #3).
@@ -49,13 +49,13 @@ impl AdapterHandler for Daemon {
             // ONLY by the runtime ST-liveness probe at the ST→FK downgrade —
             // not by a purpose/capability guess, because text-input-v3 exposes
             // no per-feature bit and the breakage is per-widget. See plan91.
-            c.set_modifiers(self.modifiers);
-            self.composer = Some(c);
+            c.set_modifiers(self.router.modifiers);
+            self.router.composer = Some(c);
         } else if deactivate {
             tracing::debug!("deactivate");
-            self.current_active = false;
-            self.composer = None;
-            self.focused_app_id = None;
+            self.router.current_active = false;
+            self.router.composer = None;
+            self.router.focused_app_id = None;
         }
 
         // After deactivate, composer is None — nothing more to do.
@@ -168,34 +168,34 @@ impl AdapterHandler for Daemon {
         let repeat = ctx.is_repeat();
 
         if !repeat {
-            if let Some(w) = self.composer.as_mut() {
+            if let Some(w) = self.router.composer.as_mut() {
                 w.check_idle_reset();
             }
         }
 
         let now_enabled = self.enabled.load(Ordering::Acquire);
         if !repeat {
-            if self.last_enabled && !now_enabled {
-                if let Some(w) = self.composer.as_mut() {
+            if self.router.last_enabled && !now_enabled {
+                if let Some(w) = self.router.composer.as_mut() {
                     w.full_reset();
                 }
             }
-            self.last_enabled = now_enabled;
+            self.router.last_enabled = now_enabled;
         }
         if !now_enabled {
             return KeyDecision::ForwardRaw;
         }
 
         let shortcut_mods = ModifierState::CTRL | ModifierState::ALT | ModifierState::SUPER;
-        if self.modifiers.intersects(shortcut_mods) {
-            tracing::debug!(key, mods = ?self.modifiers,
+        if self.router.modifiers.intersects(shortcut_mods) {
+            tracing::debug!(key, mods = ?self.router.modifiers,
                 "modifier shortcut → bypass engine + forward");
             // Same rationale as NAV: shortcuts (Ctrl+V paste, Ctrl+A select,
             // etc.) end the current composition. Roll the action clock back so
             // the next surrounding frame can re-seed from whatever word the
             // cursor lands on. (A repeat already did this on the initial press.)
             if !repeat {
-                if let Some(w) = self.composer.as_mut() {
+                if let Some(w) = self.router.composer.as_mut() {
                     w.full_reset();
                     w.defer_action();
                 }
@@ -212,7 +212,7 @@ impl AdapterHandler for Daemon {
             // should compose against whatever word the cursor lands on (killer
             // feature, multi-hop: "bò bo|" → arrows → "bò bof|" → composes).
             if !repeat {
-                if let Some(w) = self.composer.as_mut() {
+                if let Some(w) = self.router.composer.as_mut() {
                     w.full_reset();
                     w.defer_action();
                 }
@@ -221,7 +221,7 @@ impl AdapterHandler for Daemon {
             return KeyDecision::Consumed;
         }
 
-        if self.composer.is_none() {
+        if self.router.composer.is_none() {
             tracing::trace!(key, "key: no active window → forward");
             return KeyDecision::ForwardRaw;
         }
@@ -245,7 +245,7 @@ impl AdapterHandler for Daemon {
             return self.handle_backspace();
         }
 
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             w.mark_action();
         }
 
@@ -273,6 +273,7 @@ impl AdapterHandler for Daemon {
             && !ch.is_control()
         {
             let method = self
+                .router
                 .composer
                 .as_ref()
                 .map(|w| w.method())
@@ -300,7 +301,7 @@ impl AdapterHandler for Daemon {
     ) {
         let _ = method;
         let serial = ctx.serial();
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             tracing::debug!(method = ?w.method(), backspaces, commit, "strategy.apply");
             let commit_string_functional = w.commit_string_functional;
             ctx.with_sink(raw_mods, held_user_kc, commit_string_functional, |sink| {
@@ -310,8 +311,8 @@ impl AdapterHandler for Daemon {
     }
 
     fn on_modifiers(&mut self, _ctx: &mut AdapterCtx<'_>, m: ModifierState) {
-        self.modifiers = m;
-        if let Some(w) = self.composer.as_mut() {
+        self.router.modifiers = m;
+        if let Some(w) = self.router.composer.as_mut() {
             w.set_modifiers(m);
         }
     }
@@ -348,7 +349,7 @@ impl AdapterHandler for Daemon {
         let vk_available = ctx.profile().has_vk_keyboard;
         let matched = vk_only_matched && vk_available;
 
-        if matched && !self.current_active {
+        if matched && !self.router.current_active {
             let id = app_id.clone().unwrap_or_default();
             let reason = if in_force_vk_only {
                 "force_vk_only_apps"
@@ -358,29 +359,29 @@ impl AdapterHandler for Daemon {
 
             tracing::info!(app_id = %id, reason, is_xwayland,
                 "synthetic activate → VkOnly");
-            self.current_active = true;
-            self.synthetic_active = true;
-            self.focused_app_id = app_id;
+            self.router.current_active = true;
+            self.router.synthetic_active = true;
+            self.router.focused_app_id = app_id;
             let mut c = Composer::new(
                 self.config.method.to_engine(),
                 BackspaceMethod::VkOnly,
                 self.config.bracket_shortcuts,
             );
-            c.set_modifiers(self.modifiers);
-            self.composer = Some(c);
-        } else if self.synthetic_active && !matched {
+            c.set_modifiers(self.router.modifiers);
+            self.router.composer = Some(c);
+        } else if self.router.synthetic_active && !matched {
             tracing::info!(
-                old = ?self.focused_app_id,
+                old = ?self.router.focused_app_id,
                 new = ?app_id,
                 is_xwayland,
                 in_force_uinput,
                 "synthetic deactivate (no longer matches VkOnly conditions)"
             );
-            self.current_active = false;
-            self.synthetic_active = false;
-            self.composer = None;
-            self.focused_app_id = None;
-        } else if !self.synthetic_active && matched {
+            self.router.current_active = false;
+            self.router.synthetic_active = false;
+            self.router.composer = None;
+            self.router.focused_app_id = None;
+        } else if !self.router.synthetic_active && matched {
             tracing::trace!("focus_changed skipped: already active via IM");
         }
     }
