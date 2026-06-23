@@ -3,7 +3,7 @@ use std::os::fd::OwnedFd;
 use anyhow::{Context, Result};
 use xkbcommon::xkb::{
     Context as XkbContext, Keycode, Keymap, Keysym, State, CONTEXT_NO_FLAGS,
-    KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1,
+    KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1, MOD_INVALID,
 };
 
 /// xkbcommon wrapper for hardware keycode → UTF-8 char conversion.
@@ -12,6 +12,15 @@ use xkbcommon::xkb::{
 pub struct XkbState {
     keymap: Keymap,
     state: State,
+}
+
+/// Modifier masks derived from canonical xkb modifier names in the active keymap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CanonicalModifierMasks {
+    pub shift: u32,
+    pub control: u32,
+    pub alt: u32,
+    pub logo: u32,
 }
 
 impl XkbState {
@@ -64,17 +73,39 @@ impl XkbState {
     #[cfg(feature = "test-util")]
     pub fn us_for_test() -> Self {
         let ctx = XkbContext::new(CONTEXT_NO_FLAGS);
-        let keymap = Keymap::new_from_names(
-            &ctx,
-            "",
-            "",
-            "us",
-            "",
-            None,
-            KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .expect("build us test keymap");
+        let keymap = Keymap::new_from_names(&ctx, "", "", "us", "", None, KEYMAP_COMPILE_NO_FLAGS)
+            .expect("build us test keymap");
         Self::from_keymap(keymap)
+    }
+
+    /// Return masks for canonical modifiers in this keymap.
+    ///
+    /// The Wayland keyboard `modifiers` event carries xkb modifier masks, whose
+    /// bit positions are defined by the keymap's modifier indices. Do not assume
+    /// that Shift/Control/Mod1/Mod4 always occupy the conventional bit values;
+    /// ask xkbcommon for each modifier index and convert it to a mask bit.
+    ///
+    /// `Alt` and `Logo` are virtual modifier names some keymaps expose in
+    /// addition to the standard core modifier names `Mod1` and `Mod4`, so each
+    /// logical field ORs all known aliases present in the keymap.
+    pub fn canonical_modifier_masks(&self) -> CanonicalModifierMasks {
+        CanonicalModifierMasks {
+            shift: self.mod_mask_for_names(&["Shift"]),
+            control: self.mod_mask_for_names(&["Control"]),
+            alt: self.mod_mask_for_names(&["Mod1", "Alt"]),
+            logo: self.mod_mask_for_names(&["Mod4", "Logo"]),
+        }
+    }
+
+    fn mod_mask_for_names(&self, names: &[&str]) -> u32 {
+        names.iter().fold(0, |mask, name| {
+            let idx = self.keymap.mod_get_index(*name);
+            if idx == MOD_INVALID || idx >= u32::BITS {
+                mask
+            } else {
+                mask | (1_u32 << idx)
+            }
+        })
     }
 
     /// Translate a hardware evdev keycode to the char it produces with the
@@ -140,6 +171,16 @@ mod tests {
         let keymap =
             Keymap::new_from_names(&ctx, "", "", "us", "", None, KEYMAP_COMPILE_NO_FLAGS).unwrap();
         XkbState::from_keymap(keymap)
+    }
+
+    #[test]
+    fn canonical_modifier_masks_follow_keymap_indices() {
+        let xkb = us();
+        let masks = xkb.canonical_modifier_masks();
+        assert_eq!(masks.shift, 0x01);
+        assert_eq!(masks.control, 0x04);
+        assert_ne!(masks.alt & 0x08, 0, "Mod1 contributes to the Alt mask");
+        assert_eq!(masks.logo, 0x40);
     }
 
     #[test]
