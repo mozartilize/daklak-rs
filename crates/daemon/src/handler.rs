@@ -10,9 +10,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use viet_ime_edit_strategy::{
-    detect_method, BackspaceMethod, CapabilityProbe, ModifierState, SurroundingFrame,
+    detect_method, BackspaceMethod, CapabilityProbe, KeyDecision, ModifierState, SurroundingFrame,
 };
-use viet_ime_wayland_adapter::{FrameSnapshot, KeyDecision};
+use viet_ime_wayland_adapter::FrameSnapshot;
 
 #[cfg(feature = "ibus")]
 use crate::composer::CharCursor;
@@ -515,7 +515,7 @@ mod tests {
         use std::sync::Arc;
         use viet_ime_edit_strategy::BackspaceMethod;
         use viet_ime_engine::InputMethod;
-        use viet_ime_wayland_adapter::KeyDecision;
+        use viet_ime_edit_strategy::KeyDecision;
 
         fn daemon() -> Daemon {
             let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));

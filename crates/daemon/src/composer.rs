@@ -8,9 +8,8 @@
 
 use std::time::{Duration, Instant};
 
-use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, ModifierState, Strategy};
+use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, KeyDecision, ModifierState, Strategy};
 use viet_ime_engine::{EngineState, InputMethod};
-use viet_ime_wayland_adapter::KeyDecision;
 
 /// Surrounding-text cursor expressed in **bytes** (wayland text_input_v3).
 pub struct ByteCursor(pub u32);
@@ -896,7 +895,7 @@ mod tests {
     use super::{ByteCursor, Composer};
     use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, KeyState, OutputSink};
     use viet_ime_engine::InputMethod;
-    use viet_ime_wayland_adapter::KeyDecision;
+    use viet_ime_edit_strategy::KeyDecision;
 
     #[derive(Default)]
     struct DeleteCaptureSink {

@@ -7,9 +7,9 @@
 use std::sync::atomic::Ordering;
 
 use viet_ime_edit_strategy::{
-    detect_method, BackspaceMethod, CapabilityProbe, ModifierState, SurroundingFrame,
+    detect_method, BackspaceMethod, CapabilityProbe, KeyDecision, ModifierState, SurroundingFrame,
 };
-use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, FrameSnapshot, KeyDecision};
+use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, FrameSnapshot};
 
 use crate::composer::{ByteCursor, Composer};
 use crate::handler::{Daemon, KEY_BACKSPACE, NAV_KEYS};

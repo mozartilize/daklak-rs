@@ -1,7 +1,7 @@
 //! IBus transport glue: `IbusHandler` impl. Thin delegations to the `Daemon`
 //! routing surface + `Composer` brain. Only compiled with the `ibus` feature.
 
-use viet_ime_wayland_adapter::KeyDecision;
+use viet_ime_edit_strategy::KeyDecision;
 
 use crate::handler::Daemon;
 

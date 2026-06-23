@@ -1,7 +1,7 @@
 //! Evdev transport glue: `EvdevHandler` impl. Thin delegations to the
 //! `Daemon` routing surface + `Composer` brain.
 
-use viet_ime_wayland_adapter::KeyDecision;
+use viet_ime_edit_strategy::KeyDecision;
 
 use crate::handler::Daemon;
 
