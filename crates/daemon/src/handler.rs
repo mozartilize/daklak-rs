@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use viet_ime_edit_strategy::{
-    detect_method, BackspaceMethod, CapabilityProbe, KeyDecision, ModifierState, SurroundingFrame,
+    detect_method, BackspaceMethod, CapabilityProbe, KeyDecision, ModifierState,
 };
 use viet_ime_wayland_adapter::FrameSnapshot;
 
@@ -128,12 +128,7 @@ impl Daemon {
     ) -> BackspaceMethod {
         let probe = CapabilityProbe {
             purpose: frame.purpose,
-            surrounding_text_seen: frame.surrounding_text.as_ref().map(
-                |(text, cursor, _anchor)| SurroundingFrame {
-                    text: text.clone(),
-                    cursor: *cursor,
-                },
-            ),
+            surrounding_text_seen: frame.surrounding_text.is_some(),
             app_id: self.router.focused_app_id.clone(),
             force_uinput_apps: self.config.force_uinput_apps.clone(),
             force_vk_only_apps: self.config.force_vk_only_apps.clone(),
@@ -514,8 +509,8 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
         use viet_ime_edit_strategy::BackspaceMethod;
-        use viet_ime_engine::InputMethod;
         use viet_ime_edit_strategy::KeyDecision;
+        use viet_ime_engine::InputMethod;
 
         fn daemon() -> Daemon {
             let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));

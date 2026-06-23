@@ -7,7 +7,7 @@ mod uinput_backspace;
 pub mod uinput_device;
 mod vk_only;
 
-pub use capability::{detect_method, CapabilityProbe, SurroundingFrame};
+pub use capability::{detect_method, CapabilityProbe};
 pub use shadow::ShadowBuffer;
 
 use bitflags::bitflags;
