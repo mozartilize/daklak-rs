@@ -22,8 +22,8 @@ impl viet_ime_ibus_adapter::IbusHandler for Daemon {
         Daemon::observe_surrounding(self, text, cursor, anchor);
     }
     fn set_modifiers(&mut self, m: viet_ime_edit_strategy::ModifierState) {
-        self.modifiers = m;
-        if let Some(w) = self.composer.as_mut() {
+        self.router.modifiers = m;
+        if let Some(w) = self.router.composer.as_mut() {
             w.set_modifiers(m);
         }
     }
@@ -37,7 +37,7 @@ impl viet_ime_ibus_adapter::IbusHandler for Daemon {
         Daemon::update_ibus_method(self, method);
     }
     fn full_reset(&mut self) {
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             w.full_reset();
         }
     }

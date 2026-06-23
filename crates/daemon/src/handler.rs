@@ -4,7 +4,6 @@
 //! wire glue lives in [`crate::transport`]. `Daemon` keeps a single live
 //! `Composer` and exposes transport-neutral entry points that the glue calls.
 
-use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "ibus")]
 use std::sync::atomic::Ordering;
@@ -86,20 +85,6 @@ pub struct Daemon {
     pub enabled: Arc<AtomicBool>,
 }
 
-impl Deref for Daemon {
-    type Target = Router;
-
-    fn deref(&self) -> &Self::Target {
-        &self.router
-    }
-}
-
-impl DerefMut for Daemon {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.router
-    }
-}
-
 impl Daemon {
     pub fn new(config: Config, enabled: Arc<AtomicBool>) -> Self {
         let terminal_override = match std::env::var("DAKLAK_TERMINAL_TIER")
@@ -149,7 +134,7 @@ impl Daemon {
                     cursor: *cursor,
                 },
             ),
-            app_id: self.focused_app_id.clone(),
+            app_id: self.router.focused_app_id.clone(),
             force_uinput_apps: self.config.force_uinput_apps.clone(),
             force_vk_only_apps: self.config.force_vk_only_apps.clone(),
             terminal_override: self.terminal_override,
@@ -169,47 +154,47 @@ impl Daemon {
     /// shadow at word start, same as the wayland path.
     #[cfg(feature = "ibus")]
     pub fn process_key(&mut self, key: u32, ch: Option<char>) -> KeyDecision {
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             w.check_idle_reset();
         }
         let now_enabled = self.enabled.load(Ordering::Acquire);
-        if self.last_enabled && !now_enabled {
-            if let Some(w) = self.composer.as_mut() {
+        if self.router.last_enabled && !now_enabled {
+            if let Some(w) = self.router.composer.as_mut() {
                 w.full_reset();
             }
         }
-        self.last_enabled = now_enabled;
+        self.router.last_enabled = now_enabled;
         if !now_enabled {
             return KeyDecision::ForwardRaw;
         }
         let shortcut_mods = ModifierState::CTRL | ModifierState::ALT | ModifierState::SUPER;
-        if self.modifiers.intersects(shortcut_mods) {
-            if let Some(w) = self.composer.as_mut() {
+        if self.router.modifiers.intersects(shortcut_mods) {
+            if let Some(w) = self.router.composer.as_mut() {
                 w.full_reset();
                 w.defer_action();
             }
             return KeyDecision::ForwardRaw;
         }
         if NAV_KEYS.contains(&key) {
-            if let Some(w) = self.composer.as_mut() {
+            if let Some(w) = self.router.composer.as_mut() {
                 w.full_reset();
                 w.defer_action();
             }
             return KeyDecision::ForwardRaw;
         }
-        if self.composer.is_none() {
+        if self.router.composer.is_none() {
             return KeyDecision::ForwardRaw;
         }
         if key == KEY_BACKSPACE {
             return self.handle_backspace();
         }
         if key == KEY_ESC {
-            if let Some(w) = self.composer.as_mut() {
+            if let Some(w) = self.router.composer.as_mut() {
                 w.defer_action();
             }
             return KeyDecision::ForwardRaw;
         }
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             w.mark_action();
         }
         let Some(ch) = ch else {
@@ -217,7 +202,7 @@ impl Daemon {
             // Clear the composition so the next char starts fresh and isn't
             // seeded with this line's word (e.g. after "hiếu"⏎ the next key must
             // start a new word, not extend "hiếu").
-            if let Some(w) = self.composer.as_mut() {
+            if let Some(w) = self.router.composer.as_mut() {
                 w.full_reset();
                 w.defer_action();
             }
@@ -232,14 +217,14 @@ impl Daemon {
     /// (no per-key reset) for every transport — wayland, IBus, evdev — building
     /// on the prior key's state, with a render-gated shadow seed at word start.
     pub fn handle_char(&mut self, _key: u32, ch: char) -> KeyDecision {
-        match self.composer.as_mut() {
+        match self.router.composer.as_mut() {
             Some(w) => w.feed_key(ch),
             None => KeyDecision::ForwardRaw,
         }
     }
 
     pub fn handle_backspace(&mut self) -> KeyDecision {
-        match self.composer.as_mut() {
+        match self.router.composer.as_mut() {
             Some(w) => w.feed_backspace(),
             None => KeyDecision::ForwardRaw,
         }
@@ -254,7 +239,7 @@ impl Daemon {
         time: u32,
         sink: &mut S,
     ) {
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             // Echo-based ST → FK downgrade for clients that advertise
             // surrounding-text but silently no-op DeleteSurroundingText (Google
             // Docs under IBus), doubling each correction (`Tiếng` →
@@ -285,7 +270,7 @@ impl Daemon {
     /// daklak action (our own echo) and on mid-word 1-char insertions.
     #[cfg(feature = "ibus")]
     pub fn observe_surrounding(&mut self, text: &str, cursor: u32, anchor: u32) {
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             // A frame arrived → the client echoed our edit, i.e. it honored
             // delete_surrounding_text. Opens the echo window so the echo-based
             // downgrade (`note_surrounding_correction`, in `apply_with_sink`)
@@ -331,16 +316,16 @@ impl Daemon {
             BackspaceMethod::VkOnly,
             self.config.bracket_shortcuts,
         );
-        c.set_modifiers(self.modifiers);
-        self.current_active = true;
-        self.synthetic_active = true;
-        self.composer = Some(c);
+        c.set_modifiers(self.router.modifiers);
+        self.router.current_active = true;
+        self.router.synthetic_active = true;
+        self.router.composer = Some(c);
     }
 
     /// Create a composer session for a non-Wayland transport (IBus). Idempotent.
     #[cfg(feature = "ibus")]
     pub fn activate_ibus(&mut self, method: viet_ime_edit_strategy::BackspaceMethod) {
-        if self.current_active {
+        if self.router.current_active {
             return;
         }
         let mut c = Composer::new(
@@ -348,25 +333,25 @@ impl Daemon {
             method,
             self.config.bracket_shortcuts,
         );
-        c.set_modifiers(self.modifiers);
-        self.composer = Some(c);
-        self.current_active = true;
+        c.set_modifiers(self.router.modifiers);
+        self.router.composer = Some(c);
+        self.router.current_active = true;
     }
 
     /// Tear down the IBus session. Clears composition state.
     #[cfg(feature = "ibus")]
     pub fn deactivate_ibus(&mut self) {
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             w.full_reset();
         }
-        self.composer = None;
-        self.current_active = false;
+        self.router.composer = None;
+        self.router.current_active = false;
     }
 
     /// React to an IBus routing change while a session is live.
     #[cfg(feature = "ibus")]
     pub fn update_ibus_method(&mut self, want: BackspaceMethod) {
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             if w.method() != want {
                 tracing::info!(?want, "ibus: method updated");
                 w.set_method(want);
@@ -455,7 +440,7 @@ mod tests {
             // detect_method, fed by TransportProfile.has_vk_keyboard (#3, M2c).
             let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
             d.config.force_vk_only_apps = vec!["chromium".to_owned()];
-            d.focused_app_id = Some("chromium".to_owned());
+            d.router.focused_app_id = Some("chromium".to_owned());
             let f = frame("", 0, 0);
 
             assert_eq!(
@@ -483,8 +468,8 @@ mod tests {
             // arrives via the fast wl_keyboard path and changes Chrome's
             // selection state before our text edit arrives.
             let mut daemon = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
-            daemon.current_active = true;
-            daemon.composer = Some(Composer::new(
+            daemon.router.current_active = true;
+            daemon.router.composer = Some(Composer::new(
                 InputMethod::Telex,
                 BackspaceMethod::SurroundingText,
                 false,
@@ -497,7 +482,11 @@ mod tests {
             daemon.on_done_frame(&mut ctx, &frame("translate", 3, 9));
 
             let mut sink = DeleteCaptureSink::default();
-            let w = daemon.composer.as_mut().expect("composer state exists");
+            let w = daemon
+                .router
+                .composer
+                .as_mut()
+                .expect("composer state exists");
             w.apply_to_sink(1, "â", 1, 0, &mut sink);
 
             // Selection present → no delete_surrounding_text (would race),
@@ -530,8 +519,8 @@ mod tests {
 
         fn daemon() -> Daemon {
             let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
-            d.current_active = true;
-            d.composer = Some(Composer::new(
+            d.router.current_active = true;
+            d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
                 BackspaceMethod::SurroundingText,
                 false,
@@ -619,8 +608,8 @@ mod tests {
 
         fn v1_daemon() -> Daemon {
             let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
-            d.current_active = true;
-            d.composer = Some(Composer::new(
+            d.router.current_active = true;
+            d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
                 BackspaceMethod::SurroundingText,
                 false,
@@ -672,7 +661,7 @@ mod tests {
             let mut d = v1_daemon();
             // Ctrl held → Ctrl+Left takes the modifier-shortcut branch, which
             // sits above the compose-swallow so its repeats still forward.
-            d.modifiers = ModifierState::CTRL;
+            d.router.modifiers = ModifierState::CTRL;
             let decision = key(&mut d, KEY_LEFT, None, true);
             assert!(
                 matches!(decision, KeyDecision::Consumed),
@@ -702,8 +691,8 @@ mod tests {
 
         fn daemon() -> Daemon {
             let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
-            d.current_active = true;
-            d.composer = Some(Composer::new(
+            d.router.current_active = true;
+            d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
                 BackspaceMethod::ForwardKey,
                 false,

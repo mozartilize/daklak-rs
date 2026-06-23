@@ -15,26 +15,26 @@ impl viet_ime_evdev_adapter::EvdevHandler for Daemon {
     }
 
     fn clear_session(&mut self) {
-        self.current_active = false;
-        self.synthetic_active = false;
-        self.composer = None;
-        self.focused_app_id = None;
+        self.router.current_active = false;
+        self.router.synthetic_active = false;
+        self.router.composer = None;
+        self.router.focused_app_id = None;
     }
 
     fn clear_last_input_char(&mut self) {
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             w.last_input_char = None;
         }
     }
 
     fn full_reset_window(&mut self) {
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             w.full_reset();
         }
     }
 
     fn check_idle_reset_window(&mut self) {
-        if let Some(w) = self.composer.as_mut() {
+        if let Some(w) = self.router.composer.as_mut() {
             w.check_idle_reset();
         }
     }
