@@ -622,21 +622,24 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             return;
         }
 
-        if let Some(xkb) = &mut self.state.xkb {
+        let modifier_masks = if let Some(xkb) = &mut self.state.xkb {
             xkb.update_modifiers(mods_depressed, mods_latched, mods_locked, group);
-        }
+            xkb.canonical_modifier_masks()
+        } else {
+            xkb::CanonicalModifierMasks::default()
+        };
 
         let mut m = ModifierState::empty();
-        if mods_depressed & 0x01 != 0 {
+        if mods_depressed & modifier_masks.shift != 0 {
             m |= ModifierState::SHIFT;
         }
-        if mods_depressed & 0x04 != 0 {
+        if mods_depressed & modifier_masks.control != 0 {
             m |= ModifierState::CTRL;
         }
-        if mods_depressed & 0x08 != 0 {
+        if mods_depressed & modifier_masks.alt != 0 {
             m |= ModifierState::ALT;
         }
-        if mods_depressed & 0x40 != 0 {
+        if mods_depressed & modifier_masks.logo != 0 {
             m |= ModifierState::SUPER;
         }
         self.state.modifiers = m;
