@@ -251,6 +251,55 @@ impl AdapterState {
         }
     }
 
+    pub(crate) fn held_user_kc(&self) -> Option<u32> {
+        match (self.last_forwarded_key, self.last_forwarded_release) {
+            (Some((kc_p, t_p)), Some((kc_r, t_r))) if kc_p == kc_r && t_r > t_p => None,
+            (Some((kc_p, _)), _) => Some(kc_p),
+            (None, _) => None,
+        }
+    }
+
+    pub(crate) fn log_duplicate_tail_diagnostic(
+        &self,
+        commit: &str,
+        backspaces: usize,
+        held_user_kc: Option<u32>,
+    ) {
+        let Some(tail) = commit.chars().last() else {
+            return;
+        };
+        let Some(spec) = crate::keymap::char_to_emit(tail) else {
+            return;
+        };
+        let press_match = self.last_forwarded_key.filter(|(kc, _)| *kc == spec.keycode);
+        let release_match = self
+            .last_forwarded_release
+            .filter(|(kc, _)| *kc == spec.keycode);
+        let press_gap_us = press_match.map(|(_, t)| t.elapsed().as_micros() as u64);
+        let release_gap_us = release_match.map(|(_, t)| t.elapsed().as_micros() as u64);
+        let held = held_user_kc == Some(spec.keycode);
+        if press_match.is_some() || release_match.is_some() {
+            tracing::warn!(
+                tail = %tail,
+                tail_kc = spec.keycode,
+                ?press_gap_us,
+                ?release_gap_us,
+                held,
+                backspaces,
+                commit,
+                "DUPLICATE-TAIL: vk_only commit tail keycode matches user's last forwarded press/release → tail-drop prelude release will be emitted if held"
+            );
+        } else {
+            tracing::debug!(
+                tail = %tail,
+                tail_kc = spec.keycode,
+                last_press_kc = ?self.last_forwarded_key.map(|(k, _)| k),
+                last_release_kc = ?self.last_forwarded_release.map(|(k, _)| k),
+                "tail-check: vk_only commit tail keycode differs from last forwarded"
+            );
+        }
+    }
+
     /// Forward-path key emit. Falls through to `zwp_virtual_keyboard_v1`
     /// (v2) or `zwp_input_method_context_v1.key` (v1). Used by
     /// `forward_press` / `dispatch_key_release` / `KeyDecision::ForwardRaw`.

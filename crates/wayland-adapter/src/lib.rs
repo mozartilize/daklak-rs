@@ -427,10 +427,11 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                     });
                 }
 
-                let held_user_kc = compute_held_user_kc(&self.state);
+                let held_user_kc = self.state.held_user_kc();
 
                 if method == BackspaceMethod::VkOnly {
-                    log_duplicate_tail_diagnostic(&self.state, &commit, backspaces, held_user_kc);
+                    self.state
+                        .log_duplicate_tail_diagnostic(&commit, backspaces, held_user_kc);
                 }
 
                 let raw_mods = self.state.raw_mods;
@@ -664,57 +665,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
     }
 }
 
-fn compute_held_user_kc(state: &AdapterState) -> Option<u32> {
-    match (state.last_forwarded_key, state.last_forwarded_release) {
-        (Some((kc_p, t_p)), Some((kc_r, t_r))) if kc_p == kc_r && t_r > t_p => None,
-        (Some((kc_p, _)), _) => Some(kc_p),
-        (None, _) => None,
-    }
-}
-
-fn log_duplicate_tail_diagnostic(
-    state: &AdapterState,
-    commit: &str,
-    backspaces: usize,
-    held_user_kc: Option<u32>,
-) {
-    let Some(tail) = commit.chars().last() else {
-        return;
-    };
-    let Some(spec) = crate::keymap::char_to_emit(tail) else {
-        return;
-    };
-    let press_match = state
-        .last_forwarded_key
-        .filter(|(kc, _)| *kc == spec.keycode);
-    let release_match = state
-        .last_forwarded_release
-        .filter(|(kc, _)| *kc == spec.keycode);
-    let press_gap_us = press_match.map(|(_, t)| t.elapsed().as_micros() as u64);
-    let release_gap_us = release_match.map(|(_, t)| t.elapsed().as_micros() as u64);
-    let held = held_user_kc == Some(spec.keycode);
-    if press_match.is_some() || release_match.is_some() {
-        tracing::warn!(
-            tail = %tail,
-            tail_kc = spec.keycode,
-            ?press_gap_us,
-            ?release_gap_us,
-            held,
-            backspaces,
-            commit,
-            "DUPLICATE-TAIL: vk_only commit tail keycode matches user's last forwarded press/release → tail-drop prelude release will be emitted if held"
-        );
-    } else {
-        tracing::debug!(
-            tail = %tail,
-            tail_kc = spec.keycode,
-            last_press_kc = ?state.last_forwarded_key.map(|(k, _)| k),
-            last_release_kc = ?state.last_forwarded_release.map(|(k, _)| k),
-            "tail-check: vk_only commit tail keycode differs from last forwarded"
-        );
-    }
-}
-
 /// Probe the focus-tracking source, independent of the IM protocol.
 /// Order: `wlr-foreign-toplevel-management` (wlroots and anything exposing it),
 /// then KDE Plasma (only under the `kde` feature), else none. Runs for both v1
@@ -882,7 +832,6 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
 #[cfg(test)]
 mod tests {
     use super::*;
-    use viet_ime_edit_strategy::ModifierState;
 
     #[test]
     fn profile_for_imv2_has_vk_no_keysym() {
@@ -982,6 +931,7 @@ mod tests {
         }
     }
 
+
     #[test]
     fn press_value_is_2_only_while_forwarding_repeat() {
         // The whole repeat fix hinges on this: a fresh press forwards as
@@ -993,6 +943,40 @@ mod tests {
         assert_eq!(s.press_value(), 2, "repeat press = state 2");
         s.forwarding_repeat = false;
         assert_eq!(s.press_value(), 1, "back to state 1 once repeat clears");
+    }
+
+    #[test]
+    fn held_user_kc_tracks_unreleased_forwarded_press() {
+        let mut s = AdapterState::new();
+        let press_at = Instant::now();
+
+        assert_eq!(s.held_user_kc(), None, "no forwarded press is held");
+
+        s.last_forwarded_key = Some((38, press_at));
+        assert_eq!(s.held_user_kc(), Some(38), "press without release is held");
+
+        s.last_forwarded_release = Some((39, press_at + Duration::from_millis(1)));
+        assert_eq!(
+            s.held_user_kc(),
+            Some(38),
+            "release of a different key does not clear the held press"
+        );
+
+        s.last_forwarded_release = Some((38, press_at + Duration::from_millis(2)));
+        assert_eq!(
+            s.held_user_kc(),
+            None,
+            "matching release after the press clears the held key"
+        );
+    }
+
+    #[test]
+    fn duplicate_tail_diagnostic_accepts_keymap_tail_lookup() {
+        let mut s = AdapterState::new();
+        let spec = crate::keymap::char_to_emit('a').expect("test keymap emits ASCII a");
+        s.last_forwarded_key = Some((spec.keycode, Instant::now()));
+
+        s.log_duplicate_tail_diagnostic("a", 0, s.held_user_kc());
     }
 
     #[test]
