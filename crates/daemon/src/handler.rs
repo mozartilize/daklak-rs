@@ -203,7 +203,7 @@ impl Daemon {
             }
             return KeyDecision::ForwardRaw;
         };
-        self.handle_char(key, ch)
+        self.handle_char(ch)
     }
 
     // ── thin delegations to the Composer brain (trait surface + tests) ──────
@@ -211,7 +211,7 @@ impl Daemon {
     /// Feed a printable char to the composer. The engine runs continuously
     /// (no per-key reset) for every transport — wayland, IBus, evdev — building
     /// on the prior key's state, with a render-gated shadow seed at word start.
-    pub fn handle_char(&mut self, _key: u32, ch: char) -> KeyDecision {
+    pub fn handle_char(&mut self, ch: char) -> KeyDecision {
         match self.router.composer.as_mut() {
             Some(w) => w.feed_key(ch),
             None => KeyDecision::ForwardRaw,
@@ -530,7 +530,7 @@ mod tests {
             let mut d = daemon();
             let mut visible = String::new();
             for ch in "word".chars() {
-                match d.handle_char(0, ch) {
+                match d.handle_char(ch) {
                     KeyDecision::ForwardRaw => visible.push(ch),
                     KeyDecision::Apply {
                         backspaces, commit, ..

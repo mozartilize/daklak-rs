@@ -251,7 +251,7 @@ impl AdapterHandler for Daemon {
             return KeyDecision::ForwardRaw;
         };
 
-        let decision = self.handle_char(key, ch);
+        let decision = self.handle_char(ch);
 
         // v1/KWin ForwardKey: a passthrough char (engine didn't consume it, or
         // emitted it unchanged) is normally forwarded as a raw keycode. But

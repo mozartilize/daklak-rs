@@ -6,8 +6,8 @@ use viet_ime_edit_strategy::KeyDecision;
 use crate::handler::Daemon;
 
 impl viet_ime_evdev_adapter::EvdevHandler for Daemon {
-    fn handle_char(&mut self, code: u32, ch: char) -> KeyDecision {
-        Daemon::handle_char(self, code, ch)
+    fn handle_char(&mut self, _code: u32, ch: char) -> KeyDecision {
+        Daemon::handle_char(self, ch)
     }
 
     fn handle_backspace(&mut self) -> KeyDecision {
