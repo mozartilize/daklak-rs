@@ -6,9 +6,11 @@ use crate::BackspaceMethod;
 pub struct CapabilityProbe {
     /// content_type `purpose` from the compositor (zwp_input_method_v2 event).
     pub purpose: u32,
-    /// The first surrounding_text frame received after activate.
-    /// `None` means none arrived within the probe window (VSCode path).
-    pub surrounding_text_seen: Option<SurroundingFrame>,
+    /// Whether a surrounding_text frame was received after activate.
+    /// `false` means none arrived within the probe window (VSCode path).
+    /// Only presence is needed for capability detection; the frame text/cursor
+    /// stay in the transport/composer path so probing does not clone text.
+    pub surrounding_text_seen: bool,
     /// Focused window's `app_id` at activate (Sway IPC). Matched
     /// case-insensitively against `force_uinput_apps` to escalate any
     /// known-broken app (terminal or otherwise) to Tier 3 UInput. `None` on
@@ -37,11 +39,6 @@ pub struct CapabilityProbe {
     /// false. Sourced once from `TransportProfile.has_vk_keyboard`; the
     /// decision lives here so no use site re-checks the backend by name.
     pub vk_keyboard_available: bool,
-}
-
-pub struct SurroundingFrame {
-    pub text: String,
-    pub cursor: u32,
 }
 
 /// PURPOSE_TERMINAL from zwp_text_input_unstable_v3 (value 13).
@@ -114,9 +111,10 @@ fn desired_method(probe: &CapabilityProbe) -> BackspaceMethod {
     //   enum SurroundingSupport { Confirmed, TimedOut, ExplicitlyUnsupported }
     // and route TimedOut → keep last decision (or default), ExplicitlyUnsupported
     // → ForwardKey, Confirmed → SurroundingText.
-    match &probe.surrounding_text_seen {
-        Some(_) => BackspaceMethod::SurroundingText,
-        None => BackspaceMethod::ForwardKey,
+    if probe.surrounding_text_seen {
+        BackspaceMethod::SurroundingText
+    } else {
+        BackspaceMethod::ForwardKey
     }
 }
 
@@ -137,13 +135,10 @@ fn app_id_matches<S: AsRef<str>>(app_id: &str, list: &[S]) -> bool {
 mod tests {
     use super::*;
 
-    fn probe(purpose: u32, surrounding: Option<(&str, u32)>) -> CapabilityProbe {
+    fn probe(purpose: u32, surrounding_text_seen: bool) -> CapabilityProbe {
         CapabilityProbe {
             purpose,
-            surrounding_text_seen: surrounding.map(|(t, c)| SurroundingFrame {
-                text: t.to_owned(),
-                cursor: c,
-            }),
+            surrounding_text_seen,
             app_id: None,
             force_uinput_apps: Vec::new(),
             force_vk_only_apps: Vec::new(),
@@ -155,16 +150,12 @@ mod tests {
     }
 
     fn probe_with_app_id(purpose: u32, app_id: &str) -> CapabilityProbe {
-        let mut p = probe(purpose, None);
+        let mut p = probe(purpose, false);
         p.app_id = Some(app_id.to_owned());
         p
     }
 
-    fn probe_with_app_id_and_list(
-        purpose: u32,
-        app_id: &str,
-        list: &[&str],
-    ) -> CapabilityProbe {
+    fn probe_with_app_id_and_list(purpose: u32, app_id: &str, list: &[&str]) -> CapabilityProbe {
         let mut p = probe_with_app_id(purpose, app_id);
         p.force_uinput_apps = list.iter().map(|s| (*s).to_owned()).collect();
         p
@@ -173,12 +164,12 @@ mod tests {
     #[test]
     fn terminal_default_is_forward_key() {
         // No app_id, no override, empty broken list → ForwardKey.
-        assert_eq!(detect_method(&probe(13, None)), BackspaceMethod::ForwardKey);
-        // surrounding_text presence does NOT influence terminal routing.
         assert_eq!(
-            detect_method(&probe(13, Some(("text", 4)))),
+            detect_method(&probe(13, false)),
             BackspaceMethod::ForwardKey
         );
+        // surrounding_text presence does NOT influence terminal routing.
+        assert_eq!(detect_method(&probe(13, true)), BackspaceMethod::ForwardKey);
     }
 
     #[test]
@@ -209,7 +200,7 @@ mod tests {
 
     #[test]
     fn terminal_override_surrounding() {
-        let mut p = probe(13, Some(("", 0)));
+        let mut p = probe(13, true);
         p.terminal_override = Some(BackspaceMethod::SurroundingText);
         assert_eq!(detect_method(&p), BackspaceMethod::SurroundingText);
     }
@@ -224,7 +215,10 @@ mod tests {
             assert!(app_id_matches(input, list), "expected match for {input}");
         }
         for input in ["chrome", "footclient", "foot", "gedit", ""] {
-            assert!(!app_id_matches(input, list), "did not expect match for {input}");
+            assert!(
+                !app_id_matches(input, list),
+                "did not expect match for {input}"
+            );
         }
     }
 
@@ -232,7 +226,10 @@ mod tests {
     fn app_id_match_helper_empty_list_matches_nothing() {
         let empty: &[&str] = &[];
         for input in ["chromium", "ghostty", "footclient"] {
-            assert!(!app_id_matches(input, empty), "empty list should never match {input}");
+            assert!(
+                !app_id_matches(input, empty),
+                "empty list should never match {input}"
+            );
         }
     }
 
@@ -265,7 +262,7 @@ mod tests {
 
         // Even when surrounding_text frame is present (would otherwise
         // route to Tier 1) — force_vk_only_apps still wins.
-        let mut p = probe(0, Some(("phow", 4)));
+        let mut p = probe(0, true);
         p.app_id = Some("chromium".to_owned());
         p.force_vk_only_apps = vec!["chromium".to_owned()];
         assert_eq!(detect_method(&p), BackspaceMethod::VkOnly);
@@ -314,7 +311,7 @@ mod tests {
     fn terminal_override_vk_only_also_clamped_without_vk() {
         // The clamp is on the final tier, so even an explicit terminal
         // override of VkOnly is downgraded when no vk keyboard exists.
-        let mut p = probe(13, None);
+        let mut p = probe(13, false);
         p.terminal_override = Some(BackspaceMethod::VkOnly);
         p.vk_keyboard_available = false;
         assert_eq!(detect_method(&p), BackspaceMethod::UInput);
@@ -323,7 +320,7 @@ mod tests {
     #[test]
     fn gedit_non_empty_surrounding_is_tier1() {
         assert_eq!(
-            detect_method(&probe(0, Some(("phow bo ngon", 12)))),
+            detect_method(&probe(0, true)),
             BackspaceMethod::SurroundingText
         );
     }
@@ -334,7 +331,7 @@ mod tests {
         // surrounding_text at activate. Falls through to ForwardKey default.
         // (chromium's first-compose BS-drop is mitigated by adding its app_id
         // to FORWARD_KEY_BROKEN_APPS to force UInput.)
-        assert_eq!(detect_method(&probe(0, None)), BackspaceMethod::ForwardKey);
+        assert_eq!(detect_method(&probe(0, false)), BackspaceMethod::ForwardKey);
     }
 
     #[test]
@@ -342,7 +339,7 @@ mod tests {
         // Empty surrounding_text at activate = app supports the protocol
         // but widget is just empty (e.g. fresh gedit document).
         assert_eq!(
-            detect_method(&probe(0, Some(("", 0)))),
+            detect_method(&probe(0, true)),
             BackspaceMethod::SurroundingText
         );
     }
