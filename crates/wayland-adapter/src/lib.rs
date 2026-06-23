@@ -181,7 +181,6 @@ pub trait AdapterHandler: 'static {
         &mut self,
         ctx: &mut AdapterCtx<'_>,
         time: u32,
-        method: BackspaceMethod,
         backspaces: usize,
         commit: &str,
         raw_mods: (u32, u32, u32, u32),
@@ -442,7 +441,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                     self.handler.apply_pending(
                         &mut ctx,
                         time,
-                        method,
                         backspaces,
                         &commit,
                         raw_mods,
@@ -963,7 +961,6 @@ mod tests {
             &mut self,
             _ctx: &mut AdapterCtx<'_>,
             _time: u32,
-            _method: BackspaceMethod,
             _backspaces: usize,
             _commit: &str,
             _raw_mods: (u32, u32, u32, u32),

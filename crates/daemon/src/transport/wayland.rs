@@ -292,13 +292,11 @@ impl AdapterHandler for Daemon {
         &mut self,
         ctx: &mut AdapterCtx<'_>,
         time: u32,
-        method: BackspaceMethod,
         backspaces: usize,
         commit: &str,
         raw_mods: (u32, u32, u32, u32),
         held_user_kc: Option<u32>,
     ) {
-        let _ = method;
         let serial = ctx.serial();
         if let Some(w) = self.composer.as_mut() {
             tracing::debug!(method = ?w.method(), backspaces, commit, "strategy.apply");
