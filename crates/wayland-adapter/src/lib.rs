@@ -56,7 +56,7 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_m
 use crate::focus::wlr::WlrForeignToplevelBackend;
 
 pub use crate::sink::AdapterSink;
-pub use crate::state::AdapterState;
+pub use crate::state::{AdapterState, PendingSelfEmit};
 pub use viet_ime_edit_strategy::{BackspaceMethod, KeyState, ModifierState, OutputSink};
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -977,6 +977,20 @@ mod tests {
         s.last_forwarded_key = Some((spec.keycode, Instant::now()));
 
         s.log_duplicate_tail_diagnostic("a", 0, s.held_user_kc());
+    }
+
+    #[test]
+    fn suppress_self_emit_matches_named_pending_emit_fields() {
+        let mut s = AdapterState::new();
+        s.pending_self_emits
+            .push_back(crate::state::PendingSelfEmit {
+                keycode: 42,
+                value: 1,
+                emitted_at: Instant::now(),
+            });
+
+        assert!(s.suppress_self_emit(42, 1));
+        assert!(!s.suppress_self_emit(42, 1));
     }
 
     #[test]

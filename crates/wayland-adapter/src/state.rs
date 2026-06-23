@@ -40,6 +40,13 @@ use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_w
 /// grab-dance budget (~9ms) keeps clear of any human keystroke interval.
 pub(crate) const SELF_EMIT_WINDOW: Duration = Duration::from_millis(20);
 
+#[derive(Debug, Clone, Copy)]
+pub struct PendingSelfEmit {
+    pub keycode: u16,
+    pub value: i32,
+    pub emitted_at: Instant,
+}
+
 /// Adapter-side state. Owns Wayland proxies + emit-history. The handler
 /// (daemon) never sees these directly — it interacts via `AdapterCtx`.
 pub struct AdapterState {
@@ -82,11 +89,11 @@ pub struct AdapterState {
     // uinput device for Tier 3 — None if /dev/uinput is not accessible
     pub uinput: Option<UinputDevice>,
 
-    /// Queue of (keycode, value, emitted_at) for kernel events daklak just
-    /// synthesized via /dev/uinput. Each entry is round-tripped through the
+    /// Queue of kernel events daklak just synthesized via /dev/uinput. Each
+    /// entry is round-tripped through the
     /// IM grab; on_key_pressed / on_key_released match and drop the matching
     /// entry so we don't re-process our own emissions.
-    pub pending_self_emits: VecDeque<(u16, i32, Instant)>,
+    pub pending_self_emits: VecDeque<PendingSelfEmit>,
 
     /// Counter of outgoing `vk.modifiers` calls daklak has made but not yet
     /// seen mirrored back through the IM grab's `Modifiers` event. Used by
@@ -235,15 +242,15 @@ impl AdapterState {
     ///
     /// Matching is **strict FIFO**.
     pub fn suppress_self_emit(&mut self, key: u32, value: i32) -> bool {
-        while let Some(&(_, _, t)) = self.pending_self_emits.front() {
-            if t.elapsed() > SELF_EMIT_WINDOW {
+        while let Some(emit) = self.pending_self_emits.front() {
+            if emit.emitted_at.elapsed() > SELF_EMIT_WINDOW {
                 self.pending_self_emits.pop_front();
             } else {
                 break;
             }
         }
         match self.pending_self_emits.front() {
-            Some(&(k, v, _)) if k as u32 == key && v == value => {
+            Some(emit) if emit.keycode as u32 == key && emit.value == value => {
                 self.pending_self_emits.pop_front();
                 true
             }

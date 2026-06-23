@@ -9,6 +9,8 @@ use viet_ime_keymap::xkb::XkbState;
 use wayland_protocols::wp::input_method::zv1::client::zwp_input_method_context_v1::ZwpInputMethodContextV1;
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2;
 
+use crate::state::PendingSelfEmit;
+
 /// Backend selection for the text-input-v3-shaped operations (the ones
 /// `KeyEmitter` doesn't cover): `commit_string`, `commit(serial)`,
 /// `delete_surrounding_text`. Key emission is delegated to `dyn KeyEmitter`.
@@ -45,7 +47,7 @@ pub struct AdapterSink<'a> {
     pub(crate) uinput: Option<&'a mut UinputDevice>,
     /// Queue daklak's own uinput emissions go into so the grab handler can
     /// match and drop their round-trips. AdapterState owns it.
-    pub(crate) pending_self_emits: &'a mut VecDeque<(u16, i32, Instant)>,
+    pub(crate) pending_self_emits: &'a mut VecDeque<PendingSelfEmit>,
     /// Counter of `vk.modifiers` calls daklak has emitted but not yet seen
     /// echoed back through the IM grab's `Modifiers` event. Incremented per
     /// emit in `vk_commit_char`; AdapterState's `on_modifiers` handler decrements
@@ -170,8 +172,11 @@ impl OutputSink for AdapterSink<'_> {
         if let Some(u) = &mut self.uinput {
             match u.emit(key_code, value) {
                 Ok(()) => {
-                    self.pending_self_emits
-                        .push_back((key_code, value, Instant::now()));
+                    self.pending_self_emits.push_back(PendingSelfEmit {
+                        keycode: key_code,
+                        value,
+                        emitted_at: Instant::now(),
+                    });
                 }
                 Err(e) => {
                     tracing::warn!(?e, key_code, value, "uinput emit failed");
