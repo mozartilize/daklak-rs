@@ -12,6 +12,8 @@ use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, KeyDecision, ModifierS
 use viet_ime_engine::{EngineState, InputMethod};
 
 use crate::quirks::firefox::FirefoxContenteditableQuirk;
+#[cfg(feature = "ibus")]
+use crate::quirks::ibus::IbusSurroundingQuirk;
 
 /// Surrounding-text cursor expressed in **bytes** (wayland text_input_v3).
 pub struct ByteCursor(pub u32);
@@ -189,26 +191,9 @@ pub struct Composer {
     /// contenteditable in Firefox). See `note_surrounding_liveness`.
     surrounding_dead_strikes: u32,
 
-    /// Whether a surrounding_text frame has arrived SINCE the last
-    /// SurroundingText correction we emitted. Reset to false when we emit a
-    /// correction (arming the echo window), set true on any received frame.
-    /// A functional client echoes our edit → true before the next correction;
-    /// a client that drops `delete_surrounding_text` (Google Docs) stays false.
-    /// Drives the echo-based downgrade in `note_surrounding_correction`.
+    /// IBus surrounding-text liveness tracking.
     #[cfg(feature = "ibus")]
-    surrounding_echo_since_correction: bool,
-
-    /// Whether we've emitted at least one SurroundingText correction this
-    /// session — so the first correction (which has no predecessor to judge)
-    /// never counts as a missed echo.
-    #[cfg(feature = "ibus")]
-    surrounding_saw_correction: bool,
-
-    /// Consecutive SurroundingText corrections whose delete drew no echo back.
-    /// Drives the SurroundingText→ForwardKey downgrade. See
-    /// `note_surrounding_correction`.
-    #[cfg(feature = "ibus")]
-    surrounding_corrections_without_echo: u32,
+    ibus: IbusSurroundingQuirk,
 
     /// True after the engine was seeded from already-visible context instead of
     /// live keystrokes. Retroactive edits should track the latest visible word;
@@ -276,11 +261,7 @@ impl Composer {
             last_action_at: Instant::now() - Duration::from_secs(60),
             surrounding_dead_strikes: 0,
             #[cfg(feature = "ibus")]
-            surrounding_echo_since_correction: false,
-            #[cfg(feature = "ibus")]
-            surrounding_saw_correction: false,
-            #[cfg(feature = "ibus")]
-            surrounding_corrections_without_echo: 0,
+            ibus: IbusSurroundingQuirk::new(),
             retroactive_context: false,
             firefox: FirefoxContenteditableQuirk::new(),
         }
@@ -349,7 +330,7 @@ impl Composer {
     /// strike it. Call once per received frame, before any early-return guard.
     #[cfg(feature = "ibus")]
     pub fn mark_surrounding_frame_seen(&mut self) {
-        self.surrounding_echo_since_correction = true;
+        self.ibus.mark_surrounding_frame_seen();
     }
 
     /// Echo-based SurroundingText→ForwardKey downgrade. A functional client
@@ -369,15 +350,7 @@ impl Composer {
     /// (no predecessor to judge); it then arms the window for the next one.
     #[cfg(feature = "ibus")]
     pub fn note_surrounding_correction(&mut self) -> bool {
-        if self.surrounding_echo_since_correction {
-            self.surrounding_corrections_without_echo = 0;
-        } else if self.surrounding_saw_correction {
-            // The previous correction drew no echo before this one.
-            self.surrounding_corrections_without_echo += 1;
-        }
-        self.surrounding_saw_correction = true;
-        self.surrounding_echo_since_correction = false;
-        self.surrounding_corrections_without_echo >= SURROUNDING_NO_ECHO_LIMIT
+        self.ibus.note_correction_and_should_downgrade()
     }
 
     pub fn set_modifiers(&mut self, m: ModifierState) {
@@ -397,6 +370,8 @@ impl Composer {
         self.last_input_char = None;
         self.retroactive_context = false;
         self.firefox.clear();
+        #[cfg(feature = "ibus")]
+        self.ibus.reset();
     }
 
     fn refresh_retroactive_context_after_apply(&mut self, backspaces: usize) {
