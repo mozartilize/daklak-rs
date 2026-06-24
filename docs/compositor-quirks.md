@@ -40,6 +40,12 @@ forwarded BackSpace, real key events do reach native Wayland clients on GNOME.
 daklak may still downgrade to ForwardKey at runtime when surrounding-text proves
 non-functional (for example repeated empty frames or unechoed corrections).
 
+Implementation note: IBus surrounding-text echo tracking lives in
+`crates/daemon/src/quirks/ibus.rs`. It nudges the per-backspace decision toward
+ForwardKey when the previous correction was not echoed, capping downgrade rate
+at one per surrounding-text frame. The quirk has no engine or transport
+knowledge — it answers a single yes/no question.
+
 **Rejected alternatives:** Commit-only appends without deleting the old tail;
 preedit conflicts with daklak's direct-commit design; synthetic keyboard/device
 injection belongs to non-IBus transports such as evdev or future compositor-level
@@ -62,6 +68,12 @@ Using a byte length against such a client deletes the wrong amount.
 **Resolution:** A per-app "force-chars-delete" flag makes daklak express the
 delete length in characters for the affected clients; other clients keep the
 spec-correct byte semantics.
+
+Implementation note: daemon-local Firefox contenteditable state lives in
+`crates/daemon/src/quirks/firefox.rs`. This keeps the workaround removable: when
+affected Firefox/contenteditable paths consistently echo spec-compliant
+surrounding-text updates, the quirk module and its `Composer` calls can be
+deleted without touching `crates/engine` or `crates/edit-strategy`.
 
 ## VkOnly crashes some clients
 
