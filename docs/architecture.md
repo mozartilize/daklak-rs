@@ -136,6 +136,12 @@ The policy layer, independent of any transport:
 - `control` / `ipc` / `tray` — the always-on control plane.
 - `config` — configuration and per-app routing.
 - `main` — CLI parsing and transport selection.
+- `quirks/` — private module group for removable app/protocol workaround state.
+  Quirk modules must not own Vietnamese composition, shadow-buffer delete-span
+  math, or transport emission. They only answer questions such as "should this
+  correction use character-count delete because Firefox just returned a stale
+  contenteditable echo?" or "should IBus downgrade after repeated missing
+  surrounding-text echoes?".
 
 ### `wayland-adapter`
 Owns all Wayland wire concerns: input-method v1 and v2 protocols, the virtual
