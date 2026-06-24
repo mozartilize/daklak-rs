@@ -897,6 +897,11 @@ mod tests {
     use viet_ime_engine::InputMethod;
     use viet_ime_edit_strategy::KeyDecision;
 
+    // Re-exports for nested test modules
+    pub(super) use super::{EditModel, SurroundingDecision, SurroundingObserver};
+    pub(super) use super::detect_deletion as del;
+    pub(super) use super::detect_one_char_insertion as oci;
+
     #[derive(Default)]
     struct DeleteCaptureSink {
         deletes: Vec<(u32, u32, u32, u32)>,
@@ -935,554 +940,847 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stale_surrounding_echo_arms_char_delete_for_composed_chars() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let mut sink = DeleteCaptureSink::default();
+    mod firefox_contenteditable {
+        use super::*;
 
-        c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
-        c.mark_action();
-        c.apply_to_sink(1, "ư", 1, 0, &mut sink);
-        assert_eq!(
-            c.expected_echo.as_ref().map(|echo| echo.expected.as_str()),
-            Some("tư")
-        );
+        #[test]
+        fn stale_surrounding_echo_arms_char_delete_for_composed_chars() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
 
-        // Firefox contenteditable stale cache (Bug 1905481): after tu+w -> tư,
-        // the echo still reports the old shorter text. A byte-count delete would
-        // over-delete and eat the preceding consonant (the `tự` first-char drop),
-        // so arm char-count deletion for the next correction.
-        c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
-        assert_eq!(c.delete_unit, DeleteUnit::Chars);
-
-        c.mark_action();
-        c.apply_to_sink(1, "ự", 2, 0, &mut sink);
-
-        // char-count delete emits before_chars = 1 into the length slot.
-        assert_eq!(sink.deletes[1], (1, 1, 0, 0));
-        assert_eq!(c.delete_unit, DeleteUnit::Bytes);
-        assert_eq!(
-            c.expected_echo.as_ref().map(|echo| echo.expected.as_str()),
-            Some("tự")
-        );
-    }
-
-    #[test]
-    fn duplicate_stale_echo_is_not_skipped_while_waiting_for_correction_echo() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let mut sink = DeleteCaptureSink::default();
-
-        c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
-        c.mark_action();
-        c.apply_to_sink(1, "ư", 1, 0, &mut sink);
-
-        assert!(c.is_duplicate_frame("tu", 2, 2));
-        assert!(!c.should_skip_surrounding_frame("tu", 2, 2, false, false));
-
-        c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
-        c.mark_action();
-        c.apply_to_sink(1, "ự", 2, 0, &mut sink);
-
-        // Stale echo armed char-count delete → before_chars = 1 in length slot.
-        assert_eq!(sink.deletes[1], (1, 1, 0, 0));
-    }
-
-    #[test]
-    fn fresh_surrounding_echo_keeps_byte_delete() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let mut sink = DeleteCaptureSink::default();
-
-        c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
-        c.mark_action();
-        c.apply_to_sink(1, "ư", 1, 0, &mut sink);
-
-        c.observe_surrounding_bytes("tư", ByteCursor(3), ByteCursor(3), false);
-
-        assert_eq!(c.delete_unit, DeleteUnit::Bytes);
-        assert!(c.expected_echo.is_none());
-    }
-
-    #[test]
-    fn stale_echo_char_delete_resets_at_word_boundary() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let mut sink = DeleteCaptureSink::default();
-
-        c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
-        c.mark_action();
-        c.apply_to_sink(1, "ư", 1, 0, &mut sink);
-        c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
-        // Stale echo arms char-count delete.
-        assert_eq!(c.delete_unit, DeleteUnit::Chars);
-
-        // Crossing a word boundary (space) resets back to byte deletes.
-        assert!(matches!(c.feed_key(' '), KeyDecision::ForwardRaw));
-
-        assert_eq!(c.delete_unit, DeleteUnit::Bytes);
-        assert!(c.expected_echo.is_none());
-    }
-
-    #[test]
-    fn forwarded_char_after_stale_echo_resets_char_delete_before_next_correction() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let mut sink = DeleteCaptureSink::default();
-
-        c.observe_surrounding_bytes("d", ByteCursor(1), ByteCursor(1), true);
-        for (ch, text) in [('o', "do"), ('e', "doe")] {
+            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
             c.mark_action();
-            assert!(matches!(c.feed_key(ch), KeyDecision::ForwardRaw));
-            c.observe_surrounding_bytes(
-                text,
-                ByteCursor(text.len() as u32),
-                ByteCursor(text.len() as u32),
-                false,
-            );
-        }
+            c.apply_to_sink(1, "ư", 1, 0, &mut sink);
+            assert_eq!(c.shadow_text(), "tư");
 
-        c.mark_action();
-        // doe + s in Telex: backspaces=1, commit="é" → shadow becomes "doé"
-        match c.feed_key('s') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => c.apply_to_sink(backspaces, &commit, 1, 0, &mut sink),
-            _ => panic!("expected stale-echo setup tone edit"),
-        }
-        c.observe_surrounding_bytes("doe", ByteCursor(3), ByteCursor(3), false);
-        // Stale echo arms char-count delete.
-        assert_eq!(c.delete_unit, DeleteUnit::Chars);
+            // Firefox contenteditable stale cache (Bug 1905481): after tu+w -> tư,
+            // the echo still reports the old shorter text. A byte-count delete would
+            // over-delete and eat the preceding consonant (the `tự` first-char drop),
+            // so arm char-count deletion for the next correction.
+            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
 
-        // A forwarded raw key changes the buffer, so the one-shot char-count
-        // assumption no longer applies — reset to byte deletes.
-        c.mark_action();
-        assert!(matches!(c.feed_key('n'), KeyDecision::ForwardRaw));
-        assert_eq!(c.delete_unit, DeleteUnit::Bytes);
-
-        c.mark_action();
-        match c.feed_key('t') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                assert_eq!(backspaces, 4);
-                assert_eq!(commit, "doesnt");
-                c.apply_to_sink(backspaces, &commit, 2, 0, &mut sink);
-            }
-            _ => panic!("expected deconversion to raw English word"),
-        }
-
-        assert_eq!(sink.deletes.last(), Some(&(5, 4, 0, 0)));
-    }
-
-    #[test]
-    fn extracts_word_at_end_of_line() {
-        assert_eq!(current_word_before_cursor("phow", 4), "phow");
-    }
-
-    #[test]
-    fn extracts_word_in_middle_of_line() {
-        assert_eq!(current_word_before_cursor("hello phow", 10), "phow");
-    }
-
-    #[test]
-    fn extracts_partial_word_at_cursor() {
-        assert_eq!(current_word_before_cursor("phow", 3), "pho");
-    }
-
-    #[test]
-    fn empty_text_returns_empty() {
-        assert_eq!(current_word_before_cursor("", 0), "");
-    }
-
-    #[test]
-    fn cursor_at_start_returns_empty() {
-        assert_eq!(current_word_before_cursor("hello", 0), "");
-    }
-
-    #[test]
-    fn handles_multibyte_chars_at_char_boundary() {
-        assert_eq!(current_word_before_cursor("trâ", 4), "trâ");
-    }
-
-    #[test]
-    fn handles_cursor_inside_multibyte_char() {
-        let r = current_word_before_cursor("trâ", 3);
-        assert_eq!(r, "tr");
-    }
-
-    #[test]
-    fn cursor_beyond_text_clamps() {
-        assert_eq!(current_word_before_cursor("hi", 99), "hi");
-    }
-
-    #[test]
-    fn space_separates_words() {
-        assert_eq!(current_word_before_cursor("foo bar baz", 11), "baz");
-    }
-
-    #[test]
-    fn tab_separates_words() {
-        assert_eq!(current_word_before_cursor("foo\tbar", 7), "bar");
-    }
-
-    #[test]
-    fn newline_separates_words() {
-        assert_eq!(current_word_before_cursor("line1\nline2", 11), "line2");
-    }
-
-    #[test]
-    fn comma_separates_vietnamese_syllables() {
-        let text = "xin,chào";
-        assert_eq!(current_word_before_cursor(text, text.len() as u32), "chào");
-    }
-
-    #[test]
-    fn delimiters_separate_current_vietnamese_word() {
-        assert_eq!(
-            current_word_before_cursor("(tiếng", "(tiếng".len() as u32),
-            "tiếng"
-        );
-        assert_eq!(
-            current_word_before_cursor("anh/chị", "anh/chị".len() as u32),
-            "chị"
-        );
-        assert_eq!(
-            current_word_before_cursor("“đẹp", "“đẹp".len() as u32),
-            "đẹp"
-        );
-    }
-
-    #[test]
-    fn selection_after_word_prefix_seeds_prefix_for_both_directions() {
-        let text = "the vietnamese";
-        let selection_start = "the viet".len() as u32;
-        let selection_end = "the vietnamese".len() as u32;
-
-        assert_eq!(
-            current_word_before_insertion_point(text, selection_start, selection_end),
-            "viet"
-        );
-        assert_eq!(
-            current_word_before_insertion_point(text, selection_end, selection_start),
-            "viet"
-        );
-    }
-
-    #[test]
-    fn selection_at_word_start_seeds_nothing_for_both_directions() {
-        let text = "the vietnamese";
-        let selection_start = "the ".len() as u32;
-        let selection_end = "the viet".len() as u32;
-
-        assert_eq!(
-            current_word_before_insertion_point(text, selection_start, selection_end),
-            ""
-        );
-        assert_eq!(
-            current_word_before_insertion_point(text, selection_end, selection_start),
-            ""
-        );
-    }
-
-    #[test]
-    fn cursor_inside_word_ignores_suffix_after_cursor() {
-        let text = "tiếng viet vui vẻ";
-        let cursor = "tiếng vie".len() as u32;
-
-        assert_eq!(
-            current_word_before_insertion_point(text, cursor, cursor),
-            "vie"
-        );
-    }
-
-    #[test]
-    fn cursor_at_end_of_word_seeds_full_ascii_suffix_after_vietnamese_text() {
-        let text = "tiếng viet vui vẻ";
-        let cursor = "tiếng viet".len() as u32;
-
-        assert_eq!(
-            current_word_before_insertion_point(text, cursor, cursor),
-            "viet"
-        );
-    }
-
-    #[test]
-    fn cursor_jump_after_composed_word_allows_next_tone_key_to_replace_tone() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let text = "chắc nó chừa mình ra";
-        let cursor = "chắc nó".len() as u32;
-
-        c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
-
-        match c.feed_key('r') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                assert_eq!(backspaces, 1);
-                assert_eq!(commit, "ỏ");
-            }
-            _ => panic!("expected tone replacement edit"),
-        }
-    }
-
-    #[test]
-    fn idle_reset_seeds_composed_shadow_for_tone_replacement() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let text = "là";
-
-        c.observe_surrounding_bytes(
-            text,
-            ByteCursor(text.len() as u32),
-            ByteCursor(text.len() as u32),
-            true,
-        );
-        c.last_keystroke_at -= std::time::Duration::from_secs(3);
-
-        assert!(c.check_idle_reset());
-        match c.feed_key('s') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                assert_eq!(backspaces, 1);
-                assert_eq!(commit, "á");
-            }
-            _ => panic!("expected tone replacement after idle reset"),
-        }
-    }
-
-    #[test]
-    fn dead_surrounding_frames_signal_forward_key_downgrade() {
-        // Google Docs / Firefox contenteditable: advertises surrounding-text
-        // but every frame is text="" cursor=0 and delete_surrounding_text is a
-        // no-op, so SurroundingText commits double the word. The watchdog must
-        // flag the downgrade once shadow holds content but frames stay empty.
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-
-        // A genuinely empty widget (empty shadow) is NOT a strike.
-        assert!(!c.note_surrounding_liveness("", 0));
-
-        // Client reflected one commit, so our shadow now holds content.
-        c.observe_surrounding_bytes("T", ByteCursor(1), ByteCursor(1), false);
-        assert_eq!(c.shadow_text(), "T");
-
-        // Now it goes dead: empty frames despite committed shadow.
-        assert!(!c.note_surrounding_liveness("", 0)); // strike 1
-        assert!(c.note_surrounding_liveness("", 0)); // strike 2 → downgrade
-    }
-
-    #[test]
-    fn live_surrounding_frame_resets_dead_strikes() {
-        // A functional client reflects our commits; one such frame must clear
-        // the strike counter so a lone transient empty frame never downgrades.
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        c.observe_surrounding_bytes("ph", ByteCursor(2), ByteCursor(2), false);
-
-        assert!(!c.note_surrounding_liveness("", 0)); // strike 1
-        assert!(!c.note_surrounding_liveness("pho", 3)); // content seen → reset
-        assert!(!c.note_surrounding_liveness("", 0)); // back to strike 1, no downgrade
-    }
-
-    #[cfg(feature = "ibus")]
-    #[test]
-    fn unechoed_surrounding_corrections_signal_forward_key_downgrade() {
-        // Google Docs under IBus: advertises surrounding-text but silently
-        // no-ops the delete and echoes nothing back. The first correction has
-        // no predecessor to judge (no strike); the second, still echo-less,
-        // signals the downgrade.
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        assert!(!c.note_surrounding_correction()); // first correction: no strike yet
-        assert!(c.note_surrounding_correction()); // second, still no echo → downgrade
-    }
-
-    #[cfg(feature = "ibus")]
-    #[test]
-    fn echoed_surrounding_corrections_never_downgrade() {
-        // A functional client (gedit) echoes every edit back before the next
-        // correction; each echo resets the strike, so no downgrade ever fires.
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        c.mark_surrounding_frame_seen();
-        assert!(!c.note_surrounding_correction()); // echoed
-        c.mark_surrounding_frame_seen();
-        assert!(!c.note_surrounding_correction()); // echoed again
-        c.mark_surrounding_frame_seen();
-        assert!(!c.note_surrounding_correction());
-    }
-
-    #[test]
-    fn cursor_jump_after_composed_vowel_keeps_plain_consonant_continuation_raw() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let text = "raw khôn";
-        let cursor = text.len() as u32;
-
-        c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
-
-        // 'g' is a plain continuation of "khôn" → forwarded raw. The engine
-        // keeps "không" as running context, so a following tone key still edits
-        // it (proving the word survived the jump-in without a raw trail).
-        assert!(matches!(c.feed_key('g'), KeyDecision::ForwardRaw));
-        match c.feed_key('s') {
-            KeyDecision::Apply { commit, .. } => assert_eq!(commit, "ống"),
-            _ => panic!("expected tone edit on kept 'không'"),
-        }
-    }
-
-    #[test]
-    fn cursor_jump_after_toned_vowel_allows_live_vowel_update() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let text = "cái lòn gì";
-        let cursor = "cái lòn".len() as u32;
-
-        c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
-
-        match c.feed_key('o') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                assert_eq!(backspaces, 2);
-                assert_eq!(commit, "ồn");
-            }
-            _ => panic!("expected live vowel update edit"),
-        }
-    }
-
-    #[test]
-    fn retroactive_composed_word_tracks_visible_state_between_tone_updates() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let text = "nguyễn sĩ thanh";
-        let cursor = "nguyễn sĩ".len() as u32;
-
-        c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
-
-        match c.feed_key('s') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                assert_eq!(backspaces, 1);
-                assert_eq!(commit, "í");
-            }
-            _ => panic!("expected tone update"),
-        }
-
-        match c.feed_key('x') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                assert_eq!(backspaces, 1);
-                assert_eq!(commit, "ĩ");
-            }
-            _ => panic!("expected tone update"),
-        }
-
-        // 'i' makes the syllable un-composable → raw restore. On the continuous
-        // engine the restore is the full keystroke history (seed "six" + typed
-        // "sxi" = "sixsxi"), not the reset-per-key path's cleaner "sixi". Both
-        // are just a literal echo of a nonsense sequence; the continuous form is
-        // what IBus/wayland now produce.
-        match c.feed_key('i') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                assert_eq!(backspaces, 2);
-                assert_eq!(commit, "sixsxi");
-            }
-            _ => panic!("expected raw restore"),
-        }
-    }
-
-    #[test]
-    fn retroactive_tone_toggle_then_consonant_restores_last_raw_form_only() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let mut sink = DeleteCaptureSink::default();
-        let suffix = " lá la";
-        let mut word = "là".to_owned();
-
-        c.observe_surrounding_bytes(
-            "là lá la",
-            ByteCursor(word.len() as u32),
-            ByteCursor(word.len() as u32),
-            false,
-        );
-
-        for (ch, expected_word) in [
-            ('r', "lả"),
-            ('j', "lạ"),
-            ('f', "là"),
-            ('j', "lạ"),
-            ('r', "lả"),
-            ('s', "lá"),
-            ('j', "lạ"),
-            ('r', "lả"),
-            ('f', "là"),
-        ] {
             c.mark_action();
-            match c.feed_key(ch) {
+            c.apply_to_sink(1, "ự", 2, 0, &mut sink);
+
+            // char-count delete emits before_chars = 1 into the length slot.
+            assert_eq!(sink.deletes[1], (1, 1, 0, 0));
+            assert_eq!(c.shadow_text(), "tự");
+        }
+
+        #[test]
+        fn duplicate_stale_echo_is_not_skipped_while_waiting_for_correction_echo() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
+            c.mark_action();
+            c.apply_to_sink(1, "ư", 1, 0, &mut sink);
+
+            assert!(c.is_duplicate_frame("tu", 2, 2));
+            assert!(!c.should_skip_surrounding_frame("tu", 2, 2, false, false));
+
+            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
+            c.mark_action();
+            c.apply_to_sink(1, "ự", 2, 0, &mut sink);
+
+            // Stale echo armed char-count delete → before_chars = 1 in length slot.
+            assert_eq!(sink.deletes[1], (1, 1, 0, 0));
+        }
+
+        #[test]
+        fn fresh_surrounding_echo_keeps_byte_delete() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
+            c.mark_action();
+            c.apply_to_sink(1, "ư", 1, 0, &mut sink);
+
+            c.observe_surrounding_bytes("tư", ByteCursor(3), ByteCursor(3), false);
+            c.mark_action();
+            c.apply_to_sink(1, "ự", 2, 0, &mut sink);
+
+            // Fresh echo preserves byte-count delete → before_bytes = 2.
+            assert_eq!(sink.deletes[1], (2, 1, 0, 0));
+        }
+
+        #[test]
+        fn stale_echo_char_delete_resets_at_word_boundary() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
+            c.mark_action();
+            c.apply_to_sink(1, "ư", 1, 0, &mut sink);
+            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
+
+            // Crossing a word boundary (space) resets back to byte deletes.
+            assert!(matches!(c.feed_key(' '), KeyDecision::ForwardRaw));
+        }
+
+        #[test]
+        fn forwarded_char_after_stale_echo_resets_char_delete_before_next_correction() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            c.observe_surrounding_bytes("d", ByteCursor(1), ByteCursor(1), true);
+            for (ch, text) in [('o', "do"), ('e', "doe")] {
+                c.mark_action();
+                assert!(matches!(c.feed_key(ch), KeyDecision::ForwardRaw));
+                c.observe_surrounding_bytes(
+                    text,
+                    ByteCursor(text.len() as u32),
+                    ByteCursor(text.len() as u32),
+                    false,
+                );
+            }
+
+            c.mark_action();
+            // doe + s in Telex: backspaces=1, commit="é" → shadow becomes "doé"
+            match c.feed_key('s') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => c.apply_to_sink(backspaces, &commit, 1, 0, &mut sink),
+                _ => panic!("expected stale-echo setup tone edit"),
+            }
+            c.observe_surrounding_bytes("doe", ByteCursor(3), ByteCursor(3), false);
+
+            // A forwarded raw key changes the buffer, so the one-shot char-count
+            // assumption no longer applies — reset to byte deletes.
+            c.mark_action();
+            assert!(matches!(c.feed_key('n'), KeyDecision::ForwardRaw));
+
+            c.mark_action();
+            match c.feed_key('t') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 4);
+                    assert_eq!(commit, "doesnt");
+                    c.apply_to_sink(backspaces, &commit, 2, 0, &mut sink);
+                }
+                _ => panic!("expected deconversion to raw English word"),
+            }
+
+            assert_eq!(sink.deletes.last(), Some(&(5, 4, 0, 0)));
+        }
+
+        #[test]
+        fn retroactive_stale_echo_keeps_byte_delete_for_multibyte_tone_updates() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+            let text = "cà phê";
+            let cursor = "cà".len() as u32;
+
+            c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
+
+            c.mark_action();
+            match c.feed_key('r') {
                 KeyDecision::Apply {
                     backspaces, commit, ..
                 } => {
                     assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ả");
                     c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-                    word = expected_word.to_owned();
-                    let text = format!("{word}{suffix}");
-                    c.observe_surrounding_bytes(
-                        &text,
-                        ByteCursor(word.len() as u32),
-                        ByteCursor(word.len() as u32),
-                        false,
-                    );
                 }
-                _ => panic!("expected tone update for {ch:?}"),
+                _ => panic!("expected retroactive tone replacement"),
+            }
+
+            // Firefox contenteditable can echo the old surrounding buffer with the
+            // cursor shifted past the edit. This must not switch retroactive edits
+            // to char-count deletion, because the v1 path still needs byte counts
+            // to delete the multibyte Vietnamese character before committing again.
+            c.observe_surrounding_bytes(text, ByteCursor("cà ".len() as u32), ByteCursor("cà ".len() as u32), false);
+
+            c.mark_action();
+            match c.feed_key('j') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ạ");
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                _ => panic!("expected second retroactive tone replacement"),
+            }
+
+            assert_eq!(sink.deletes[1], (3, 1, 0, 0));
+        }
+
+        #[test]
+        fn recent_implausible_surrounding_echo_does_not_clobber_shadow() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+            c.mark_action();
+            // First key 'i' (shape is path-dependent; this test is about the echo,
+            // not the key). The implausible "ii" cursor=0 frame must be dropped so
+            // shadow stays "i" and the next tone key composes against it.
+            let _ = c.feed_key('i');
+            c.observe_surrounding_bytes("i", ByteCursor(1), ByteCursor(1), false);
+            c.observe_surrounding_bytes("ii", ByteCursor(0), ByteCursor(0), false);
+
+            assert_eq!(c.shadow_text(), "i");
+            match c.feed_key('s') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "í");
+                }
+                _ => panic!("expected tone transform"),
             }
         }
 
-        c.mark_action();
-        match c.feed_key('d') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                assert_eq!(backspaces, 2);
-                assert_eq!(commit, "lafd");
+        #[test]
+        fn recent_selection_surrounding_frame_reaches_shadow() {
+            // Chromium omnibox autocomplete: user types "tra", the omnibox expands
+            // to "translate" with "nslate" selected (cursor=3, anchor=9). That frame
+            // arrives within the post-keystroke `recent_action` window and is not a
+            // one-char insertion, but its before-cursor prefix "tra" == our shadow,
+            // so it is shadow_confirmed and must be trusted — it carries the
+            // selection the Tier-1 fallback (surrounding::apply) needs.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+            // Type "tra" so the shadow holds the prefix the autocomplete selects past.
+            for ch in "tra".chars() {
+                c.mark_action();
+                assert!(matches!(c.feed_key(ch), KeyDecision::ForwardRaw));
             }
-            _ => panic!("expected raw restore for final consonant"),
+            assert_eq!(c.shadow_text(), "tra");
+
+            c.mark_action();
+            c.observe_surrounding_bytes("translate", ByteCursor(3), ByteCursor(9), false);
+
+            // Frame reached the shadow: before-cursor text is "tra" and the
+            // after-cursor selection "nslate" is recorded, so pop_delete_span
+            // yields after_bytes > 0 and the ForwardKey fallback would fire.
+            assert_eq!(c.shadow_text(), "tra");
+            let (_, _, after_bytes, _) = c.pop_shadow_delete_span_for_test(1);
+            assert!(after_bytes > 0, "selection-after must be recorded");
         }
+
+        #[test]
+        fn recent_external_delete_reseeds_before_next_key() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+            c.observe_surrounding_bytes("work", ByteCursor(4), ByteCursor(4), true);
+            // An EXTERNAL delete is by definition not our own recent action — the
+            // user deleted via some other channel. Model that with `defer_action`
+            // (rolls the action clock back) so the delete frame is trusted and the
+            // engine resets. A delete frame inside the recent-action window
+            // is instead our own delete_surrounding_text echo and must be dropped.
+            c.defer_action();
+            c.observe_surrounding_bytes("wor", ByteCursor(3), ByteCursor(3), false);
+
+            assert_eq!(c.shadow_text(), "wor");
+            // After the external delete, 'd' continues the English word: the shadow
+            // word "wor" is render-gated (telex-misreads, so no seed) and 'd' is
+            // forwarded raw → "word", not recomposed into the deleted word.
+            match c.feed_key('d') {
+                KeyDecision::ForwardRaw => {}
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    panic!("expected raw 'd', got edit bs={backspaces} commit={commit:?}");
+                }
+                KeyDecision::Consumed => panic!("expected raw 'd', got consumed"),
+            }
+        }
+
     }
 
-    #[test]
-    fn retroactive_stale_echo_keeps_byte_delete_for_multibyte_tone_updates() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-        let mut sink = DeleteCaptureSink::default();
-        let text = "cà phê";
-        let cursor = "cà".len() as u32;
+    mod surrounding_words {
+        use super::*;
 
-        c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
-
-        c.mark_action();
-        match c.feed_key('r') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                assert_eq!(backspaces, 1);
-                assert_eq!(commit, "ả");
-                c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-            }
-            _ => panic!("expected retroactive tone replacement"),
+        #[test]
+        fn extracts_word_at_end_of_line() {
+            assert_eq!(current_word_before_cursor("phow", 4), "phow");
         }
 
-        // Firefox contenteditable can echo the old surrounding buffer with the
-        // cursor shifted past the edit. This must not switch retroactive edits
-        // to char-count deletion, because the v1 path still needs byte counts
-        // to delete the multibyte Vietnamese character before committing again.
-        c.observe_surrounding_bytes(text, ByteCursor("cà ".len() as u32), ByteCursor("cà ".len() as u32), false);
-
-        c.mark_action();
-        match c.feed_key('j') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                assert_eq!(backspaces, 1);
-                assert_eq!(commit, "ạ");
-                c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-            }
-            _ => panic!("expected second retroactive tone replacement"),
+        #[test]
+        fn extracts_word_in_middle_of_line() {
+            assert_eq!(current_word_before_cursor("hello phow", 10), "phow");
         }
 
-        assert_eq!(sink.deletes[1], (3, 1, 0, 0));
+        #[test]
+        fn extracts_partial_word_at_cursor() {
+            assert_eq!(current_word_before_cursor("phow", 3), "pho");
+        }
+
+        #[test]
+        fn empty_text_returns_empty() {
+            assert_eq!(current_word_before_cursor("", 0), "");
+        }
+
+        #[test]
+        fn cursor_at_start_returns_empty() {
+            assert_eq!(current_word_before_cursor("hello", 0), "");
+        }
+
+        #[test]
+        fn handles_multibyte_chars_at_char_boundary() {
+            assert_eq!(current_word_before_cursor("trâ", 4), "trâ");
+        }
+
+        #[test]
+        fn handles_cursor_inside_multibyte_char() {
+            let r = current_word_before_cursor("trâ", 3);
+            assert_eq!(r, "tr");
+        }
+
+        #[test]
+        fn cursor_beyond_text_clamps() {
+            assert_eq!(current_word_before_cursor("hi", 99), "hi");
+        }
+
+        #[test]
+        fn space_separates_words() {
+            assert_eq!(current_word_before_cursor("foo bar baz", 11), "baz");
+        }
+
+        #[test]
+        fn tab_separates_words() {
+            assert_eq!(current_word_before_cursor("foo\tbar", 7), "bar");
+        }
+
+        #[test]
+        fn newline_separates_words() {
+            assert_eq!(current_word_before_cursor("line1\nline2", 11), "line2");
+        }
+
+        #[test]
+        fn comma_separates_vietnamese_syllables() {
+            let text = "xin,chào";
+            assert_eq!(current_word_before_cursor(text, text.len() as u32), "chào");
+        }
+
+        #[test]
+        fn delimiters_separate_current_vietnamese_word() {
+            assert_eq!(
+                current_word_before_cursor("(tiếng", "(tiếng".len() as u32),
+                "tiếng"
+            );
+            assert_eq!(
+                current_word_before_cursor("anh/chị", "anh/chị".len() as u32),
+                "chị"
+            );
+            assert_eq!(
+                current_word_before_cursor("“đẹp", "“đẹp".len() as u32),
+                "đẹp"
+            );
+        }
+
+        #[test]
+        fn selection_after_word_prefix_seeds_prefix_for_both_directions() {
+            let text = "the vietnamese";
+            let selection_start = "the viet".len() as u32;
+            let selection_end = "the vietnamese".len() as u32;
+
+            assert_eq!(
+                current_word_before_insertion_point(text, selection_start, selection_end),
+                "viet"
+            );
+            assert_eq!(
+                current_word_before_insertion_point(text, selection_end, selection_start),
+                "viet"
+            );
+        }
+
+        #[test]
+        fn selection_at_word_start_seeds_nothing_for_both_directions() {
+            let text = "the vietnamese";
+            let selection_start = "the ".len() as u32;
+            let selection_end = "the viet".len() as u32;
+
+            assert_eq!(
+                current_word_before_insertion_point(text, selection_start, selection_end),
+                ""
+            );
+            assert_eq!(
+                current_word_before_insertion_point(text, selection_end, selection_start),
+                ""
+            );
+        }
+
+        #[test]
+        fn cursor_inside_word_ignores_suffix_after_cursor() {
+            let text = "tiếng viet vui vẻ";
+            let cursor = "tiếng vie".len() as u32;
+
+            assert_eq!(
+                current_word_before_insertion_point(text, cursor, cursor),
+                "vie"
+            );
+        }
+
+        #[test]
+        fn cursor_at_end_of_word_seeds_full_ascii_suffix_after_vietnamese_text() {
+            let text = "tiếng viet vui vẻ";
+            let cursor = "tiếng viet".len() as u32;
+
+            assert_eq!(
+                current_word_before_insertion_point(text, cursor, cursor),
+                "viet"
+            );
+        }
+
+    }
+
+    mod retroactive_context {
+        use super::*;
+
+        #[test]
+        fn cursor_jump_after_composed_word_allows_next_tone_key_to_replace_tone() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let text = "chắc nó chừa mình ra";
+            let cursor = "chắc nó".len() as u32;
+
+            c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
+
+            match c.feed_key('r') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ỏ");
+                }
+                _ => panic!("expected tone replacement edit"),
+            }
+        }
+
+        #[test]
+        fn idle_reset_seeds_composed_shadow_for_tone_replacement() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let text = "là";
+
+            c.observe_surrounding_bytes(
+                text,
+                ByteCursor(text.len() as u32),
+                ByteCursor(text.len() as u32),
+                true,
+            );
+            c.last_keystroke_at -= std::time::Duration::from_secs(3);
+
+            assert!(c.check_idle_reset());
+            match c.feed_key('s') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "á");
+                }
+                _ => panic!("expected tone replacement after idle reset"),
+            }
+        }
+
+        #[test]
+        fn cursor_jump_after_composed_vowel_keeps_plain_consonant_continuation_raw() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let text = "raw khôn";
+            let cursor = text.len() as u32;
+
+            c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
+
+            // 'g' is a plain continuation of "khôn" → forwarded raw. The engine
+            // keeps "không" as running context, so a following tone key still edits
+            // it (proving the word survived the jump-in without a raw trail).
+            assert!(matches!(c.feed_key('g'), KeyDecision::ForwardRaw));
+            match c.feed_key('s') {
+                KeyDecision::Apply { commit, .. } => assert_eq!(commit, "ống"),
+                _ => panic!("expected tone edit on kept 'không'"),
+            }
+        }
+
+        #[test]
+        fn cursor_jump_after_toned_vowel_allows_live_vowel_update() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let text = "cái lòn gì";
+            let cursor = "cái lòn".len() as u32;
+
+            c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
+
+            match c.feed_key('o') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 2);
+                    assert_eq!(commit, "ồn");
+                }
+                _ => panic!("expected live vowel update edit"),
+            }
+        }
+
+        #[test]
+        fn retroactive_composed_word_tracks_visible_state_between_tone_updates() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let text = "nguyễn sĩ thanh";
+            let cursor = "nguyễn sĩ".len() as u32;
+
+            c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
+
+            match c.feed_key('s') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "í");
+                }
+                _ => panic!("expected tone update"),
+            }
+
+            match c.feed_key('x') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ĩ");
+                }
+                _ => panic!("expected tone update"),
+            }
+
+            // 'i' makes the syllable un-composable → raw restore. On the continuous
+            // engine the restore is the full keystroke history (seed "six" + typed
+            // "sxi" = "sixsxi"), not the reset-per-key path's cleaner "sixi". Both
+            // are just a literal echo of a nonsense sequence; the continuous form is
+            // what IBus/wayland now produce.
+            match c.feed_key('i') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 2);
+                    assert_eq!(commit, "sixsxi");
+                }
+                _ => panic!("expected raw restore"),
+            }
+        }
+
+        #[test]
+        fn retroactive_tone_toggle_then_consonant_restores_last_raw_form_only() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+            let suffix = " lá la";
+            let mut word = "là".to_owned();
+
+            c.observe_surrounding_bytes(
+                "là lá la",
+                ByteCursor(word.len() as u32),
+                ByteCursor(word.len() as u32),
+                false,
+            );
+
+            for (ch, expected_word) in [
+                ('r', "lả"),
+                ('j', "lạ"),
+                ('f', "là"),
+                ('j', "lạ"),
+                ('r', "lả"),
+                ('s', "lá"),
+                ('j', "lạ"),
+                ('r', "lả"),
+                ('f', "là"),
+            ] {
+                c.mark_action();
+                match c.feed_key(ch) {
+                    KeyDecision::Apply {
+                        backspaces, commit, ..
+                    } => {
+                        assert_eq!(backspaces, 1);
+                        c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                        word = expected_word.to_owned();
+                        let text = format!("{word}{suffix}");
+                        c.observe_surrounding_bytes(
+                            &text,
+                            ByteCursor(word.len() as u32),
+                            ByteCursor(word.len() as u32),
+                            false,
+                        );
+                    }
+                    _ => panic!("expected tone update for {ch:?}"),
+                }
+            }
+
+            c.mark_action();
+            match c.feed_key('d') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 2);
+                    assert_eq!(commit, "lafd");
+                }
+                _ => panic!("expected raw restore for final consonant"),
+            }
+        }
+
+    }
+
+    mod surrounding_liveness {
+        use super::*;
+
+        #[test]
+        fn dead_surrounding_frames_signal_forward_key_downgrade() {
+            // Google Docs / Firefox contenteditable: advertises surrounding-text
+            // but every frame is text="" cursor=0 and delete_surrounding_text is a
+            // no-op, so SurroundingText commits double the word. The watchdog must
+            // flag the downgrade once shadow holds content but frames stay empty.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+            // A genuinely empty widget (empty shadow) is NOT a strike.
+            assert!(!c.note_surrounding_liveness("", 0));
+
+            // Client reflected one commit, so our shadow now holds content.
+            c.observe_surrounding_bytes("T", ByteCursor(1), ByteCursor(1), false);
+            assert_eq!(c.shadow_text(), "T");
+
+            // Now it goes dead: empty frames despite committed shadow.
+            assert!(!c.note_surrounding_liveness("", 0)); // strike 1
+            assert!(c.note_surrounding_liveness("", 0)); // strike 2 → downgrade
+        }
+
+        #[test]
+        fn live_surrounding_frame_resets_dead_strikes() {
+            // A functional client reflects our commits; one such frame must clear
+            // the strike counter so a lone transient empty frame never downgrades.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.observe_surrounding_bytes("ph", ByteCursor(2), ByteCursor(2), false);
+
+            assert!(!c.note_surrounding_liveness("", 0)); // strike 1
+            assert!(!c.note_surrounding_liveness("pho", 3)); // content seen → reset
+            assert!(!c.note_surrounding_liveness("", 0)); // back to strike 1, no downgrade
+        }
+
+        #[cfg(feature = "ibus")]
+        #[test]
+        fn unechoed_surrounding_corrections_signal_forward_key_downgrade() {
+            // Google Docs under IBus: advertises surrounding-text but silently
+            // no-ops the delete and echoes nothing back. The first correction has
+            // no predecessor to judge (no strike); the second, still echo-less,
+            // signals the downgrade.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            assert!(!c.note_surrounding_correction()); // first correction: no strike yet
+            assert!(c.note_surrounding_correction()); // second, still no echo → downgrade
+        }
+
+        #[cfg(feature = "ibus")]
+        #[test]
+        fn echoed_surrounding_corrections_never_downgrade() {
+            // A functional client (gedit) echoes every edit back before the next
+            // correction; each echo resets the strike, so no downgrade ever fires.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.mark_surrounding_frame_seen();
+            assert!(!c.note_surrounding_correction()); // echoed
+            c.mark_surrounding_frame_seen();
+            assert!(!c.note_surrounding_correction()); // echoed again
+            c.mark_surrounding_frame_seen();
+            assert!(!c.note_surrounding_correction());
+        }
+
+    }
+
+    mod surrounding_policy {
+        use super::*;
+
+        #[test]
+        fn surrounding_observer_trusts_mid_word_one_char_without_reseed() {
+            let decision = super::SurroundingObserver::observe(true, true, false, false, false);
+
+            assert_eq!(
+                decision,
+                super::SurroundingDecision {
+                    trust: true,
+                    reseed: false
+                }
+            );
+        }
+
+        #[test]
+        fn surrounding_observer_trusts_recent_shadow_confirmed_without_reseed() {
+            // A recent frame whose before-cursor text matches our shadow (post-commit
+            // echo, or a Chromium autocomplete selection whose prefix is what we
+            // typed) is trusted — syncs the shadow/selection without reseeding.
+            let decision = super::SurroundingObserver::observe(true, false, false, false, true);
+
+            assert_eq!(
+                decision,
+                super::SurroundingDecision {
+                    trust: true,
+                    reseed: false
+                }
+            );
+        }
+
+        #[test]
+        fn surrounding_observer_drops_recent_unconfirmed_selection() {
+            // A STALE Chromium-omnibox autocomplete selection (recent, not a one-char
+            // insert, before-cursor does NOT match shadow) must be dropped — trusting
+            // it re-armed a stale selection span and broke `haf`→`à`.
+            let decision = super::SurroundingObserver::observe(true, false, false, false, false);
+
+            assert_eq!(
+                decision,
+                super::SurroundingDecision {
+                    trust: false,
+                    reseed: false
+                }
+            );
+        }
+
+        #[test]
+        fn surrounding_observer_drops_recent_delete_echo() {
+            // A deletion within the recent-action window is our own
+            // delete_surrounding_text echo, not an external edit — drop it so the
+            // shadow and in-progress composition survive until the commit echo.
+            let decision = super::SurroundingObserver::observe(true, false, true, false, false);
+
+            assert_eq!(
+                decision,
+                super::SurroundingDecision {
+                    trust: false,
+                    reseed: false
+                }
+            );
+        }
+
+        #[test]
+        fn surrounding_observer_trusts_external_delete_for_reset() {
+            // The same deletion outside the recent-action window IS an external
+            // edit — trust it so the deletion branch can reset the engine.
+            let decision = super::SurroundingObserver::observe(false, false, true, false, false);
+
+            assert_eq!(
+                decision,
+                super::SurroundingDecision {
+                    trust: true,
+                    reseed: false
+                }
+            );
+        }
+
+    }
+
+    mod edit_model_behavior {
+        use super::*;
+
+        #[test]
+        fn edit_model_owns_shadow_and_tier_apply() {
+            let mut edit = super::EditModel::new(BackspaceMethod::SurroundingText);
+            edit.push_forwarded_char('a');
+            assert_eq!(edit.shadow_text(), "a");
+
+            let mut sink = DeleteCaptureSink::default();
+            edit.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
+
+            assert_eq!(sink.deletes.len(), 1);
+            assert_eq!(sink.commits, vec!["â".to_owned()]);
+            assert_eq!(edit.shadow_text(), "â");
+        }
+
+        #[test]
+        fn oci_empty_to_first_char() {
+            assert!(oci("", 0, "t", 1));
+        }
+
+        #[test]
+        fn oci_append_ascii() {
+            assert!(oci("ti", 2, "tie", 3));
+        }
+
+        #[test]
+        fn oci_append_after_vietnamese() {
+            // shadow "tiê" (4 bytes, 3 chars). cursor at byte 4. Type 'n' →
+            // "tiên" (5 bytes), cursor at byte 5. Must detect as keystroke.
+            assert!(oci("tiê", 4, "tiên", 5));
+        }
+
+        #[test]
+        fn oci_append_direct_multibyte_scalar() {
+            // Direct app-visible insertion of one Vietnamese scalar advances the
+            // byte cursor by that scalar's UTF-8 width, not by exactly one byte.
+            assert!(oci("ti", 2, "tiế", "tiế".len() as u32));
+        }
+
+        #[test]
+        fn oci_mid_text_insert() {
+            // "abcd" cursor=2 ("ab|cd"). Type 'X' → "abXcd" cursor=3.
+            assert!(oci("abcd", 2, "abXcd", 3));
+        }
+
+        #[test]
+        fn oci_multi_char_paste_rejected() {
+            assert!(!oci("ab", 2, "abcde", 5));
+        }
+
+        #[test]
+        fn oci_backspace_rejected() {
+            assert!(!oci("abc", 3, "ab", 2));
+        }
+
+        #[test]
+        fn oci_same_text_rejected() {
+            // Duplicate frame: text and cursor unchanged.
+            assert!(!oci("abc", 3, "abc", 3));
+        }
+
+        #[test]
+        fn oci_cursor_jump_rejected() {
+            // Same text, cursor moved (user clicked elsewhere).
+            assert!(!oci("abcde", 5, "abcde", 2));
+        }
+
+        #[test]
+        fn oci_replace_with_same_length_rejected() {
+            // ê (2 bytes) replaced with two ASCII: same byte count, no growth.
+            assert!(!oci("tiê", 4, "tiab", 4));
+        }
+
+        #[test]
+        fn oci_cursor_mismatch_rejected() {
+            // text grew by 1 byte but cursor jumped by 2 (impossible for single
+            // keystroke insert at cursor).
+            assert!(!oci("ab", 2, "abc", 3) == false);
+            // also: cursor at 0 in larger text (not at insertion point).
+            assert!(!oci("ab", 2, "abc", 1));
+        }
+
+        #[test]
+        fn oci_post_apply_echo_rejected() {
+            // After daklak's `bs=2 commit="ê"` on "tiee" cursor=4:
+            // kate text becomes "tiê" cursor=4. text shrank by 0 in chars but
+            // -1 byte (4→4 bytes? actually tiê=4 bytes, tiee=4 bytes, same len).
+            // Should NOT be one_char_typed.
+            assert!(!oci("tiee", 4, "tiê", 4));
+        }
+
+        #[test]
+        fn oci_duong_line_break_to_capital_d() {
+            // Regression: gedit on Enter resets surrounding text. User had
+            // "đường" then pressed Enter and typed 'D'. text="D" cursor=1 vs
+            // prev_text="đường" prev_cursor=9. Cursor went DOWN — must NOT be
+            // detected as a 1-char keystroke (would feed 'D' into the engine
+            // without resetting it).
+            assert!(!oci("đường", 9, "D", 1));
+        }
+
+        #[test]
+        fn oci_second_capital_d_on_new_line() {
+            // After cursor jump above, prev_text becomes "D" prev_cursor=1.
+            // User types second 'D' → text="DD" cursor=2. MUST be detected as
+            // 1-char keystroke so handle_char fires and `DD→Đ` rule runs.
+            assert!(oci("D", 1, "DD", 2));
+        }
+
+        #[test]
+        fn deletion_rejects_cursor_inside_multibyte_char() {
+            // Cursor offsets are byte offsets. When both offsets land inside 'ế',
+            // slicing returns None on both sides; that must not be accepted as a
+            // real external deletion.
+            assert!(!del("aếb", 2, "aế", 2));
+        }
+
+        #[test]
+        fn deletion_accepts_multibyte_char_span() {
+            assert!(del("aếb", "aế".len() as u32, "ab", 1));
+        }
+
     }
 
     #[test]
@@ -1511,86 +1809,6 @@ mod tests {
                 assert_eq!(commit, "ớn");
             }
             _ => panic!("expected tone update"),
-        }
-    }
-
-    #[test]
-    fn recent_implausible_surrounding_echo_does_not_clobber_shadow() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-
-        c.mark_action();
-        // First key 'i' (shape is path-dependent; this test is about the echo,
-        // not the key). The implausible "ii" cursor=0 frame must be dropped so
-        // shadow stays "i" and the next tone key composes against it.
-        let _ = c.feed_key('i');
-        c.observe_surrounding_bytes("i", ByteCursor(1), ByteCursor(1), false);
-        c.observe_surrounding_bytes("ii", ByteCursor(0), ByteCursor(0), false);
-
-        assert_eq!(c.shadow_text(), "i");
-        match c.feed_key('s') {
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                assert_eq!(backspaces, 1);
-                assert_eq!(commit, "í");
-            }
-            _ => panic!("expected tone transform"),
-        }
-    }
-
-    #[test]
-    fn recent_selection_surrounding_frame_reaches_shadow() {
-        // Chromium omnibox autocomplete: user types "tra", the omnibox expands
-        // to "translate" with "nslate" selected (cursor=3, anchor=9). That frame
-        // arrives within the post-keystroke `recent_action` window and is not a
-        // one-char insertion, but its before-cursor prefix "tra" == our shadow,
-        // so it is shadow_confirmed and must be trusted — it carries the
-        // selection the Tier-1 fallback (surrounding::apply) needs.
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-
-        // Type "tra" so the shadow holds the prefix the autocomplete selects past.
-        for ch in "tra".chars() {
-            c.mark_action();
-            assert!(matches!(c.feed_key(ch), KeyDecision::ForwardRaw));
-        }
-        assert_eq!(c.shadow_text(), "tra");
-
-        c.mark_action();
-        c.observe_surrounding_bytes("translate", ByteCursor(3), ByteCursor(9), false);
-
-        // Frame reached the shadow: before-cursor text is "tra" and the
-        // after-cursor selection "nslate" is recorded, so pop_delete_span
-        // yields after_bytes > 0 and the ForwardKey fallback would fire.
-        assert_eq!(c.shadow_text(), "tra");
-        let (_, _, after_bytes, _) = c.pop_shadow_delete_span_for_test(1);
-        assert!(after_bytes > 0, "selection-after must be recorded");
-    }
-
-    #[test]
-    fn recent_external_delete_reseeds_before_next_key() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-
-        c.observe_surrounding_bytes("work", ByteCursor(4), ByteCursor(4), true);
-        // An EXTERNAL delete is by definition not our own recent action — the
-        // user deleted via some other channel. Model that with `defer_action`
-        // (rolls the action clock back) so the delete frame is trusted and the
-        // engine resets. A delete frame inside the recent-action window
-        // is instead our own delete_surrounding_text echo and must be dropped.
-        c.defer_action();
-        c.observe_surrounding_bytes("wor", ByteCursor(3), ByteCursor(3), false);
-
-        assert_eq!(c.shadow_text(), "wor");
-        // After the external delete, 'd' continues the English word: the shadow
-        // word "wor" is render-gated (telex-misreads, so no seed) and 'd' is
-        // forwarded raw → "word", not recomposed into the deleted word.
-        match c.feed_key('d') {
-            KeyDecision::ForwardRaw => {}
-            KeyDecision::Apply {
-                backspaces, commit, ..
-            } => {
-                panic!("expected raw 'd', got edit bs={backspaces} commit={commit:?}");
-            }
-            KeyDecision::Consumed => panic!("expected raw 'd', got consumed"),
         }
     }
 
@@ -1882,16 +2100,6 @@ mod tests {
         assert_eq!(c.shadow_text(), "word");
     }
 
-    /// Reproduces the wayland v2 (wlroots/sway) frame sequence seen on
-    /// gedit/firefox typing "word" as the FIRST word. Telex turns w→ư, o, r→
-    /// (hook) ử so the visible word becomes "ửo"; the final 'd' makes the
-    /// syllable invalid and the engine must deconvert the whole word back to
-    /// raw "word". The regression: our own delete_surrounding_text echo (the
-    /// intermediate "" frame after the 'r' delete+commit) was trusted, reset
-    /// the engine mid-word, and the deconversion never ran → "ửod".
-    ///
-    /// v2 path: keys arrive via `feed_key`; each surrounding
-    /// frame the compositor echoes is replayed verbatim through the reseed gate.
     #[test]
     fn v2_first_word_invalid_syllable_deconverts_despite_delete_echo() {
         let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
@@ -1963,13 +2171,6 @@ mod tests {
         assert_eq!((before_bytes, before_chars), (4, 2));
     }
 
-    /// Chromium omnibox (purpose=5) first word `haf` → expect `hà`. The omnibox
-    /// emits STALE autocomplete-selection frames (e.g. "https://…" cursor=1
-    /// anchor=N) interleaved with the real ones. A stale selection frame that
-    /// describes a prefix we already typed past must be dropped — otherwise it
-    /// re-arms a selection span in the shadow, the real cleared-selection frame
-    /// is lost, and the next tone fires the ForwardKey-BS selection fallback,
-    /// deleting `ha` and committing only `à`.
     #[test]
     fn chromium_omnibox_stale_selection_does_not_eat_first_word() {
         let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
@@ -2043,208 +2244,8 @@ mod tests {
         assert_eq!(*sink.deletes.last().unwrap(), (1, 1, 0, 0));
     }
 
-    #[test]
-    fn surrounding_observer_trusts_mid_word_one_char_without_reseed() {
-        let decision = super::SurroundingObserver::observe(true, true, false, false, false);
-
-        assert_eq!(
-            decision,
-            super::SurroundingDecision {
-                trust: true,
-                reseed: false
-            }
-        );
-    }
-
-    #[test]
-    fn surrounding_observer_trusts_recent_shadow_confirmed_without_reseed() {
-        // A recent frame whose before-cursor text matches our shadow (post-commit
-        // echo, or a Chromium autocomplete selection whose prefix is what we
-        // typed) is trusted — syncs the shadow/selection without reseeding.
-        let decision = super::SurroundingObserver::observe(true, false, false, false, true);
-
-        assert_eq!(
-            decision,
-            super::SurroundingDecision {
-                trust: true,
-                reseed: false
-            }
-        );
-    }
-
-    #[test]
-    fn surrounding_observer_drops_recent_unconfirmed_selection() {
-        // A STALE Chromium-omnibox autocomplete selection (recent, not a one-char
-        // insert, before-cursor does NOT match shadow) must be dropped — trusting
-        // it re-armed a stale selection span and broke `haf`→`à`.
-        let decision = super::SurroundingObserver::observe(true, false, false, false, false);
-
-        assert_eq!(
-            decision,
-            super::SurroundingDecision {
-                trust: false,
-                reseed: false
-            }
-        );
-    }
-
-    #[test]
-    fn surrounding_observer_drops_recent_delete_echo() {
-        // A deletion within the recent-action window is our own
-        // delete_surrounding_text echo, not an external edit — drop it so the
-        // shadow and in-progress composition survive until the commit echo.
-        let decision = super::SurroundingObserver::observe(true, false, true, false, false);
-
-        assert_eq!(
-            decision,
-            super::SurroundingDecision {
-                trust: false,
-                reseed: false
-            }
-        );
-    }
-
-    #[test]
-    fn surrounding_observer_trusts_external_delete_for_reset() {
-        // The same deletion outside the recent-action window IS an external
-        // edit — trust it so the deletion branch can reset the engine.
-        let decision = super::SurroundingObserver::observe(false, false, true, false, false);
-
-        assert_eq!(
-            decision,
-            super::SurroundingDecision {
-                trust: true,
-                reseed: false
-            }
-        );
-    }
-
-    #[test]
-    fn edit_model_owns_shadow_and_tier_apply() {
-        let mut edit = super::EditModel::new(BackspaceMethod::SurroundingText);
-        edit.push_forwarded_char('a');
-        assert_eq!(edit.shadow_text(), "a");
-
-        let mut sink = DeleteCaptureSink::default();
-        edit.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
-
-        assert_eq!(sink.deletes.len(), 1);
-        assert_eq!(sink.commits, vec!["â".to_owned()]);
-        assert_eq!(edit.shadow_text(), "â");
-    }
-
-    // ── detect_one_char_insertion ──────────────────────────────────────
-
-    use super::detect_deletion as del;
-    use super::detect_one_char_insertion as oci;
-
-    #[test]
-    fn oci_empty_to_first_char() {
-        assert!(oci("", 0, "t", 1));
-    }
-
-    #[test]
-    fn oci_append_ascii() {
-        assert!(oci("ti", 2, "tie", 3));
-    }
-
-    #[test]
-    fn oci_append_after_vietnamese() {
-        // shadow "tiê" (4 bytes, 3 chars). cursor at byte 4. Type 'n' →
-        // "tiên" (5 bytes), cursor at byte 5. Must detect as keystroke.
-        assert!(oci("tiê", 4, "tiên", 5));
-    }
-
-    #[test]
-    fn oci_append_direct_multibyte_scalar() {
-        // Direct app-visible insertion of one Vietnamese scalar advances the
-        // byte cursor by that scalar's UTF-8 width, not by exactly one byte.
-        assert!(oci("ti", 2, "tiế", "tiế".len() as u32));
-    }
-
-    #[test]
-    fn oci_mid_text_insert() {
-        // "abcd" cursor=2 ("ab|cd"). Type 'X' → "abXcd" cursor=3.
-        assert!(oci("abcd", 2, "abXcd", 3));
-    }
-
-    #[test]
-    fn oci_multi_char_paste_rejected() {
-        assert!(!oci("ab", 2, "abcde", 5));
-    }
-
-    #[test]
-    fn oci_backspace_rejected() {
-        assert!(!oci("abc", 3, "ab", 2));
-    }
-
-    #[test]
-    fn oci_same_text_rejected() {
-        // Duplicate frame: text and cursor unchanged.
-        assert!(!oci("abc", 3, "abc", 3));
-    }
-
-    #[test]
-    fn oci_cursor_jump_rejected() {
-        // Same text, cursor moved (user clicked elsewhere).
-        assert!(!oci("abcde", 5, "abcde", 2));
-    }
-
-    #[test]
-    fn oci_replace_with_same_length_rejected() {
-        // ê (2 bytes) replaced with two ASCII: same byte count, no growth.
-        assert!(!oci("tiê", 4, "tiab", 4));
-    }
-
-    #[test]
-    fn oci_cursor_mismatch_rejected() {
-        // text grew by 1 byte but cursor jumped by 2 (impossible for single
-        // keystroke insert at cursor).
-        assert!(!oci("ab", 2, "abc", 3) == false);
-        // also: cursor at 0 in larger text (not at insertion point).
-        assert!(!oci("ab", 2, "abc", 1));
-    }
-
-    #[test]
-    fn oci_post_apply_echo_rejected() {
-        // After daklak's `bs=2 commit="ê"` on "tiee" cursor=4:
-        // kate text becomes "tiê" cursor=4. text shrank by 0 in chars but
-        // -1 byte (4→4 bytes? actually tiê=4 bytes, tiee=4 bytes, same len).
-        // Should NOT be one_char_typed.
-        assert!(!oci("tiee", 4, "tiê", 4));
-    }
-
-    #[test]
-    fn oci_duong_line_break_to_capital_d() {
-        // Regression: gedit on Enter resets surrounding text. User had
-        // "đường" then pressed Enter and typed 'D'. text="D" cursor=1 vs
-        // prev_text="đường" prev_cursor=9. Cursor went DOWN — must NOT be
-        // detected as a 1-char keystroke (would feed 'D' into the engine
-        // without resetting it).
-        assert!(!oci("đường", 9, "D", 1));
-    }
-
-    #[test]
-    fn oci_second_capital_d_on_new_line() {
-        // After cursor jump above, prev_text becomes "D" prev_cursor=1.
-        // User types second 'D' → text="DD" cursor=2. MUST be detected as
-        // 1-char keystroke so handle_char fires and `DD→Đ` rule runs.
-        assert!(oci("D", 1, "DD", 2));
-    }
-
-    #[test]
-    fn deletion_rejects_cursor_inside_multibyte_char() {
-        // Cursor offsets are byte offsets. When both offsets land inside 'ế',
-        // slicing returns None on both sides; that must not be accepted as a
-        // real external deletion.
-        assert!(!del("aếb", 2, "aế", 2));
-    }
-
-    #[test]
-    fn deletion_accepts_multibyte_char_span() {
-        assert!(del("aếb", "aế".len() as u32, "ab", 1));
-    }
 }
+
 
 #[cfg(all(test, feature = "ibus"))]
 mod char_to_byte_offset_tests {
