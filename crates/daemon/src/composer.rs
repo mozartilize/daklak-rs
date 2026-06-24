@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, KeyDecision, ModifierState, Strategy};
 use viet_ime_engine::{EngineState, InputMethod};
 
+use crate::quirks::firefox::FirefoxContenteditableQuirk;
+
 /// Surrounding-text cursor expressed in **bytes** (wayland text_input_v3).
 pub struct ByteCursor(pub u32);
 /// Surrounding-text cursor expressed in **chars** (IBus).
@@ -208,26 +210,14 @@ pub struct Composer {
     #[cfg(feature = "ibus")]
     surrounding_corrections_without_echo: u32,
 
-    /// One-shot echo expectation for the most recent SurroundingText
-    /// correction. `delete_echo` is the legitimate intermediate frame after the
-    /// delete but before the commit; any other mismatch while recent indicates a
-    /// stale client cache and arms char-count delete for the next correction.
-    expected_echo: Option<PendingEcho>,
-
     /// True after the engine was seeded from already-visible context instead of
     /// live keystrokes. Retroactive edits should track the latest visible word;
     /// otherwise repeated tone toggles accumulate reconstructed raw history that
     /// leaks on a later raw restore.
     retroactive_context: bool,
 
-    /// Current delete unit for this word/composition. It starts as bytes, is
-    /// armed to chars by one stale echo, and is consumed by the next correction.
-    delete_unit: DeleteUnit,
-}
-
-struct PendingEcho {
-    expected: String,
-    delete_echo: String,
+    /// Firefox contenteditable stale-echo workaround state.
+    firefox: FirefoxContenteditableQuirk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,9 +281,8 @@ impl Composer {
             surrounding_saw_correction: false,
             #[cfg(feature = "ibus")]
             surrounding_corrections_without_echo: 0,
-            expected_echo: None,
             retroactive_context: false,
-            delete_unit: DeleteUnit::Bytes,
+            firefox: FirefoxContenteditableQuirk::new(),
         }
     }
 
@@ -407,12 +396,7 @@ impl Composer {
         self.edit.reset();
         self.last_input_char = None;
         self.retroactive_context = false;
-        self.reset_delete_unit();
-    }
-
-    fn reset_delete_unit(&mut self) {
-        self.expected_echo = None;
-        self.delete_unit = DeleteUnit::Bytes;
+        self.firefox.clear();
     }
 
     fn refresh_retroactive_context_after_apply(&mut self, backspaces: usize) {
@@ -463,7 +447,7 @@ impl Composer {
         );
         if !ch.is_ascii_alphabetic() {
             self.retroactive_context = false;
-            self.reset_delete_unit();
+            self.firefox.clear();
         }
         self.last_input_char = Some(ch);
 
@@ -499,7 +483,7 @@ impl Composer {
             // A forwarded key changes the shadow after the stale echo that
             // armed char-count mode, so that one-shot assumption no longer
             // applies to the next correction.
-            self.reset_delete_unit();
+            self.firefox.clear();
             KeyDecision::ForwardRaw
         }
     }
@@ -524,7 +508,7 @@ impl Composer {
             tracing::trace!("BS not consumed → forward");
             self.edit.pop_forwarded_char();
             self.last_keystroke_at = Instant::now();
-            self.reset_delete_unit();
+            self.firefox.clear();
             KeyDecision::ForwardRaw
         }
     }
@@ -555,7 +539,7 @@ impl Composer {
     ) {
         let before = self.edit.shadow_text().to_owned();
         let delete_echo = prefix_after_char_delete(&before, backspaces);
-        let delete_unit = self.delete_unit;
+        let delete_unit = self.firefox.delete_unit();
         if delete_unit == DeleteUnit::Chars {
             tracing::info!(
                 backspaces,
@@ -568,15 +552,11 @@ impl Composer {
         }
         self.edit
             .apply(backspaces, commit, serial, time, sink, delete_unit);
-        if delete_unit == DeleteUnit::Chars {
-            self.delete_unit = DeleteUnit::Bytes;
-        }
+        self.firefox.reset_delete_unit_after_use();
         self.refresh_retroactive_context_after_apply(backspaces);
         if backspaces > 0 && self.method() == BackspaceMethod::SurroundingText {
-            self.expected_echo = Some(PendingEcho {
-                expected: self.edit.shadow_text().to_owned(),
-                delete_echo,
-            });
+            self.firefox
+                .record_expected_echo(self.edit.shadow_text().to_owned(), delete_echo);
         }
     }
 
@@ -649,51 +629,8 @@ impl Composer {
             shadow_confirmed,
         );
 
-        if let Some(expected_echo) = self.expected_echo.as_ref() {
-            if before_cursor == expected_echo.expected {
-                self.reset_delete_unit();
-            } else if before_cursor == expected_echo.delete_echo {
-                // Legitimate delete-only echo; keep waiting for the commit echo.
-            } else if recent_action {
-                // Stale pre-edit echo. Firefox's cross-process contenteditable
-                // cache (Bug 1905481) returns text shorter than the real DOM, so
-                // a byte-count delete over-deletes and eats the preceding
-                // consonant (the `tự` first-char drop). Arm char-count delete for
-                // the next correction to compensate.
-                //
-                // Exception: during a retroactive edit where the cursor has left
-                // the word (sits on a word boundary), the surrounding text is the
-                // real buffer, not a stale-short cache — keep byte counts so the
-                // multibyte vowel is deleted whole.
-                let retroactive_cursor_left_word = self.retroactive_context
-                    && before_cursor
-                        .chars()
-                        .last()
-                        .map(is_word_boundary)
-                        .unwrap_or(false);
-                if retroactive_cursor_left_word {
-                    tracing::info!(
-                        expected = %expected_echo.expected,
-                        delete_echo = %expected_echo.delete_echo,
-                        actual = %before_cursor,
-                        "stale surrounding echo during retroactive edit; keeping byte delete"
-                    );
-                    self.delete_unit = DeleteUnit::Bytes;
-                } else {
-                    tracing::info!(
-                        expected = %expected_echo.expected,
-                        delete_echo = %expected_echo.delete_echo,
-                        actual = %before_cursor,
-                        "stale surrounding echo detected; arming char-count delete for current composition"
-                    );
-                    self.delete_unit = DeleteUnit::Chars;
-                }
-                self.expected_echo = None;
-            } else {
-                self.expected_echo = None;
-                self.delete_unit = DeleteUnit::Bytes;
-            }
-        }
+        self.firefox
+            .observe_surrounding(before_cursor, recent_action, self.retroactive_context);
 
         if !decision.trust {
             tracing::trace!(text, cursor, anchor, "skip recent surrounding_text echo");
@@ -742,7 +679,7 @@ impl Composer {
     ) -> bool {
         !activate
             && !deactivate
-            && self.expected_echo.is_none()
+            && !self.firefox.has_pending_echo()
             && self.is_duplicate_frame(text, cursor, anchor)
     }
 
