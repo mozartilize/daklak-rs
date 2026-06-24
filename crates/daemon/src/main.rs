@@ -4,6 +4,7 @@ mod control;
 mod handler;
 mod ipc;
 mod main_loop;
+mod quirks;
 mod transport;
 mod tray;
 
