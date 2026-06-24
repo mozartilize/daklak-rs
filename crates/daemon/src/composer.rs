@@ -211,6 +211,8 @@ struct SurroundingDecision {
     reseed: bool,
 }
 
+// Generic surrounding-frame trust/reseed policy. This is not in `quirks/`
+// because it is shared session behavior, not an app/protocol workaround.
 struct SurroundingObserver;
 
 impl SurroundingObserver {
