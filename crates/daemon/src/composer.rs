@@ -114,6 +114,18 @@ impl EditModel {
             .apply(backspaces, commit, serial, time, sink, delete_unit);
     }
 
+    fn apply_forward_key<S: viet_ime_edit_strategy::OutputSink>(
+        &mut self,
+        backspaces: usize,
+        commit: &str,
+        serial: u32,
+        time: u32,
+        sink: &mut S,
+    ) {
+        self.strategy
+            .apply_forward_key(backspaces, commit, serial, time, sink);
+    }
+
     #[cfg(test)]
     fn pop_delete_span_for_test(&mut self, backspaces: usize) -> (u32, u32, u32, u32) {
         self.strategy.shadow.pop_delete_span(backspaces)
@@ -372,6 +384,7 @@ impl Composer {
         self.last_input_char = None;
         self.retroactive_context = false;
         self.firefox.clear();
+        self.firefox.reset_forward_sticky();
         #[cfg(feature = "ibus")]
         self.ibus.reset();
     }
@@ -517,19 +530,55 @@ impl Composer {
         let before = self.edit.shadow_text().to_owned();
         let delete_echo = prefix_after_char_delete(&before, backspaces);
         let delete_unit = self.firefox.delete_unit();
-        if delete_unit == DeleteUnit::Chars {
+
+        // Firefox contenteditable quirk: once a stale correction echo is
+        // observed, force delete through ForwardKey until a fresh correction
+        // echo clears the quirk state.
+        //
+        // delete_unit == Chars is still logged as the immediate stale signal.
+        // `firefox.use_forward_delete()` reflects the quirk's current stale
+        // assessment, while `firefox.forward_sticky()` keeps delete on
+        // ForwardKey for this text-input object once stale mode has been
+        // observed at least once.
+        let quirk_requests_forward = self.firefox.use_forward_delete();
+        if quirk_requests_forward {
+            self.firefox.arm_forward_sticky();
+        }
+        let used_forward_key = quirk_requests_forward || self.firefox.forward_sticky();
+        tracing::trace!(
+            ?delete_unit,
+            quirk_requests_forward,
+            sticky_forward = self.firefox.forward_sticky(),
+            used_forward_key,
+            pending_echo = self.firefox.has_pending_echo(),
+            retroactive_context = self.retroactive_context,
+            "firefox delete-channel decision"
+        );
+
+        // Firefox contenteditable quirk: when delete_unit == Chars, the quirk
+        // detected a stale surrounding-text echo, meaning Firefox didn't update
+        // its text-input-v3 state after our last correction. Using
+        // delete_surrounding_text in this state is unreliable — Firefox may
+        // delete the wrong range or skip the delete entirely, causing forward
+        // deletion into the next word. Emit physical Backspace key events
+        // (ForwardKey) instead.
+        if used_forward_key {
             tracing::info!(
                 backspaces,
                 shadow_before_bytes = before.len(),
                 shadow_before_chars = before.chars().count(),
                 commit_bytes = commit.len(),
                 commit_chars = commit.chars().count(),
-                "using char-count delete fallback for current SurroundingText correction"
+                "firefox quirk active: using ForwardKey instead of delete_surrounding_text"
             );
+            self.edit
+                .apply_forward_key(backspaces, commit, serial, time, sink);
+        } else {
+            self.edit
+                .apply(backspaces, commit, serial, time, sink, delete_unit);
+            self.firefox.reset_delete_unit_after_use();
         }
-        self.edit
-            .apply(backspaces, commit, serial, time, sink, delete_unit);
-        self.firefox.reset_delete_unit_after_use();
+
         self.refresh_retroactive_context_after_apply(backspaces);
         if backspaces > 0 && self.method() == BackspaceMethod::SurroundingText {
             self.firefox
@@ -876,8 +925,12 @@ mod tests {
             c.mark_action();
             c.apply_to_sink(1, "ự", 2, 0, &mut sink);
 
-            // char-count delete emits before_chars = 1 into the length slot.
-            assert_eq!(sink.deletes[1], (1, 1, 0, 0));
+            // Stale echo now bypasses delete_surrounding_text and emits one
+            // ForwardKey Backspace pair instead.
+            assert_eq!(sink.deletes.len(), 1);
+            assert_eq!(sink.vk_keys.len(), 2);
+            assert_eq!(sink.vk_keys[0], (0, 14, KeyState::Pressed));
+            assert_eq!(sink.vk_keys[1], (0, 14, KeyState::Released));
             assert_eq!(c.shadow_text(), "tự");
         }
 
@@ -897,8 +950,40 @@ mod tests {
             c.mark_action();
             c.apply_to_sink(1, "ự", 2, 0, &mut sink);
 
-            // Stale echo armed char-count delete → before_chars = 1 in length slot.
-            assert_eq!(sink.deletes[1], (1, 1, 0, 0));
+            // Duplicate stale echo still reaches the correction path, but
+            // the correction now uses ForwardKey Backspace instead of
+            // delete_surrounding_text.
+            assert_eq!(sink.deletes.len(), 1);
+            assert_eq!(sink.vk_keys.len(), 2);
+            assert_eq!(sink.vk_keys[0], (0, 14, KeyState::Pressed));
+            assert_eq!(sink.vk_keys[1], (0, 14, KeyState::Released));
+        }
+
+        #[test]
+        fn stale_mode_keeps_using_forward_key_until_a_fresh_echo() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
+            c.mark_action();
+            c.apply_to_sink(1, "ư", 1, 0, &mut sink);
+
+            // Stale echo arms firefox quirk mode.
+            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
+
+            c.mark_action();
+            c.apply_to_sink(1, "ự", 2, 0, &mut sink);
+            c.mark_action();
+            c.apply_to_sink(1, "ữ", 3, 0, &mut sink);
+
+            // Initial correction uses surrounding delete; stale-mode corrections
+            // keep using ForwardKey until a healthy echo arrives.
+            assert_eq!(sink.deletes.len(), 1);
+            assert_eq!(sink.vk_keys.len(), 4);
+            assert_eq!(sink.vk_keys[0], (0, 14, KeyState::Pressed));
+            assert_eq!(sink.vk_keys[1], (0, 14, KeyState::Released));
+            assert_eq!(sink.vk_keys[2], (0, 14, KeyState::Pressed));
+            assert_eq!(sink.vk_keys[3], (0, 14, KeyState::Released));
         }
 
         #[test]
@@ -1019,6 +1104,96 @@ mod tests {
             }
 
             assert_eq!(sink.deletes[1], (3, 1, 0, 0));
+        }
+
+        #[test]
+        fn retroactive_stale_cursor_into_next_word_uses_forward_key_delete() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            // Cursor moved to the end of the first word in a two-word phrase.
+            c.observe_surrounding_bytes(
+                "là lạ",
+                ByteCursor("là".len() as u32),
+                ByteCursor("là".len() as u32),
+                false,
+            );
+
+            // First retroactive tone replacement on the first word: là -> lạ.
+            c.mark_action();
+            match c.feed_key('j') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ạ");
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                _ => panic!("expected first retroactive tone replacement"),
+            }
+            assert_eq!(c.shadow_text(), "lạ");
+
+            // Firefox stale echo can shift cursor into the next word while
+            // still reporting old surrounding text. Historically this armed
+            // char-count delete and caused forward deletion into the second
+            // word. We now bypass delete_surrounding_text and emit ForwardKey BS.
+            c.observe_surrounding_bytes(
+                "lạ lạ",
+                ByteCursor("lạ l".len() as u32),
+                ByteCursor("lạ l".len() as u32),
+                false,
+            );
+
+            c.mark_action();
+            match c.feed_key('r') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ả");
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                _ => panic!("expected second retroactive tone replacement"),
+            }
+
+            // First correction used SurroundingText delete; second correction
+            // (after stale cursor shift) must use ForwardKey delete instead.
+            assert_eq!(sink.deletes.len(), 1);
+            assert_eq!(sink.vk_keys.len(), 2);
+            assert_eq!(sink.vk_keys[0], (0, 14, KeyState::Pressed));
+            assert_eq!(sink.vk_keys[1], (0, 14, KeyState::Released));
+            assert_eq!(c.shadow_text(), "lả");
+        }
+
+        #[test]
+        fn sticky_forward_mode_keeps_delete_channel_after_first_stale_hit() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            c.observe_surrounding_bytes("la", ByteCursor(2), ByteCursor(2), true);
+
+            // Arm Firefox quirk stale mode once, as seen in field logs where
+            // one correction flips to ForwardKey and following corrections
+            // previously flapped back to delete_surrounding_text.
+            c.firefox.record_expected_echo("lả".to_owned(), "l".to_owned());
+            c.firefox.observe_surrounding("lạ l", true, false);
+            assert!(c.firefox.use_forward_delete());
+
+            c.mark_action();
+            c.apply_to_sink(1, "ả", 1, 0, &mut sink);
+
+            // Quirk can transiently clear after unrelated surrounding frames,
+            // but sticky mode must keep delete on ForwardKey for this object.
+            c.firefox.clear();
+            c.mark_action();
+            c.apply_to_sink(1, "ạ", 2, 0, &mut sink);
+
+            assert_eq!(sink.deletes.len(), 0);
+            assert_eq!(sink.vk_keys.len(), 4);
+            assert_eq!(sink.vk_keys[0], (0, 14, KeyState::Pressed));
+            assert_eq!(sink.vk_keys[1], (0, 14, KeyState::Released));
+            assert_eq!(sink.vk_keys[2], (0, 14, KeyState::Pressed));
+            assert_eq!(sink.vk_keys[3], (0, 14, KeyState::Released));
         }
 
         #[test]
@@ -1491,7 +1666,6 @@ mod tests {
     }
 
     mod surrounding_policy {
-        use super::*;
 
         #[test]
         fn surrounding_observer_trusts_mid_word_one_char_without_reseed() {

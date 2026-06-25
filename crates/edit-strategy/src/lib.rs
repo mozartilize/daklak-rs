@@ -174,7 +174,15 @@ impl Strategy {
                 );
             }
             BackspaceMethod::ForwardKey => {
-                forward_key::apply(&mut self.shadow, backspaces, commit, serial, time, sink);
+                forward_key::apply(
+                    &mut self.shadow,
+                    backspaces,
+                    commit,
+                    serial,
+                    time,
+                    sink,
+                    false,
+                );
             }
             BackspaceMethod::UInput => {
                 uinput_backspace::apply(
@@ -190,6 +198,29 @@ impl Strategy {
                 vk_only::apply(&mut self.shadow, backspaces, commit, time, sink);
             }
         }
+    }
+
+    /// Like `apply`, but uses ForwardKey (virtual keyboard Backspace keys)
+    /// regardless of the current method. Does NOT change `self.method`.
+    /// Used by the Firefox contenteditable quirk to bypass
+    /// `delete_surrounding_text` which Firefox handles unreliably.
+    pub fn apply_forward_key(
+        &mut self,
+        backspaces: usize,
+        commit: &str,
+        serial: u32,
+        time: u32,
+        sink: &mut impl OutputSink,
+    ) {
+        forward_key::apply(
+            &mut self.shadow,
+            backspaces,
+            commit,
+            serial,
+            time,
+            sink,
+            true,
+        );
     }
 
     /// Observe a surrounding_text frame from the compositor. Resets shadow on
