@@ -11,7 +11,7 @@ not re-litigate or add ad-hoc workarounds beyond what's described here.
 
 - [GNOME / IBus ForwardKeyEvent fails in Mutter](#gnome--ibus-forwardkeyevent-fails-in-mutter)
 - [Terminals — forwarded-key routing](#terminals--forwarded-key-routing)
-- [Surrounding-text delete: chars vs bytes](#surrounding-text-delete-chars-vs-bytes)
+- [Firefox contenteditable: stale-echo delete bypass](#firefox-contenteditable-stale-echo-delete-bypass)
 - [VkOnly crashes some clients](#vkonly-crashes-some-clients)
 - [Tail-drop after tone + space](#tail-drop-after-tone--space)
 - [Preedit rendering of forwarded keys](#preedit-rendering-of-forwarded-keys)
@@ -59,21 +59,36 @@ drop commits in a terminal's PTY, while device-level backspace can race the
 terminal's own read loop. Users can override per session with
 `DAKLAK_TERMINAL_TIER`, or per configuration with `terminal_override`.
 
-## Surrounding-text delete: chars vs bytes
+## Firefox contenteditable: stale-echo delete bypass
 
 **Behavior:** The text-input spec defines `delete_surrounding_text` lengths in
-**bytes**, but some clients (notably Firefox) interpret them as **characters**.
-Using a byte length against such a client deletes the wrong amount.
+**bytes**, but Firefox contenteditable can return stale surrounding-text echoes.
+When the echo is stale and the cursor drifts into the next word, a
+char-count delete can target the wrong character (for example deleting the
+inter-word space or the next word's prefix), so repeated tone edits start
+mutating text ahead of the intended word.
 
-**Resolution:** A per-app "force-chars-delete" flag makes daklak express the
-delete length in characters for the affected clients; other clients keep the
-spec-correct byte semantics.
+**Resolution:** Keep spec-correct byte deletes on healthy surrounding-text
+frames. When the Firefox quirk detects a stale correction echo, daklak now
+bypasses `delete_surrounding_text` and emits one ForwardKey Backspace pair per
+requested delete instead (Tier 2 key path). The replacement character is also
+routed through the key channel when possible (vk/keysym), falling back to
+`commit_string` only for chars outside the synthetic key inventory. For
+retroactive reseed sessions this ForwardKey choice is kept sticky, so rapid
+stale cursor shifts cannot alternate between delete channels mid-word. This
+keeps retroactive surrounding-text reseeding but avoids Firefox's mis-targeted
+surrounding deletes and post-first-edit channel desync.
 
 Implementation note: daemon-local Firefox contenteditable state lives in
-`crates/daemon/src/quirks/firefox.rs`. This keeps the workaround removable: when
-affected Firefox/contenteditable paths consistently echo spec-compliant
-surrounding-text updates, the quirk module and its `Composer` calls can be
-deleted without touching `crates/engine` or `crates/edit-strategy`.
+`crates/daemon/src/quirks/firefox.rs`. The ForwardKey bypass is wired in
+`Composer::apply_to_sink` and remains a removable workaround: when
+Firefox/contenteditable paths consistently echo spec-compliant
+surrounding-text updates, the quirk module and this Composer hook can be
+deleted without touching `crates/engine`.
+
+Validation status: this behavior has been live-validated on wlroots/im-v2.
+KWin/im-v1 uses the same logical routing (ForwardKey delete + key-channel
+commit preference), but has not yet been confirmed by a live repro trace.
 
 ## VkOnly crashes some clients
 

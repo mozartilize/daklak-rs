@@ -4,6 +4,8 @@ use viet_ime_edit_strategy::DeleteUnit;
 pub(crate) struct FirefoxContenteditableQuirk {
     expected_echo: Option<PendingEcho>,
     delete_unit: DeleteUnit,
+    use_forward_delete: bool,
+    forward_sticky: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,11 +19,29 @@ impl FirefoxContenteditableQuirk {
         Self {
             expected_echo: None,
             delete_unit: DeleteUnit::Bytes,
+            use_forward_delete: false,
+            forward_sticky: false,
         }
     }
 
     pub(crate) fn delete_unit(&self) -> DeleteUnit {
         self.delete_unit
+    }
+
+    pub(crate) fn use_forward_delete(&self) -> bool {
+        self.use_forward_delete
+    }
+
+    pub(crate) fn forward_sticky(&self) -> bool {
+        self.forward_sticky
+    }
+
+    pub(crate) fn arm_forward_sticky(&mut self) {
+        self.forward_sticky = true;
+    }
+
+    pub(crate) fn reset_forward_sticky(&mut self) {
+        self.forward_sticky = false;
     }
 
     pub(crate) fn reset_delete_unit_after_use(&mut self) {
@@ -44,6 +64,7 @@ impl FirefoxContenteditableQuirk {
     pub(crate) fn clear(&mut self) {
         self.expected_echo = None;
         self.delete_unit = DeleteUnit::Bytes;
+        self.use_forward_delete = false;
     }
 
     pub(crate) fn observe_surrounding(
@@ -72,10 +93,12 @@ impl FirefoxContenteditableQuirk {
             } else {
                 DeleteUnit::Chars
             };
+            self.use_forward_delete = self.delete_unit == DeleteUnit::Chars;
             self.expected_echo = None;
         } else {
             self.expected_echo = None;
             self.delete_unit = DeleteUnit::Bytes;
+            self.use_forward_delete = false;
         }
     }
 
@@ -86,6 +109,7 @@ impl FirefoxContenteditableQuirk {
     fn reset_delete_unit(&mut self) {
         self.expected_echo = None;
         self.delete_unit = DeleteUnit::Bytes;
+        self.use_forward_delete = false;
     }
 }
 
