@@ -58,6 +58,7 @@ mod tests {
     use super::*;
     use crate::composer::Composer;
     use crate::config::Config;
+    use crate::handler::noop_config_rx;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use viet_ime_edit_strategy::BackspaceMethod;
@@ -65,7 +66,11 @@ mod tests {
     use viet_ime_evdev_adapter::EvdevHandler;
 
     fn daemon() -> Daemon {
-        let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
+        let mut d = Daemon::new(
+            Config::default(),
+            Arc::new(AtomicBool::new(true)),
+            noop_config_rx(),
+        );
         d.router.current_active = true;
         d.router.composer = Some(Composer::new(
             InputMethod::Telex,

@@ -3,6 +3,30 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::config::MethodConfig;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConfigChange {
+    pub method: MethodConfig,
+    pub modern_style: bool,
+}
+
+impl ConfigChange {
+    /// True when nothing has changed from the given baseline.
+    pub fn no_change_from(&self, other: &Self) -> bool {
+        self.method == other.method && self.modern_style == other.modern_style
+    }
+}
+
+impl Default for ConfigChange {
+    fn default() -> Self {
+        Self {
+            method: MethodConfig::Telex,
+            modern_style: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum CmdKind {
     Toggle,

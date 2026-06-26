@@ -122,6 +122,20 @@ impl EngineState {
         self.engine.reset();
     }
 
+    /// Change the active input method at runtime. Resets composition state
+    /// (the new method has different keystroke semantics).
+    pub fn set_input_method(&mut self, method: InputMethod) {
+        self.engine.reset();
+        self.engine.set_input_method(method.to_vnkey());
+        self.method = method;
+    }
+
+    /// Toggle modern-style tone placement. `false` = legacy `òa` instead of `oà`.
+    /// Does NOT reset composition — the change takes effect on the next tone.
+    pub fn set_modern_style(&mut self, enabled: bool) {
+        self.engine.options.modern_style = enabled;
+    }
+
     /// Seed engine with text before the cursor — enables retroactive word
     /// editing when the IME activates mid-word. Returns true if context
     /// was fed successfully.

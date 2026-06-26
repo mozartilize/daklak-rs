@@ -17,6 +17,7 @@ use viet_ime_wayland_adapter::FrameSnapshot;
 use crate::composer::CharCursor;
 use crate::composer::Composer;
 use crate::config::Config;
+use crate::control;
 
 // Linux evdev code for Backspace.
 pub(crate) const KEY_BACKSPACE: u32 = 14;
@@ -82,10 +83,30 @@ pub struct Daemon {
 
     /// Shared on/off flag — written by the control task, read each keystroke.
     pub enabled: Arc<AtomicBool>,
+
+    /// Receiver for config changes sent by the tray / IPC menu actions.
+    /// Polled before each keystroke handler call to pick up method,
+    /// modern_style changes and apply them to the active composer.
+    config_change_rx: tokio::sync::watch::Receiver<control::ConfigChange>,
+    /// Last applied config values — used to avoid re-applying identical
+    /// changes (which would reset the engine mid-word on every keystroke).
+    last_config: control::ConfigChange,
+}
+
+/// Create a no-op config-change receiver (always reports `None`).
+/// Used by tests and code paths that don't wire a config change channel.
+#[cfg(test)]
+pub(crate) fn noop_config_rx() -> tokio::sync::watch::Receiver<control::ConfigChange> {
+    let (tx, _) = tokio::sync::watch::channel(control::ConfigChange::default());
+    tx.subscribe()
 }
 
 impl Daemon {
-    pub fn new(config: Config, enabled: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        config: Config,
+        enabled: Arc<AtomicBool>,
+        config_change_rx: tokio::sync::watch::Receiver<control::ConfigChange>,
+    ) -> Self {
         let terminal_override = match std::env::var("DAKLAK_TERMINAL_TIER")
             .ok()
             .as_deref()
@@ -112,11 +133,19 @@ impl Daemon {
             }
         };
 
+        let initial_method = config.method;
+        let initial_modern_style = config.modern_style;
+
         Self {
             config,
             router: Router::new(),
             terminal_override,
             enabled,
+            config_change_rx,
+            last_config: control::ConfigChange {
+                method: initial_method,
+                modern_style: initial_modern_style,
+            },
         }
     }
 
@@ -159,12 +188,45 @@ impl Daemon {
         now_enabled
     }
 
+    /// Poll the config-change channel and apply pending changes (method,
+    /// modern_style) to the active composer. Called at the top of every
+    /// transport entry point — the change takes effect within one keystroke.
+    pub(crate) fn sync_config(&mut self) {
+        if self.config_change_rx.has_changed().unwrap_or(false) {
+            let change = *self.config_change_rx.borrow_and_update();
+            if change.no_change_from(&self.last_config) {
+                return;
+            }
+            // Method change — reset engine.
+            if change.method != self.last_config.method {
+                self.config.method = change.method;
+                if let Some(c) = self.router.composer.as_mut() {
+                    c.set_input_method(change.method.to_engine());
+                }
+                tracing::info!(method = ?change.method, "config: method changed at runtime");
+            }
+            // Modern_style change — no engine reset needed.
+            if change.modern_style != self.last_config.modern_style {
+                self.config.modern_style = change.modern_style;
+                if let Some(c) = self.router.composer.as_mut() {
+                    c.set_modern_style(change.modern_style);
+                }
+                tracing::info!(
+                    modern_style = change.modern_style,
+                    "config: modern_style changed at runtime"
+                );
+            }
+            self.last_config = change;
+        }
+    }
+
     /// Like wayland's `on_key_pressed` but without `AdapterCtx`. NAV and
     /// modifier-shortcut keys return `ForwardRaw` instead of `Consumed` (the
     /// caller just passes through). Runs the engine continuously and seeds from
     /// shadow at word start, same as the wayland path.
     #[cfg(feature = "ibus")]
     pub fn process_key(&mut self, key: u32, ch: Option<char>) -> KeyDecision {
+        self.sync_config();
         if let Some(w) = self.router.composer.as_mut() {
             w.check_idle_reset();
         }
@@ -221,6 +283,7 @@ impl Daemon {
     /// (no per-key reset) for every transport — wayland, IBus, evdev — building
     /// on the prior key's state, with a render-gated shadow seed at word start.
     pub fn handle_char(&mut self, ch: char) -> KeyDecision {
+        self.sync_config();
         match self.router.composer.as_mut() {
             Some(w) => w.feed_key(ch),
             None => KeyDecision::ForwardRaw,
@@ -228,6 +291,7 @@ impl Daemon {
     }
 
     pub fn handle_backspace(&mut self) -> KeyDecision {
+        self.sync_config();
         match self.router.composer.as_mut() {
             Some(w) => w.feed_backspace(),
             None => KeyDecision::ForwardRaw,
@@ -372,9 +436,17 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
+    fn test_daemon() -> Daemon {
+        Daemon::new(
+            Config::default(),
+            Arc::new(AtomicBool::new(true)),
+            super::noop_config_rx(),
+        )
+    }
+
     #[test]
     fn daemon_initializes_router_lifecycle_state() {
-        let d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
+        let d = test_daemon();
 
         assert!(!d.router.current_active);
         assert!(!d.router.synthetic_active);
@@ -443,7 +515,7 @@ mod tests {
             // virtual keyboard (vk_keyboard_available=false, e.g. KWin/ImV1)
             // detect_capability must resolve to UInput — the clamp now lives in
             // detect_method, fed by TransportProfile.has_vk_keyboard (#3, M2c).
-            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
             d.config.force_vk_only_apps = vec!["chromium".to_owned()];
             d.router.focused_app_id = Some("chromium".to_owned());
             let f = frame("", 0, 0);
@@ -472,7 +544,7 @@ mod tests {
             // to avoid the Chromium race condition where the key release
             // arrives via the fast wl_keyboard path and changes Chrome's
             // selection state before our text edit arrives.
-            let mut daemon = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
+            let mut daemon = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
             daemon.router.current_active = true;
             daemon.router.composer = Some(Composer::new(
                 InputMethod::Telex,
@@ -523,7 +595,7 @@ mod tests {
         use viet_ime_engine::InputMethod;
 
         fn daemon() -> Daemon {
-            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
             d.router.current_active = true;
             d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
@@ -629,7 +701,7 @@ mod tests {
         const KEY_LEFT: u32 = 105;
 
         fn v1_daemon() -> Daemon {
-            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
             d.router.current_active = true;
             d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
@@ -712,7 +784,7 @@ mod tests {
         const KEY_L: u32 = 38;
 
         fn daemon() -> Daemon {
-            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)));
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
             d.router.current_active = true;
             d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
@@ -770,6 +842,144 @@ mod tests {
                 matches!(key(&mut d, ImProtocol::ImV2, 'L'), KeyDecision::ForwardRaw),
                 "v2 keeps raw forward; the KWin modifier quirk doesn't apply"
             );
+        }
+    }
+
+    // ── Config-change coalescing regression tests ──────────────────────
+    //
+    // The watch-based config channel carries a full-state `ConfigChange`
+    // struct so fast sequential tray clicks (method change + legacy toggle)
+    // never lose an update. Further, `sync_config()` must only apply deltas
+    // — identical values must NOT reset the engine (or mid-word composition
+    // breaks on every keystroke).
+    mod sync_config {
+        use super::super::Daemon;
+        use crate::composer::Composer;
+        use crate::config::{Config, MethodConfig};
+        use crate::control::ConfigChange;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use tokio::sync::watch;
+        use viet_ime_edit_strategy::BackspaceMethod;
+        use viet_ime_engine::InputMethod;
+
+        #[test]
+        fn full_state_struct_applies_method_and_modern_style_together() {
+            // The tray always sends a complete `ConfigChange{method,modern_style}`.
+            // `sync_config()` must apply both fields from a single update.
+            let (tx, rx) = watch::channel(ConfigChange::default());
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), rx);
+            assert_eq!(d.config.method, MethodConfig::Telex);
+            assert!(d.config.modern_style);
+
+            // Send VNI + legacy-style in one atomic send.
+            let _ = tx.send(ConfigChange {
+                method: MethodConfig::Vni,
+                modern_style: false,
+            });
+            d.sync_config();
+
+            assert_eq!(
+                d.config.method,
+                MethodConfig::Vni,
+                "method must flip from a full-state send"
+            );
+            assert!(
+                !d.config.modern_style,
+                "modern_style must flip from the same send"
+            );
+        }
+
+        #[test]
+        fn noop_update_does_not_reset_engine_inflight() {
+            // Identical config after `sync_config()` must NOT trigger
+            // `set_input_method` (which resets the engine word).
+            let (tx, rx) = watch::channel(ConfigChange::default());
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), rx);
+            d.router.current_active = true;
+            d.router.composer = Some(Composer::new(
+                InputMethod::Telex,
+                BackspaceMethod::SurroundingText,
+                false,
+            ));
+
+            // Build an in-flight composition state.
+            let _ = d.handle_char('h');
+            assert!(
+                d.router.composer.as_ref().unwrap().last_input_char.is_some(),
+                "engine must have state after handle_char"
+            );
+
+            // Send the SAME config we already have.
+            let _ = tx.send(ConfigChange {
+                method: MethodConfig::Telex,
+                modern_style: true,
+            });
+            d.sync_config();
+
+            // The in-flight state must survive (no silent reset).
+            assert!(
+                d.router.composer.as_ref().unwrap().last_input_char.is_some(),
+                "no-op sync_config() must not reset the engine"
+            );
+        }
+
+        #[test]
+        fn sequential_sends_apply_latest_config() {
+            // The actual coalescing scenario: two back-to-back sends before
+            // `sync_config()` reads. The watch channel only retains the
+            // latest, so the tray must always send a *full* ConfigChange.
+            let (tx, rx) = watch::channel(ConfigChange::default());
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), rx);
+
+            // Two rapid sends before any poll.
+            let _ = tx.send(ConfigChange {
+                method: MethodConfig::Vni,
+                modern_style: true,
+            });
+            let _ = tx.send(ConfigChange {
+                method: MethodConfig::Telex,
+                modern_style: false,
+            });
+
+            d.sync_config();
+
+            // Both fields must reflect the LATEST send, not an intermediate.
+            assert_eq!(d.config.method, MethodConfig::Telex);
+            assert!(!d.config.modern_style, "modern_style from the second send");
+        }
+
+        #[test]
+        fn method_change_resets_engine_state() {
+            // When method actually changes, `set_input_method()` must fire
+            // and reset the in-flight composition.
+            let (tx, rx) = watch::channel(ConfigChange::default());
+            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), rx);
+            d.router.current_active = true;
+            d.router.composer = Some(Composer::new(
+                InputMethod::Telex,
+                BackspaceMethod::SurroundingText,
+                false,
+            ));
+
+            // Build in-flight state.
+            let _ = d.handle_char('h');
+            assert!(d.router.composer.as_ref().unwrap().last_input_char.is_some());
+
+            // Method changes: Telex → Vni.
+            let _ = tx.send(ConfigChange {
+                method: MethodConfig::Vni,
+                modern_style: true,
+            });
+            d.sync_config();
+
+            // Engine must have been reset by set_input_method.
+            assert!(
+                d.router.composer.as_ref().unwrap().last_input_char.is_none(),
+                "engine must reset on method change"
+            );
+            // Config field persisted.
+            assert_eq!(d.config.method, MethodConfig::Vni);
         }
     }
 }

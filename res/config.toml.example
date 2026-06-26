@@ -43,3 +43,8 @@ enable_evdev_grab = false
 # Telex-only: allow []{} shortcuts for o-horn/u-horn.
 # default: false
 bracket_shortcuts = false
+
+# Modern-style tone placement on oa/oe/uy diphthongs.
+# true (default) → oà, false → òa (legacy).
+# default: true
+modern_style = true

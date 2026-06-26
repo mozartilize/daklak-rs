@@ -278,6 +278,8 @@ fn main() -> Result<()> {
         let enabled = Arc::new(AtomicBool::new(true));
         let (cmd_tx, cmd_rx) = control::channel();
         let (state_tx, state_rx) = tokio::sync::watch::channel(true);
+        let (config_change_tx, config_change_rx) =
+            tokio::sync::watch::channel(control::ConfigChange::default());
 
         control::spawn(cmd_rx, enabled.clone(), state_tx);
 
@@ -299,25 +301,42 @@ fn main() -> Result<()> {
             });
         }
 
-        tray::spawn_tray(cmd_tx.clone(), state_rx);
+        tray::spawn_tray(
+            cmd_tx.clone(),
+            state_rx,
+            config_change_tx.clone(),
+            &config,
+        );
 
         // --- mode-specific run loop ---
 
         #[cfg(feature = "ibus")]
         if config.enable_ibus {
-            let daemon = handler::Daemon::new(config, enabled.clone());
+            let daemon = handler::Daemon::new(
+                config,
+                enabled.clone(),
+                config_change_rx.clone(),
+            );
             return viet_ime_ibus_adapter::IbusAdapter::run(daemon, enabled).await;
         }
 
         if config.enable_wayland {
-            let daemon = handler::Daemon::new(config, enabled.clone());
+            let daemon = handler::Daemon::new(
+                config,
+                enabled.clone(),
+                config_change_rx.clone(),
+            );
             let mut wayland = connect(daemon)?;
             return crate::main_loop::core_loop_with_wayland(&mut wayland).await;
         }
 
         #[cfg(feature = "evdev_grab")]
         if config.enable_evdev_grab {
-            let mut daemon = handler::Daemon::new(config, enabled.clone());
+            let mut daemon = handler::Daemon::new(
+                config,
+                enabled.clone(),
+                config_change_rx.clone(),
+            );
             daemon.activate_evdev();
             let mut evdev = viet_ime_evdev_adapter::EvdevAdapter::open()?;
             return evdev.run(&mut daemon).await;

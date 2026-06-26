@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use viet_ime_engine::InputMethod;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MethodConfig {
     Telex,
@@ -27,7 +27,7 @@ impl MethodConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub method: MethodConfig,
@@ -104,9 +104,25 @@ pub struct Config {
     /// Env override `DAKLAK_ENABLE_IBUS` (truthy heuristic).
     #[serde(default)]
     pub enable_ibus: bool,
+
+    /// Modern-style tone placement on `oa`/`oe`/`uy` diphthongs.
+    /// `true` (default) → `oà`, `false` → `òa` (legacy).
+    /// Override: `DAKLAK_MODERN_STYLE` env var (truthy heuristic).
+    #[serde(default = "default_modern_style")]
+    pub modern_style: bool,
+
+    /// Path where this config was loaded from. `None` when using defaults.
+    /// Populated by `Config::load()` / `Config::load_from()`. Used by the
+    /// tray menu to write method/modern_style changes back to the file.
+    #[serde(skip)]
+    pub config_path: Option<PathBuf>,
 }
 
 fn default_enable_wayland() -> bool {
+    true
+}
+
+fn default_modern_style() -> bool {
     true
 }
 
@@ -124,6 +140,8 @@ impl Default for Config {
             enable_evdev_grab: false,
             bracket_shortcuts: false,
             enable_ibus: false,
+            modern_style: default_modern_style(),
+            config_path: None,
         }
     }
 }
@@ -143,9 +161,17 @@ impl Config {
 
     pub fn load_from(path: Option<PathBuf>) -> Result<Self> {
         let mut cfg = match path {
-            Some(path) => Self::load_file(&path)?,
+            Some(ref p) => Self::load_file(p)?,
             None => Self::load_default_file().unwrap_or_default(),
         };
+
+        // Populate config_path now so that tray / save() know where to write.
+        // load_file / load_default_file set it internally.
+        if let Some(p) = path {
+            if cfg.config_path.is_none() {
+                cfg.config_path = Some(p);
+            }
+        }
 
         if let Ok(m) = std::env::var("DAKLAK_METHOD") {
             cfg.method = match m.to_lowercase().as_str() {
@@ -203,6 +229,13 @@ impl Config {
             );
         }
 
+        if let Ok(v) = std::env::var("DAKLAK_MODERN_STYLE") {
+            cfg.modern_style = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
         if let Ok(v) = std::env::var("DAKLAK_ENABLE_IBUS") {
             cfg.enable_ibus = matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -227,15 +260,18 @@ impl Config {
             })?;
 
         let path = config_dir.join("daklak").join("config.toml");
-        let text = std::fs::read_to_string(path).ok()?;
-        toml::from_str(&text).ok()
+        let text = std::fs::read_to_string(&path).ok()?;
+        let mut cfg: Self = toml::from_str(&text).ok()?;
+        cfg.config_path = Some(path);
+        Some(cfg)
     }
 
     fn load_file(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let cfg = toml::from_str(&text)
+        let mut cfg: Self = toml::from_str(&text)
             .with_context(|| format!("failed to parse config file {}", path.display()))?;
+        cfg.config_path = Some(path.to_owned());
         Ok(cfg)
     }
 }

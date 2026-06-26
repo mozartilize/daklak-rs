@@ -215,6 +215,10 @@ pub struct Composer {
 
     /// Firefox contenteditable stale-echo workaround state.
     firefox: FirefoxContenteditableQuirk,
+
+    /// Whether `[`/`]`/`{`/`}` Telex shortcuts for ơ/ư/Ơ/Ư are enabled.
+    /// Stored so `set_input_method` can recreate the engine with it.
+    bracket_shortcuts: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +282,7 @@ impl Composer {
             ibus: IbusSurroundingQuirk::new(),
             retroactive_context: false,
             firefox: FirefoxContenteditableQuirk::new(),
+            bracket_shortcuts,
         }
     }
 
@@ -369,6 +374,17 @@ impl Composer {
 
     pub fn set_modifiers(&mut self, m: ModifierState) {
         self.edit.set_modifiers(m);
+    }
+
+    /// Change input method at runtime. Resets all composition state.
+    pub fn set_input_method(&mut self, method: InputMethod) {
+        self.full_reset();
+        self.engine = EngineState::new_with_options(method, self.bracket_shortcuts);
+    }
+
+    /// Toggle modern-style tone placement. `false` = legacy `òa` instead of `oà`.
+    pub fn set_modern_style(&mut self, enabled: bool) {
+        self.engine.set_modern_style(enabled);
     }
 
     // ── lifecycle ─────────────────────────────────────────────────────────

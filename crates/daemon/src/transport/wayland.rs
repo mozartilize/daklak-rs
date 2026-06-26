@@ -16,6 +16,8 @@ use crate::handler::{Daemon, KEY_BACKSPACE, NAV_KEYS};
 
 impl AdapterHandler for Daemon {
     fn on_done_frame(&mut self, ctx: &mut AdapterCtx<'_>, frame: &FrameSnapshot) {
+        self.sync_config();
+
         if frame.activate && self.router.synthetic_active {
             tracing::info!(
                 "real Activate received while synthetic session active → drop synthetic"
@@ -157,6 +159,8 @@ impl AdapterHandler for Daemon {
         key: u32,
         ch: Option<char>,
     ) -> KeyDecision {
+        self.sync_config();
+
         // A key REPEAT (wl_keyboard state=2) is not a fresh keystroke: it must
         // never mutate the compose engine or re-Apply a commit. We still run the
         // forward decision so nav / modifier-shortcut repeats reach the client
