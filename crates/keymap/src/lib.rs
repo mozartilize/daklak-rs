@@ -318,23 +318,62 @@ pub fn keymap_text() -> String {
     s.push_str("  xkb_types \"complete\" { include \"complete\" };\n");
     s.push_str("  xkb_compat \"complete\" { include \"complete\" };\n");
     // ── symbols — standard pc+us layout + EIGHT_LEVEL custom slots ────────
-    append_symbols_section(&mut s, "  ", "pc+us+daklak");
+    append_symbols_section(&mut s, "  ", "pc+us+daklak", true);
     s.push_str("};\n");
     s
 }
 
 /// Build a standalone xkb_symbols fragment for installation under
-/// `<datadir>/X11/xkb/symbols/daklak_vn`.
+/// `<xkb base>/symbols/daklak_vn` (system `<datadir>/X11/xkb/symbols/` or
+/// user-local `~/.config/xkb/symbols/`).
+///
+/// Emits two sections:
+/// - **`basic`** (default): self-contained — includes `pc+us+inet(evdev)`
+///   then applies the daklak overrides. Used when `daklak_vn` is selected
+///   as a *layout* (and by the standalone keymap blob path).
+/// - **`overlay`**: the daklak overrides *only*, with no base include. Used
+///   when daklak is applied as an xkb *option* (`daklak:vn`) on top of an
+///   existing base layout. This is the path that survives KDE/libxkbcommon's
+///   rules composition: option-supplied symbols are merged *after* the
+///   model's `inet(evdev)`, so the daklak slot overrides win instead of
+///   being re-clobbered by `inet`'s `<ZEHA>`/`<FK13>`-`<FK19>` definitions.
 pub fn symbols_text() -> String {
-    let mut s = String::with_capacity(8 * 1024);
+    let mut s = String::with_capacity(12 * 1024);
     s.push_str("default partial alphanumeric_keys\n");
-    append_symbols_section(&mut s, "", "basic");
+    append_symbols_section(&mut s, "", "basic", true);
+    s.push('\n');
+    s.push_str("partial alphanumeric_keys\n");
+    append_symbols_section(&mut s, "", "overlay", false);
     s
 }
 
-fn append_symbols_section(s: &mut String, indent: &str, section: &str) {
+/// Build the user-local xkb rules overlay for installation at
+/// `~/.config/xkb/rules/evdev`. It pulls in the stock `evdev` ruleset and
+/// registers the `daklak:vn` option, which maps to the `overlay` symbols
+/// variant. Applying daklak via this option (rather than as a layout)
+/// places its overrides after `inet(evdev)` in the composed keymap, which
+/// is what makes all 17 Vietnamese slots survive on KDE/Wayland without
+/// editing any system files.
+pub fn rules_text() -> String {
+    let mut s = String::with_capacity(128);
+    s.push_str("// daklak xkb rules overlay — install at ~/.config/xkb/rules/evdev\n");
+    s.push_str("// Pulls in the stock evdev ruleset, then registers the daklak:vn option.\n");
+    s.push_str("! include %S/evdev\n");
+    s.push('\n');
+    s.push_str("! option = symbols\n");
+    s.push_str("  daklak:vn  =  +daklak_vn(overlay)\n");
+    s
+}
+
+/// Append one `xkb_symbols "<section>"` block. When `include_base` is true
+/// the block opens with `include "pc+us+inet(evdev)"` (self-contained
+/// layout); when false it emits the daklak overrides only (overlay variant
+/// meant to be merged onto an existing base layout via an xkb option).
+fn append_symbols_section(s: &mut String, indent: &str, section: &str, include_base: bool) {
     s.push_str(&format!("{indent}xkb_symbols \"{section}\" {{\n"));
-    s.push_str(&format!("{indent}  include \"pc+us+inet(evdev)\"\n"));
+    if include_base {
+        s.push_str(&format!("{indent}  include \"pc+us+inet(evdev)\"\n"));
+    }
     // Group name override — lets evdev-only mode probe whether scroll/sway
     // actually loaded our keymap (vs falling back to its default "English
     // (US)" for daklak's uinput device).
@@ -627,18 +666,40 @@ mod tests {
         assert!(text.starts_with("default partial alphanumeric_keys\n"));
         assert!(text.contains("xkb_symbols \"basic\" {\n"));
         assert!(text.contains("name[Group1] = \"Daklak Vietnamese\";"));
+        // The overlay variant (for the daklak:vn option path) must also be
+        // present, and unlike `basic` it must NOT re-include the base.
+        assert!(text.contains("xkb_symbols \"overlay\" {\n"));
+        let overlay = text
+            .split("xkb_symbols \"overlay\" {")
+            .nth(1)
+            .expect("overlay section present");
+        assert!(
+            !overlay.contains("include \"pc+us+inet(evdev)\""),
+            "overlay must not re-include the base layout"
+        );
+    }
+
+    #[test]
+    fn rules_text_registers_daklak_option() {
+        let text = rules_text();
+        assert!(text.contains("! include %S/evdev"));
+        assert!(text.contains("! option = symbols"));
+        assert!(text.contains("daklak:vn"));
+        assert!(text.contains("+daklak_vn(overlay)"));
     }
 
     #[test]
     fn symbols_and_keymap_share_slot_rows() {
-        fn slot_rows(text: &str) -> Vec<String> {
+        use std::collections::BTreeSet;
+        fn slot_rows(text: &str) -> BTreeSet<String> {
             text.lines()
                 .map(str::trim_start)
                 .filter(|l| l.starts_with("replace key <"))
                 .map(str::to_owned)
                 .collect()
         }
-
+        // symbols_text() now carries two sections (basic + overlay) whose
+        // override rows are identical, so compare the unique row sets.
         assert_eq!(slot_rows(&keymap_text()), slot_rows(&symbols_text()));
     }
 }

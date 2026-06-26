@@ -30,7 +30,10 @@ fn print_help() {
          \x20              Pipe to a file then load it into your compositor manually:\n\
          \x20                daklak gen-keymap > /tmp/daklak.xkb\n\
          \x20                swaymsg input <viet-ime-id> xkb_file /tmp/daklak.xkb\n\
-         \x20              Add --symbols to print the installable xkb_symbols fragment."
+         \x20              Add --symbols to print the installable xkb_symbols fragment
+         \x20              (basic + overlay variants), or --rules to print the
+         \x20              ~/.config/xkb/rules/evdev overlay that registers the
+         \x20              daklak:vn option for KDE/Wayland."
     );
     println!();
     println!("With no subcommand, runs the input-method daemon.");
@@ -74,6 +77,7 @@ struct Cli {
     command: Option<Command>,
     overrides: CliOverrides,
     gen_keymap_symbols: bool,
+    gen_keymap_rules: bool,
 }
 
 fn parse_cli() -> Result<Cli> {
@@ -90,6 +94,7 @@ fn parse_cli() -> Result<Cli> {
             "status" => set_command(&mut cli.command, Command::Status, &arg)?,
             "gen-keymap" => set_command(&mut cli.command, Command::GenKeymap, &arg)?,
             "--symbols" => cli.gen_keymap_symbols = true,
+            "--rules" => cli.gen_keymap_rules = true,
             "--config" | "-c" => {
                 cli.overrides.config_path = Some(PathBuf::from(next_value(&mut args, "--config")?));
             }
@@ -128,6 +133,14 @@ fn parse_cli() -> Result<Cli> {
 
     if cli.gen_keymap_symbols && !matches!(cli.command, Some(Command::GenKeymap)) {
         return Err(anyhow::anyhow!("daklak: --symbols is only valid with gen-keymap"));
+    }
+    if cli.gen_keymap_rules && !matches!(cli.command, Some(Command::GenKeymap)) {
+        return Err(anyhow::anyhow!("daklak: --rules is only valid with gen-keymap"));
+    }
+    if cli.gen_keymap_symbols && cli.gen_keymap_rules {
+        return Err(anyhow::anyhow!(
+            "daklak: --symbols and --rules are mutually exclusive"
+        ));
     }
 
     Ok(cli)
@@ -230,7 +243,9 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::GenKeymap) => {
-            if cli.gen_keymap_symbols {
+            if cli.gen_keymap_rules {
+                print!("{}", viet_ime_keymap::rules_text());
+            } else if cli.gen_keymap_symbols {
                 print!("{}", viet_ime_keymap::symbols_text());
             } else {
                 print!("{}", viet_ime_keymap::keymap_text());
