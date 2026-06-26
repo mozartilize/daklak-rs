@@ -13,12 +13,12 @@
 
 ## Build
 
-The daemon crate is `viet-ime-daemon`. Transport support is gated behind Cargo
-features (`wayland`, `ibus`, `kde`), declared in
+The daemon crate is `viet-ime-daemon`. Cargo features are only used for
+optional integrations (`ibus`, `kde`), declared in
 [`crates/daemon/Cargo.toml`](../crates/daemon/Cargo.toml).
 
 ```sh
-# default feature set (Wayland)
+# default build
 cargo build -p viet-ime-daemon
 
 # with IBus support
@@ -50,8 +50,8 @@ The daemon picks its transport at startup. The selection order is:
 
 1. **IBus** — if built with `--features ibus` and IBus mode is enabled
    (via the `--ibus` flag or by being spawned by `ibus-daemon`).
-2. **Wayland** — if built with `--features wayland` and Wayland is enabled.
-3. **evdev** — the fallback when neither of the above is active.
+2. **Wayland** — if Wayland is enabled in config.
+3. **evdev** — the fallback when Wayland is disabled and evdev grab is enabled.
 
 ### wlroots / Sway
 
@@ -61,10 +61,11 @@ Run daklak directly in Wayland mode:
 cargo run -p viet-ime-daemon
 ```
 
-Development run with trace logging:
+Development run with logging overrides:
 
 ```sh
-RUST_LOG=daklak=trace,viet_ime_wayland_adapter=trace \
+DAKLAK_LOG_LEVEL=error \
+DAKLAK_LOG_MODULES=daklak=debug,viet_ime_wayland_adapter=info \
 DAKLAK_FORCE_VK_ONLY_APPS=org.keepassxc.KeePassXC,xfce4-terminal \
 cargo run -p viet-ime-daemon
 ```
@@ -120,6 +121,7 @@ A few subcommands are handled before the daemon loop starts:
 | ------- | ------ |
 | `daklak` (no args) | Start the daemon in the auto-selected transport mode. |
 | `daklak --ibus` | Force IBus mode (used by the IBus component exec line). |
+| `daklak --log-level debug --log-module daklak=debug` | Override logging from the command line. |
 | `daklak toggle` | Toggle the running daemon on/off (IPC client). |
 | `daklak enable` | Enable composition in the running daemon. |
 | `daklak disable` | Disable composition (pass-through). |
@@ -139,6 +141,18 @@ and toggles the enabled state. This works in every transport mode.
 ## Configuration
 
 Configuration is loaded at startup (see [`crates/daemon/src/config.rs`](../crates/daemon/src/config.rs)).
+Notable logging options:
+
+```toml
+log_level = "error"
+log_path = "/dev/stdout"
+log_modules = ["daklak=debug", "viet_ime_wayland_adapter=info"]
+```
+
+- **log level** — base level for all targets (default `error`).
+- **log path** — destination for tracing output (default `/dev/stdout`).
+- **log modules** — per-target overrides such as `daklak=debug`.
+
 Notable per-app routing options:
 
 - **force-uinput apps** — apps that must use the uinput tier (e.g. clients that

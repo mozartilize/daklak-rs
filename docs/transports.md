@@ -19,8 +19,8 @@ At startup the daemon picks the first applicable mode:
 
 1. **IBus** — built with `--features ibus` and IBus mode enabled (the `--ibus`
    flag, or being launched by `ibus-daemon`).
-2. **Wayland** — built with `--features wayland` and Wayland enabled.
-3. **evdev** — the fallback when neither of the above applies.
+2. **Wayland** — enabled in config.
+3. **evdev** — the fallback when Wayland is disabled and evdev grab is enabled.
 
 The control plane (enable/disable, IPC, tray) starts before the mode loop and is
 identical across all three.

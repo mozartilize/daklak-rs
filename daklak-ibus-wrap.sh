@@ -15,12 +15,13 @@ cd "$(dirname "$(readlink -f "$0")")"
 #     exit 1
 # fi
 
-# Keep handler at trace (composition logic) but quiet the raw protocol
-# event dump from dispatch_v1 (3-5 events per keystroke = noise).
+# Keep handler at debug while leaving the rest at error.
 # export WAYLAND_DEBUG=1
-export RUST_LOG=daklak=trace,viet_ime_ibus_adapter=debug,viet_ime_edit_strategy=debug,viet_ime_engine=trace
+export DAKLAK_LOG_PATH=/tmp/daklak.log
+export DAKLAK_LOG_LEVEL=error
+export DAKLAK_LOG_MODULES=daklak=debug,viet_ime_ibus_adapter=info,viet_ime_edit_strategy=info,viet_ime_engine=debug
 #export DAKLAK_ENABLE_EVDEV_GRAB=0
 #export DAKLAK_ENABLE_WAYLAND=1
 # export DAKLAK_FORCE_VK_ONLY_APPS=org.keepassxc.KeePassXC,ONLYOFFICE,steam,xfce4-terminal,com.mitchellh.ghostty
 
-exec ./target/debug/daklak --ibus >>/tmp/daklak.log 2>&1
+exec ./target/debug/daklak --ibus

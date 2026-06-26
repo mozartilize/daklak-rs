@@ -3,6 +3,7 @@ mod config;
 mod control;
 mod handler;
 mod ipc;
+mod logging;
 mod main_loop;
 mod quirks;
 mod transport;
@@ -12,7 +13,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tracing_subscriber::{filter::EnvFilter, fmt};
 
 use viet_ime_wayland_adapter::connect;
 
@@ -35,6 +35,131 @@ fn print_help() {
     println!();
     println!("Sway keybind example:");
     println!("  bindsym $mod+space exec daklak toggle");
+    println!();
+    println!("Logging flags:");
+    println!("  --log-level <error|info|debug>  Set the base log level (trace aliases debug).");
+    println!("  --log-path <path>               Write logs to this path (default /dev/stdout).");
+    println!("  --log-module <target=level>      Add a per-target directive; repeatable.");
+    println!("  --log-modules <a,b,c>           Comma-separated per-target directives.");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Toggle,
+    Enable,
+    Disable,
+    Status,
+    GenKeymap,
+    Help,
+}
+
+#[derive(Debug, Default)]
+struct CliOverrides {
+    ibus: bool,
+    log_level: Option<String>,
+    log_path: Option<String>,
+    log_modules: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct Cli {
+    command: Option<Command>,
+    overrides: CliOverrides,
+}
+
+fn parse_cli() -> Result<Cli> {
+    let mut cli = Cli::default();
+    let mut args = std::env::args().skip(1).peekable();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--ibus" => cli.overrides.ibus = true,
+            "--help" | "-h" | "help" => cli.command = Some(Command::Help),
+            "toggle" => set_command(&mut cli.command, Command::Toggle, &arg)?,
+            "enable" => set_command(&mut cli.command, Command::Enable, &arg)?,
+            "disable" => set_command(&mut cli.command, Command::Disable, &arg)?,
+            "status" => set_command(&mut cli.command, Command::Status, &arg)?,
+            "gen-keymap" => set_command(&mut cli.command, Command::GenKeymap, &arg)?,
+            "--log-level" => cli.overrides.log_level = Some(next_value(&mut args, "--log-level")?),
+            _ if arg.starts_with("--log-level=") => {
+                cli.overrides.log_level = Some(value_after_equals(&arg, "--log-level")?);
+            }
+            "--log-path" => cli.overrides.log_path = Some(next_value(&mut args, "--log-path")?),
+            _ if arg.starts_with("--log-path=") => {
+                cli.overrides.log_path = Some(value_after_equals(&arg, "--log-path")?);
+            }
+            "--log-module" => cli.overrides.log_modules.push(next_value(&mut args, "--log-module")?),
+            _ if arg.starts_with("--log-module=") => {
+                cli.overrides.log_modules.push(value_after_equals(&arg, "--log-module")?);
+            }
+            "--log-modules" => cli
+                .overrides
+                .log_modules
+                .extend(parse_csv_list(&next_value(&mut args, "--log-modules")?)),
+            _ if arg.starts_with("--log-modules=") => {
+                cli.overrides
+                    .log_modules
+                    .extend(parse_csv_list(&value_after_equals(&arg, "--log-modules")?));
+            }
+            other if other.starts_with('-') => {
+                return Err(anyhow::anyhow!("daklak: unknown option {other:?}"));
+            }
+            other => {
+                return Err(anyhow::anyhow!("daklak: unknown subcommand {other:?}"));
+            }
+        }
+    }
+
+    Ok(cli)
+}
+
+fn set_command(slot: &mut Option<Command>, command: Command, arg: &str) -> Result<()> {
+    if let Some(prev) = slot {
+        if *prev != command {
+            return Err(anyhow::anyhow!("daklak: multiple subcommands provided"));
+        }
+        return Ok(());
+    }
+
+    *slot = Some(command);
+    if arg == "help" {
+        *slot = Some(Command::Help);
+    }
+    Ok(())
+}
+
+fn next_value(args: &mut std::iter::Peekable<impl Iterator<Item = String>>, flag: &str) -> Result<String> {
+    args.next().ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
+}
+
+fn value_after_equals(arg: &str, flag: &str) -> Result<String> {
+    arg.split_once('=')
+        .map(|(_, value)| value.to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
+}
+
+fn parse_csv_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn apply_overrides(config: &mut config::Config, overrides: CliOverrides) {
+    if let Some(level) = overrides.log_level {
+        config.log_level = level;
+    }
+    if let Some(path) = overrides.log_path {
+        config.log_path = path;
+    }
+    if !overrides.log_modules.is_empty() {
+        config.log_modules = overrides.log_modules;
+    }
+    if overrides.ibus {
+        config.enable_ibus = true;
+    }
 }
 
 /// Connect to the running daemon socket and send a one-line command.
@@ -57,48 +182,43 @@ fn ipc_send(cmd: &str) -> Result<String> {
 }
 
 fn main() -> Result<()> {
-    // CLI subcommands — parsed before logging init so output stays clean.
-    if let Some(arg) = std::env::args().nth(1) {
-        match arg.as_str() {
-            "toggle" | "enable" | "disable" | "status" => {
-                let reply = ipc_send(&arg)?;
-                println!("{reply}");
-                return Ok(());
-            }
-            "gen-keymap" => {
-                print!("{}", viet_ime_keymap::keymap_text());
-                return Ok(());
-            }
-            "--help" | "-h" | "help" => {
-                print_help();
-                return Ok(());
-            }
-            "--ibus" => {
-                // ibus-daemon spawned us via the component <exec> line.
-                // Fall through to main with enable_ibus = true.
-                // Config::load() will see DAKLAK_ENABLE_IBUS if set; we also
-                // force the flag here so no env var is needed.
-            }
-            other => {
-                eprintln!("daklak: unknown subcommand {other:?}\n");
-                print_help();
-                std::process::exit(2);
-            }
-        }
-    }
+    let cli = parse_cli()?;
 
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("RUST_LOG")
-                .unwrap_or_else(|_| EnvFilter::new("viet_ime=debug")),
-        )
-        .init();
+    match cli.command {
+        Some(Command::Help) => {
+            print_help();
+            return Ok(());
+        }
+        Some(Command::Toggle) => {
+            let reply = ipc_send("toggle")?;
+            println!("{reply}");
+            return Ok(());
+        }
+        Some(Command::Enable) => {
+            let reply = ipc_send("enable")?;
+            println!("{reply}");
+            return Ok(());
+        }
+        Some(Command::Disable) => {
+            let reply = ipc_send("disable")?;
+            println!("{reply}");
+            return Ok(());
+        }
+        Some(Command::Status) => {
+            let reply = ipc_send("status")?;
+            println!("{reply}");
+            return Ok(());
+        }
+        Some(Command::GenKeymap) => {
+            print!("{}", viet_ime_keymap::keymap_text());
+            return Ok(());
+        }
+        None => {}
+    }
 
     let mut config = config::Config::load()?;
-    // --ibus flag forces ibus mode regardless of config file.
-    if std::env::args().any(|a| a == "--ibus") {
-        config.enable_ibus = true;
-    }
+    apply_overrides(&mut config, cli.overrides);
+    logging::init(&config)?;
     tracing::info!("input method: {:?}", config.method);
 
     let rt = tokio::runtime::Builder::new_multi_thread()

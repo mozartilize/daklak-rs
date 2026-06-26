@@ -36,6 +36,18 @@ pub struct Config {
     #[serde(default = "default_enable_wayland")]
     pub enable_wayland: bool,
 
+    /// Minimum log level for all targets unless overridden by `log_modules`.
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+
+    /// Log destination. Defaults to `/dev/stdout`.
+    #[serde(default = "default_log_path")]
+    pub log_path: String,
+
+    /// Per-target logging directives, e.g. `daklak=debug`.
+    #[serde(default)]
+    pub log_modules: Vec<String>,
+
     /// Apps whose `app_id` (case-insensitive) forces Tier 3 UInput routing
     /// regardless of `purpose` or other capability signals. Use this for
     /// apps confirmed broken on both Tier 2 ForwardKey and Tier 1
@@ -102,6 +114,9 @@ impl Default for Config {
         Self {
             method: MethodConfig::default(),
             enable_wayland: default_enable_wayland(),
+            log_level: default_log_level(),
+            log_path: default_log_path(),
+            log_modules: Vec::new(),
             force_uinput_apps: Vec::new(),
             force_vk_only_apps: Vec::new(),
             auto_vk_only_for_xwayland: true,
@@ -142,6 +157,18 @@ impl Config {
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );
+        }
+
+        if let Ok(v) = std::env::var("DAKLAK_LOG_LEVEL") {
+            cfg.log_level = v;
+        }
+
+        if let Ok(v) = std::env::var("DAKLAK_LOG_PATH") {
+            cfg.log_path = v;
+        }
+
+        if let Ok(v) = std::env::var("DAKLAK_LOG_MODULES") {
+            cfg.log_modules = parse_directive_list(&v);
         }
 
         if let Ok(v) = std::env::var("DAKLAK_AUTO_VK_ONLY_XWAYLAND") {
@@ -203,12 +230,29 @@ fn parse_app_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parse a comma-separated list of logging directives.
+fn parse_directive_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Normalize a user-supplied list (TOML): trim, drop empties, lowercase.
 fn canonicalize_app_list(list: Vec<String>) -> Vec<String> {
     list.into_iter()
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+fn default_log_level() -> String {
+    "error".to_owned()
+}
+
+fn default_log_path() -> String {
+    "/dev/stdout".to_owned()
 }
 
 #[cfg(test)]

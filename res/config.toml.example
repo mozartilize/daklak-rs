@@ -10,6 +10,14 @@ method = "telex"
 # default: true
 enable_wayland = true
 
+# Logging.
+# default: "error"
+log_level = "error"
+# default: "/dev/stdout"
+log_path = "/dev/stdout"
+# Per-target overrides; trace is accepted as an alias for debug.
+log_modules = ["daklak=debug", "viet_ime_wayland_adapter=info"]
+
 # Force these app_id values to Tier 3 UInput routing (case-insensitive).
 # default: []
 force_uinput_apps = []
