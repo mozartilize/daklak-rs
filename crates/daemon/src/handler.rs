@@ -305,6 +305,7 @@ impl Daemon {
     /// Bootstrap a synthetic session for evdev-only mode. Sets up a composer
     /// with VkOnly routing so `handle_char` / `handle_backspace` work without a
     /// Wayland compositor.
+    #[cfg(feature = "evdev_grab")]
     pub fn activate_evdev(&mut self) {
         let mut c = Composer::new(
             self.config.method.to_engine(),

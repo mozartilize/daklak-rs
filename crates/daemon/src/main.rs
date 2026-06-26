@@ -14,7 +14,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing_subscriber::{filter::EnvFilter, fmt};
 
-#[cfg(feature = "wayland")]
 use viet_ime_wayland_adapter::connect;
 
 fn print_help() {
@@ -143,16 +142,27 @@ fn main() -> Result<()> {
             return viet_ime_ibus_adapter::IbusAdapter::run(daemon, enabled).await;
         }
 
-        #[cfg(feature = "wayland")]
         if config.enable_wayland {
             let daemon = handler::Daemon::new(config, enabled.clone());
             let mut wayland = connect(daemon)?;
             return crate::main_loop::core_loop_with_wayland(&mut wayland).await;
         }
 
-        let mut daemon = handler::Daemon::new(config, enabled.clone());
-        daemon.activate_evdev();
-        let mut evdev = viet_ime_evdev_adapter::EvdevAdapter::open()?;
-        evdev.run(&mut daemon).await
+        #[cfg(feature = "evdev_grab")]
+        if config.enable_evdev_grab {
+            let mut daemon = handler::Daemon::new(config, enabled.clone());
+            daemon.activate_evdev();
+            let mut evdev = viet_ime_evdev_adapter::EvdevAdapter::open()?;
+            return evdev.run(&mut daemon).await;
+        }
+
+        #[cfg(not(feature = "evdev_grab"))]
+        if config.enable_evdev_grab {
+            return Err(anyhow::anyhow!(
+                "evdev_grab mode requested, but the daemon was built without the evdev_grab feature"
+            ));
+        }
+
+        anyhow::bail!("no input backend enabled; set enable_wayland=true or enable_evdev_grab=true")
     })
 }

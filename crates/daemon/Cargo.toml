@@ -9,10 +9,10 @@ name = "daklak"
 path = "src/main.rs"
 
 [features]
-default = ["wayland"]
-wayland = []
+default = []
 kde = ["viet-ime-wayland-adapter/kde"]
 ibus = ["dep:viet-ime-ibus-adapter"]
+evdev_grab = ["dep:viet-ime-evdev-adapter"]
 
 [dependencies]
 viet-ime-engine = { path = "../engine" }
@@ -20,7 +20,7 @@ viet-ime-edit-strategy = { path = "../edit-strategy" }
 viet-ime-focus = { path = "../focus" }
 viet-ime-keymap = { workspace = true }
 viet-ime-wayland-adapter = { path = "../wayland-adapter" }
-viet-ime-evdev-adapter = { path = "../evdev-adapter" }
+viet-ime-evdev-adapter = { path = "../evdev-adapter", optional = true }
 viet-ime-key-emitter = { workspace = true }
 viet-ime-ibus-adapter = { workspace = true, optional = true }
 

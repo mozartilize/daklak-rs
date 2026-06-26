@@ -31,6 +31,9 @@ endif
 if get_option('ibus')
   features += 'ibus'
 endif
+if get_option('evdev_grab')
+  features += 'evdev_grab'
+endif
 
 summary({
   'prefix': get_option('prefix'),

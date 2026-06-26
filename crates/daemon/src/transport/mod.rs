@@ -2,6 +2,7 @@
 //! into `Daemon` routing calls + `Composer` brain operations. Adding a
 //! transport touches one new file here, not the composition core.
 
+#[cfg(feature = "evdev_grab")]
 mod evdev;
 mod wayland;
 

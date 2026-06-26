@@ -31,8 +31,8 @@ pub struct Config {
     #[serde(default)]
     pub method: MethodConfig,
 
-    /// When false, skip Wayland IME setup and fall through to the evdev-only
-    /// placeholder loop. Must match a compiled-in `wayland` feature.
+    /// When false, skip Wayland IME setup and fall through to the optional
+    /// evdev-grab loop if the daemon was built with `evdev_grab`.
     #[serde(default = "default_enable_wayland")]
     pub enable_wayland: bool,
 

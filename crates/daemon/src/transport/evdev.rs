@@ -1,10 +1,12 @@
 //! Evdev transport glue: `EvdevHandler` impl. Thin delegations to the
 //! `Daemon` routing surface + `Composer` brain.
 
+#[cfg(feature = "evdev_grab")]
 use viet_ime_edit_strategy::KeyDecision;
 
 use crate::handler::Daemon;
 
+#[cfg(feature = "evdev_grab")]
 impl viet_ime_evdev_adapter::EvdevHandler for Daemon {
     fn handle_char(&mut self, _code: u32, ch: char) -> KeyDecision {
         Daemon::handle_char(self, ch)
