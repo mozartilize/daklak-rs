@@ -71,20 +71,37 @@ in `xev` but harmless in practice (clients typically lazy-cache xkb state).
 
 ## Generating the keymap
 
-Daklak's `gen-keymap` subcommand prints the synthetic xkb keymap to stdout.
-Add `--symbols` to print the installable `xkb_symbols` fragment instead. The
-daemon itself never writes the file or calls into the compositor — keymap setup
-is the user's responsibility (one `swaymsg` / `xkbcomp` invocation, easily
-wrapped in a systemd unit):
+Daklak's `gen-keymap` subcommand prints xkb keymap material to stdout. The
+daemon itself never writes a file or calls into the compositor — keymap setup
+is the user's responsibility (one `swaymsg` / `xkbcomp` / `kwriteconfig6` /
+`gsettings` invocation, easily wrapped in a systemd unit). Three output forms:
+
+- `daklak gen-keymap` — the **full keymap blob** (`xkb_keymap { … }`). For the
+  per-device / session-wide blob paths (`swaymsg … xkb_file`, `xkbcomp`).
+- `daklak gen-keymap --symbols` — the standalone `xkb_symbols` fragment, with
+  **two sections**: `basic` (self-contained: includes `pc+us+inet(evdev)` then
+  applies the daklak overrides — for selecting `daklak_vn` as a layout) and
+  `overlay` (the daklak overrides *only*, no base include — for applying daklak
+  as an xkb **option** on KDE/GNOME Wayland; see below).
+- `daklak gen-keymap --rules` — the user-local **rules overlay** that pulls in
+  the stock `evdev` ruleset and registers the `daklak:vn` option mapping to
+  `daklak_vn(overlay)`.
 
 ```
-daklak gen-keymap > /tmp/daklak.xkb
-daklak gen-keymap --symbols > /usr/share/X11/xkb/symbols/daklak_vn
+daklak gen-keymap          > /tmp/daklak.xkb                      # blob
+daklak gen-keymap --symbols > ~/.config/xkb/symbols/daklak_vn     # option path (Wayland)
+daklak gen-keymap --rules   > ~/.config/xkb/rules/evdev           # option path (Wayland)
 ```
 
-Meson installs the same symbols file automatically when configured with
-`-Devdev_grab=true` and installed to a system prefix (`sudo meson install`,
-so it lands under `/usr/share/X11/xkb/symbols/daklak_vn`).
+For the **blob** paths (sway/X11) nothing is installed — the blob is loaded
+directly. For the **option** paths (KDE/GNOME Wayland) the two files go under
+`~/.config/xkb/` (user-local, no root, no system-file edits); libxkbcommon
+searches `~/.config/xkb` first, so they shadow the stock ruleset cleanly.
+
+Meson installs the symbols file system-wide (`/usr/share/X11/xkb/symbols/
+daklak_vn`) when configured with `-Devdev_grab=true` and `sudo meson install` —
+that covers the `setxkbmap daklak_vn` *layout* path only; the Wayland *option*
+path wants the user-local copies above.
 
 Verify it parses cleanly (optional — the slot/name table is checked at compile
 time via a `const` assertion, so this is just for hand-editing or CI):
@@ -148,20 +165,88 @@ the swaymsg call races, retry in a loop or use a small sleep.)
 
 ## KDE Plasma, GNOME, X11
 
-Per-device raw-keymap APIs aren't standard on these. Apply the generated keymap
-manually via the platform-appropriate path; daklak itself still runs and emits
-as before — only the compositor-side keymap mapping is platform-specific.
+Per-device raw-keymap APIs aren't standard on these. Daklak itself still runs
+and emits as before — only the compositor-side keymap mapping is applied
+manually, session-wide.
+
+Applying daklak's slots session-wide is harmless even though it touches every
+device's keymap: daklak grabs the physical keyboards, so the compositor only
+ever sees daklak's own uinput emits traverse the session keymap. And the overlay
+is purely *additive* — the base layout (`us`, …) is untouched for ordinary keys;
+daklak only redefines the high IME / F13-F19 / Korean slot keycodes that normal
+typing never produces.
+
+### Why an xkb *option*, not a *layout* (Wayland)
+
+The intuitive approach — install `daklak_vn` as a layout and select it — is
+broken on KDE/GNOME by xkb rules composition. Selecting it as a layout composes
+`pc+daklak_vn+inet(evdev)`, and `inet(evdev)` is appended **last**, re-defining 8
+of daklak's 17 slots (`<ZEHA>` → the `à/á/ả/ã` family, and `<FK13>`-`<FK19>` →
+the `o`/`u` families). Result: `hà` → `h;2~`, `hơn` → `hn`.
+
+Applied as an xkb **option** instead, daklak's symbols are merged *after*
+`inet(evdev)`, so the daklak overrides win and all 17 slots survive. That's what
+the `overlay` symbols variant + the `--rules` file are for. Both compositors
+read `~/.config/xkb` first (KWin via libxkbcommon defaults; Mutter explicitly —
+see [`meta-keymap-utils.c`](https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/936)),
+so no system files are edited.
+
+Drop the two user-local files once (shared by KDE and GNOME):
+
+```
+daklak gen-keymap --symbols > ~/.config/xkb/symbols/daklak_vn
+daklak gen-keymap --rules   > ~/.config/xkb/rules/evdev
+```
 
 ### KDE / KWin
 
-No per-device raw keymap support in mainline KWin (as of writing). A
-session-wide workaround using `kxkbrc` is possible but clobbers your other
-keyboards. Track upstream for `wp_keymap_v1` support.
+Set the `daklak:vn` option in `kxkbrc`, then tell KWin to reload:
+
+```
+kwriteconfig6 --file kxkbrc --group Layout --key Options daklak:vn
+kwriteconfig6 --file kxkbrc --group Layout --key ResetOldOptions true
+qdbus6 org.kde.KWin /KWin reconfigure
+```
+
+**`ResetOldOptions=true` is mandatory.** Without it KWin silently ignores the
+`Options` key at runtime — the keymap won't change even though `reconfigure`
+recompiles. With it, a plain `reconfigure` applies the option immediately (no
+layout-list toggling needed).
+
+`ResetOldOptions=true` makes KWin **replace** the entire xkb option set with
+exactly what's in `Options` on each apply. If you rely on other options (e.g.
+`compose:ralt`, a `grp:` layout-switch key), list them all, comma-separated:
+`Options=daklak:vn,compose:ralt`.
+
+Revert:
+
+```
+kwriteconfig6 --file kxkbrc --group Layout --key Options ""
+kwriteconfig6 --file kxkbrc --group Layout --key ResetOldOptions true
+qdbus6 org.kde.KWin /KWin reconfigure
+```
 
 ### GNOME / Mutter
 
-Same as KDE — no per-device raw keymap. Session-wide via `gsettings` is the only
-option and is destructive.
+Set the option via `gsettings` — Mutter watches the schema and recompiles the
+keymap **live**, so there's no reconfigure step:
+
+```
+gsettings set org.gnome.desktop.input-sources xkb-options "['daklak:vn']"
+```
+
+Requires GNOME/Mutter **≥ 3.38** — the `$XDG_CONFIG_HOME/xkb` include path landed
+in mutter MR !936 (merged Jun 2020). Like KDE's `ResetOldOptions`, `xkb-options`
+is always the **complete** option list, so include any others you need:
+`"['daklak:vn', 'compose:ralt']"`. GNOME passes the raw option string straight to
+libxkbcommon and does not filter unregistered options (the Settings GUI just
+won't *list* `daklak:vn`, which doesn't matter — you set it directly here).
+
+Revert:
+
+```
+gsettings reset org.gnome.desktop.input-sources xkb-options
+```
 
 ### X11
 
@@ -271,6 +356,12 @@ tied to the uinput device). The `xkbcomp` one-shot above is the documented path.
 sway/scroll: automatic. Per-device setting died with the uinput.
 
 X11 (if you applied `xkbcomp` manually): `setxkbmap us` to reset.
+
+KDE/GNOME (option overlay): nothing to recover — the `daklak:vn` option persists
+in `kxkbrc` / `gsettings` across a daklak crash, and is harmless while daklak is
+stopped (it only redefines high IME slot keycodes that normal typing never
+emits). Re-launch daklak and it works again; clear the option with the revert
+command above if you want it gone.
 
 ## Troubleshooting
 
