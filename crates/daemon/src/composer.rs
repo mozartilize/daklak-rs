@@ -657,6 +657,9 @@ impl Composer {
 
         self.firefox
             .observe_surrounding(before_cursor, recent_action, self.retroactive_context);
+        if self.firefox.use_forward_delete() || self.firefox.forward_sticky() {
+            self.commit_string_functional = false;
+        }
 
         if !decision.trust {
             tracing::trace!(text, cursor, anchor, "skip recent surrounding_text echo");
@@ -1163,6 +1166,27 @@ mod tests {
             assert_eq!(sink.vk_keys[0], (0, 14, KeyState::Pressed));
             assert_eq!(sink.vk_keys[1], (0, 14, KeyState::Released));
             assert_eq!(c.shadow_text(), "lả");
+        }
+
+        #[test]
+        fn stale_firefox_echo_marks_commit_string_unusable_before_forward_key() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            c.observe_surrounding_bytes("la", ByteCursor(2), ByteCursor(2), true);
+            c.mark_action();
+            c.apply_to_sink(1, "ả", 1, 0, &mut sink);
+            assert!(c.commit_string_functional);
+
+            c.observe_surrounding_bytes(
+                "lạ l",
+                ByteCursor("lạ l".len() as u32),
+                ByteCursor("lạ l".len() as u32),
+                false,
+            );
+
+            assert!(c.firefox.use_forward_delete());
+            assert!(!c.commit_string_functional);
         }
 
         #[test]

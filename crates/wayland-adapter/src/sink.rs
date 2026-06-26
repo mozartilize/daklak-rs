@@ -24,6 +24,20 @@ pub(crate) enum TextOpsTarget<'a> {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V1CommitRoute {
+    CommitString,
+    Keysym,
+}
+
+fn v1_commit_route(is_unmapped: bool, commit_string_functional: bool) -> V1CommitRoute {
+    if !is_unmapped && commit_string_functional {
+        V1CommitRoute::CommitString
+    } else {
+        V1CommitRoute::Keysym
+    }
+}
+
 /// Bridges `edit_strategy::OutputSink` to live Wayland proxy calls.
 ///
 /// Constructed via `AdapterCtx::with_sink` — borrows proxy references from
@@ -304,7 +318,9 @@ impl AdapterSink<'_> {
             // telex tails) has a standard keysym present in the layout, so KWin
             // forwards the real keycode (no kc 247 dance); single-channel
             // ordering is preserved.
-            if !is_unmapped && self.commit_string_functional {
+            if v1_commit_route(is_unmapped, self.commit_string_functional)
+                == V1CommitRoute::CommitString
+            {
                 ascii_buf.push(c);
                 continue;
             }
@@ -355,5 +371,26 @@ impl AdapterSink<'_> {
             let _ = conn.flush();
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_ascii_uses_keysym_when_commit_string_is_not_functional() {
+        assert_eq!(v1_commit_route(false, false), V1CommitRoute::Keysym);
+    }
+
+    #[test]
+    fn v1_ascii_uses_commit_string_when_commit_string_is_functional() {
+        assert_eq!(v1_commit_route(false, true), V1CommitRoute::CommitString);
+    }
+
+    #[test]
+    fn v1_unmapped_chars_always_use_keysym() {
+        assert_eq!(v1_commit_route(true, true), V1CommitRoute::Keysym);
+        assert_eq!(v1_commit_route(true, false), V1CommitRoute::Keysym);
     }
 }
