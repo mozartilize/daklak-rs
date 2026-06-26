@@ -5,7 +5,6 @@
 //! `Composer` and exposes transport-neutral entry points that the glue calls.
 
 use std::sync::atomic::AtomicBool;
-#[cfg(feature = "ibus")]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -143,6 +142,23 @@ impl Daemon {
 
     // ── transport-neutral key routing (non-wayland: ibus, evdev) ────────────
 
+    /// Apply the enabled on→off edge and report whether the IME is currently
+    /// enabled. When daklak is toggled off mid-word this resets the in-flight
+    /// composition so the next enable starts clean. Shared by the evdev and
+    /// ibus transports: both must forward keys raw while disabled instead of
+    /// continuing to compose. (The wayland path inlines the same logic with an
+    /// extra key-repeat guard.)
+    pub(crate) fn sync_enabled_edge(&mut self) -> bool {
+        let now_enabled = self.enabled.load(Ordering::Acquire);
+        if self.router.last_enabled && !now_enabled {
+            if let Some(w) = self.router.composer.as_mut() {
+                w.full_reset();
+            }
+        }
+        self.router.last_enabled = now_enabled;
+        now_enabled
+    }
+
     /// Like wayland's `on_key_pressed` but without `AdapterCtx`. NAV and
     /// modifier-shortcut keys return `ForwardRaw` instead of `Consumed` (the
     /// caller just passes through). Runs the engine continuously and seeds from
@@ -152,14 +168,7 @@ impl Daemon {
         if let Some(w) = self.router.composer.as_mut() {
             w.check_idle_reset();
         }
-        let now_enabled = self.enabled.load(Ordering::Acquire);
-        if self.router.last_enabled && !now_enabled {
-            if let Some(w) = self.router.composer.as_mut() {
-                w.full_reset();
-            }
-        }
-        self.router.last_enabled = now_enabled;
-        if !now_enabled {
+        if !self.sync_enabled_edge() {
             return KeyDecision::ForwardRaw;
         }
         let shortcut_mods = ModifierState::CTRL | ModifierState::ALT | ModifierState::SUPER;
@@ -522,6 +531,23 @@ mod tests {
                 false,
             ));
             d
+        }
+
+        #[test]
+        fn sync_enabled_edge_gates_and_resets_inflight() {
+            use std::sync::atomic::Ordering;
+            let mut d = daemon();
+            // Enabled: gate open, no reset.
+            assert!(d.sync_enabled_edge());
+            // Build in-flight composition state.
+            let _ = d.handle_char('h');
+            assert!(d.router.composer.as_ref().unwrap().last_input_char.is_some());
+            // Toggle off: the on→off edge closes the gate and clears the word
+            // so a later enable starts clean (mirrors what the evdev/ibus
+            // transports rely on to stop composing while daklak is "off").
+            d.enabled.store(false, Ordering::Release);
+            assert!(!d.sync_enabled_edge());
+            assert!(d.router.composer.as_ref().unwrap().last_input_char.is_none());
         }
 
         #[test]
