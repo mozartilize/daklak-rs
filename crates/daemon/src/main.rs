@@ -9,6 +9,7 @@ mod quirks;
 mod transport;
 mod tray;
 
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -37,6 +38,11 @@ fn print_help() {
     println!("Sway keybind example:");
     println!("  bindsym $mod+space exec daklak toggle");
     println!();
+    println!("Config file:");
+    println!("  -c, --config <path>       Use an alternate config file.");
+    println!("  DAKLAK_CONFIG=<path>      Same as --config (env override).");
+    println!("                            Default: $XDG_CONFIG_HOME/daklak/config.toml");
+    println!();
     println!("Logging flags:");
     println!("  --log-level <error|info|debug>  Set the base log level (trace aliases debug).");
     println!("  --log-path <path>               Write logs to this path (default /dev/stdout).");
@@ -57,6 +63,7 @@ enum Command {
 #[derive(Debug, Default)]
 struct CliOverrides {
     ibus: bool,
+    config_path: Option<PathBuf>,
     log_level: Option<String>,
     log_path: Option<String>,
     log_modules: Vec<String>,
@@ -83,6 +90,12 @@ fn parse_cli() -> Result<Cli> {
             "status" => set_command(&mut cli.command, Command::Status, &arg)?,
             "gen-keymap" => set_command(&mut cli.command, Command::GenKeymap, &arg)?,
             "--symbols" => cli.gen_keymap_symbols = true,
+            "--config" | "-c" => {
+                cli.overrides.config_path = Some(PathBuf::from(next_value(&mut args, "--config")?));
+            }
+            _ if arg.starts_with("--config=") || arg.starts_with("-c=") => {
+                cli.overrides.config_path = Some(PathBuf::from(value_after_equals(&arg, "--config")?));
+            }
             "--log-level" => cli.overrides.log_level = Some(next_value(&mut args, "--log-level")?),
             _ if arg.starts_with("--log-level=") => {
                 cli.overrides.log_level = Some(value_after_equals(&arg, "--log-level")?);
@@ -227,7 +240,15 @@ fn main() -> Result<()> {
         None => {}
     }
 
-    let mut config = config::Config::load()?;
+    let config_path = cli
+        .overrides
+        .config_path
+        .clone()
+        .or_else(|| std::env::var_os("DAKLAK_CONFIG").map(PathBuf::from));
+    let mut config = match config_path {
+        Some(path) => config::Config::load_from(Some(path))?,
+        None => config::Config::load()?,
+    };
     apply_overrides(&mut config, cli.overrides);
     logging::init(&config)?;
     tracing::info!("input method: {:?}", config.method);

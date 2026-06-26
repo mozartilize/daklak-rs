@@ -121,6 +121,8 @@ A few subcommands are handled before the daemon loop starts:
 | ------- | ------ |
 | `daklak` (no args) | Start the daemon in the auto-selected transport mode. |
 | `daklak --ibus` | Force IBus mode (used by the IBus component exec line). |
+| `daklak -c ~/.config/daklak/custom.toml` | Use an alternate config file. |
+| `DAKLAK_CONFIG=~/.config/daklak/custom.toml daklak` | Same as `--config` via env. |
 | `daklak --log-level debug --log-module daklak=debug` | Override logging from the command line. |
 | `daklak toggle` | Toggle the running daemon on/off (IPC client). |
 | `daklak enable` | Enable composition in the running daemon. |
@@ -141,6 +143,10 @@ and toggles the enabled state. This works in every transport mode.
 ## Configuration
 
 Configuration is loaded at startup (see [`crates/daemon/src/config.rs`](../crates/daemon/src/config.rs)).
+Notable config-file options:
+
+- `DAKLAK_CONFIG=/path/to/file` — alternate config file path (same as `--config`).
+
 Notable logging options:
 
 ```toml

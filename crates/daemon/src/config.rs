@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use viet_ime_engine::InputMethod;
 
 #[derive(Debug, Deserialize)]
@@ -133,8 +134,18 @@ impl Config {
     /// - `DAKLAK_METHOD={telex|vni|viqr}` overrides `method`.
     /// - `DAKLAK_FORCE_UINPUT_APPS=app1,app2,...` replaces `force_uinput_apps`
     ///   (empty string clears the list).
+    ///
+    /// `load_from(Some(path))` loads that file directly and errors loudly on
+    /// missing or invalid input.
     pub fn load() -> Result<Self> {
-        let mut cfg = Self::load_file().unwrap_or_default();
+        Self::load_from(None)
+    }
+
+    pub fn load_from(path: Option<PathBuf>) -> Result<Self> {
+        let mut cfg = match path {
+            Some(path) => Self::load_file(&path)?,
+            None => Self::load_default_file().unwrap_or_default(),
+        };
 
         if let Ok(m) = std::env::var("DAKLAK_METHOD") {
             cfg.method = match m.to_lowercase().as_str() {
@@ -205,7 +216,7 @@ impl Config {
         Ok(cfg)
     }
 
-    fn load_file() -> Option<Self> {
+    fn load_default_file() -> Option<Self> {
         let config_dir = std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(std::path::PathBuf::from)
@@ -218,6 +229,14 @@ impl Config {
         let path = config_dir.join("daklak").join("config.toml");
         let text = std::fs::read_to_string(path).ok()?;
         toml::from_str(&text).ok()
+    }
+
+    fn load_file(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+        let cfg = toml::from_str(&text)
+            .with_context(|| format!("failed to parse config file {}", path.display()))?;
+        Ok(cfg)
     }
 }
 
@@ -287,5 +306,48 @@ mod tests {
     fn auto_vk_only_for_xwayland_defaults_enabled() {
         let cfg = Config::default();
         assert!(cfg.auto_vk_only_for_xwayland);
+    }
+
+    #[test]
+    fn load_from_explicit_path_reads_that_file() {
+        let path = std::env::temp_dir().join(format!(
+            "daklak-config-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_nanos()
+        ));
+
+        std::fs::write(
+            &path,
+            r#"method = "vni"
+log_level = "info"
+log_path = "/tmp/daklak.log"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(Some(path.clone())).unwrap();
+        assert_eq!(cfg.method.to_engine(), InputMethod::Vni);
+        assert_eq!(cfg.log_level, "info");
+        assert_eq!(cfg.log_path, "/tmp/daklak.log");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_from_explicit_path_missing_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "daklak-missing-config-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_nanos()
+        ));
+
+        let err = Config::load_from(Some(path)).unwrap_err();
+        assert!(err.to_string().contains("failed to read config file"));
     }
 }
