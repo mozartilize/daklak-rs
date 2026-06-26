@@ -117,3 +117,21 @@ daklak_bin = custom_target(
   install_dir: get_option('bindir'),
   install_mode: 'rwxr-xr-x',
 )
+
+if get_option('evdev_grab')
+  daklak_xkb_symbols = custom_target(
+    'daklak-xkb-symbols',
+    output: 'daklak_vn',
+    command: [
+      find_program('scripts/generate-xkb-symbols.sh'),
+      meson.current_build_dir(),
+      '@OUTPUT@',
+    ],
+    depends: [daklak_bin],
+    build_by_default: true,
+    build_always_stale: true,
+    console: true,
+    install: true,
+    install_dir: get_option('datadir') / 'X11' / 'xkb' / 'symbols',
+  )
+endif

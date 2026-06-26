@@ -318,20 +318,35 @@ pub fn keymap_text() -> String {
     s.push_str("  xkb_types \"complete\" { include \"complete\" };\n");
     s.push_str("  xkb_compat \"complete\" { include \"complete\" };\n");
     // ── symbols — standard pc+us layout + EIGHT_LEVEL custom slots ────────
-    s.push_str("  xkb_symbols \"pc+us+daklak\" {\n");
-    s.push_str("    include \"pc+us+inet(evdev)\"\n");
+    append_symbols_section(&mut s, "  ", "pc+us+daklak");
+    s.push_str("};\n");
+    s
+}
+
+/// Build a standalone xkb_symbols fragment for installation under
+/// `<datadir>/X11/xkb/symbols/daklak_vn`.
+pub fn symbols_text() -> String {
+    let mut s = String::with_capacity(8 * 1024);
+    s.push_str("default partial alphanumeric_keys\n");
+    append_symbols_section(&mut s, "", "basic");
+    s
+}
+
+fn append_symbols_section(s: &mut String, indent: &str, section: &str) {
+    s.push_str(&format!("{indent}xkb_symbols \"{section}\" {{\n"));
+    s.push_str(&format!("{indent}  include \"pc+us+inet(evdev)\"\n"));
     // Group name override — lets evdev-only mode probe whether scroll/sway
     // actually loaded our keymap (vs falling back to its default "English
     // (US)" for daklak's uinput device).
-    s.push_str("    name[Group1] = \"Daklak Vietnamese\";\n");
+    s.push_str(&format!("{indent}  name[Group1] = \"Daklak Vietnamese\";\n"));
     // Bake lv3:ralt_switch into the keymap so RightAlt selects Level3
     // (Mod5). The standard us-evdev include binds RALT to Mod1 (= Alt),
     // which makes daklak's emit dance for Vietnamese L3 chars appear to
     // apps as Alt+keycode (a hotkey) instead of selecting L3 of the
     // EIGHT_LEVEL DK slot. Without this, 'â', 'á', 'ấ', etc. silently
     // drop because the compositor never enters Level3 mode for the emit.
-    s.push_str("    replace key <RALT> { type[Group1] = \"ONE_LEVEL\", [ ISO_Level3_Shift ] };\n");
-    s.push_str("    modifier_map Mod5 { <RALT> };\n");
+    s.push_str(&format!("{indent}  replace key <RALT> {{ type[Group1] = \"ONE_LEVEL\", [ ISO_Level3_Shift ] }};\n"));
+    s.push_str(&format!("{indent}  modifier_map Mod5 {{ <RALT> }};\n"));
     // LevelFive selector — HENK (KEY_HENKAN, evdev kc 92) is bound to
     // ISO_Level5_Shift and routed to Mod3. Daklak addresses levels 5-8
     // via Mod3 (= 0x20 in vk.modifiers depressed mask), or by pressing
@@ -339,8 +354,13 @@ pub fn keymap_text() -> String {
     // evdev-only mode. Real users with Japanese keyboards may hit
     // KEY_HENKAN physically — that fires through their real-kb keymap,
     // which doesn't have this binding.
-    s.push_str("    replace key <HENK> { type[Group1] = \"ONE_LEVEL\", [ ISO_Level5_Shift ] };\n");
-    s.push_str("    modifier_map Mod3 { <HENK> };\n");
+    s.push_str(&format!("{indent}  replace key <HENK> {{ type[Group1] = \"ONE_LEVEL\", [ ISO_Level5_Shift ] }};\n"));
+    s.push_str(&format!("{indent}  modifier_map Mod3 {{ <HENK> }};\n"));
+    append_symbol_rows(s, indent);
+    s.push_str(&format!("{indent}}};\n"));
+}
+
+fn append_symbol_rows(s: &mut String, indent: &str) {
     for i in 0..slots_needed() {
         let base = i * 4;
         // Collect up to 4 lower/upper pairs, padding shortfall with VoidSymbol.
@@ -348,7 +368,7 @@ pub fn keymap_text() -> String {
         for j in 0..4 {
             let idx = base + j;
             if idx < VN_LOWER.len() {
-                keysyms[j * 2]     = VN_LOWER[idx] as u32;
+                keysyms[j * 2] = VN_LOWER[idx] as u32;
                 keysyms[j * 2 + 1] = VN_UPPER[idx] as u32;
             }
         }
@@ -370,13 +390,10 @@ pub fn keymap_text() -> String {
         // <FK13>) is replaced rather than merged — without it xkbcomp
         // emits "Multiple symbols for level 1/group 1" warnings.
         s.push_str(&format!(
-            "    replace key <{}> {{ type[Group1] = \"EIGHT_LEVEL\", [ {} ] }};\n",
+            "{indent}  replace key <{}> {{ type[Group1] = \"EIGHT_LEVEL\", [ {} ] }};\n",
             kc_name, row
         ));
     }
-    s.push_str("  };\n");
-    s.push_str("};\n");
-    s
 }
 
 /// Plan the modifier dance for one `emit_char` invocation. Public so both
@@ -602,5 +619,26 @@ mod tests {
     #[test]
     fn dance_preserves_user_ctrl_with_l5_spec() {
         assert_eq!(plan_mod_dance(CTRL, LEVEL5), Some((CTRL | LEVEL5, CTRL)));
+    }
+
+    #[test]
+    fn symbols_text_contains_the_expected_wrapper() {
+        let text = symbols_text();
+        assert!(text.starts_with("default partial alphanumeric_keys\n"));
+        assert!(text.contains("xkb_symbols \"basic\" {\n"));
+        assert!(text.contains("name[Group1] = \"Daklak Vietnamese\";"));
+    }
+
+    #[test]
+    fn symbols_and_keymap_share_slot_rows() {
+        fn slot_rows(text: &str) -> Vec<String> {
+            text.lines()
+                .map(str::trim_start)
+                .filter(|l| l.starts_with("replace key <"))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        assert_eq!(slot_rows(&keymap_text()), slot_rows(&symbols_text()));
     }
 }

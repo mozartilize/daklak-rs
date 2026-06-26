@@ -71,14 +71,20 @@ in `xev` but harmless in practice (clients typically lazy-cache xkb state).
 
 ## Generating the keymap
 
-Daklak's `gen-keymap` subcommand prints the synthetic xkb keymap to stdout. The
+Daklak's `gen-keymap` subcommand prints the synthetic xkb keymap to stdout.
+Add `--symbols` to print the installable `xkb_symbols` fragment instead. The
 daemon itself never writes the file or calls into the compositor — keymap setup
 is the user's responsibility (one `swaymsg` / `xkbcomp` invocation, easily
 wrapped in a systemd unit):
 
 ```
 daklak gen-keymap > /tmp/daklak.xkb
+daklak gen-keymap --symbols > /usr/share/X11/xkb/symbols/daklak_vn
 ```
+
+Meson installs the same symbols file automatically when configured with
+`-Devdev_grab=true` and installed to a system prefix (`sudo meson install`,
+so it lands under `/usr/share/X11/xkb/symbols/daklak_vn`).
 
 Verify it parses cleanly (optional — the slot/name table is checked at compile
 time via a `const` assertion, so this is just for hand-editing or CI):

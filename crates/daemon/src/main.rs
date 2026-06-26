@@ -28,7 +28,8 @@ fn print_help() {
         "  gen-keymap   Print daklak's synthetic xkb keymap to stdout and exit.\n\
          \x20              Pipe to a file then load it into your compositor manually:\n\
          \x20                daklak gen-keymap > /tmp/daklak.xkb\n\
-         \x20                swaymsg input <viet-ime-id> xkb_file /tmp/daklak.xkb"
+         \x20                swaymsg input <viet-ime-id> xkb_file /tmp/daklak.xkb\n\
+         \x20              Add --symbols to print the installable xkb_symbols fragment."
     );
     println!();
     println!("With no subcommand, runs the input-method daemon.");
@@ -65,6 +66,7 @@ struct CliOverrides {
 struct Cli {
     command: Option<Command>,
     overrides: CliOverrides,
+    gen_keymap_symbols: bool,
 }
 
 fn parse_cli() -> Result<Cli> {
@@ -80,6 +82,7 @@ fn parse_cli() -> Result<Cli> {
             "disable" => set_command(&mut cli.command, Command::Disable, &arg)?,
             "status" => set_command(&mut cli.command, Command::Status, &arg)?,
             "gen-keymap" => set_command(&mut cli.command, Command::GenKeymap, &arg)?,
+            "--symbols" => cli.gen_keymap_symbols = true,
             "--log-level" => cli.overrides.log_level = Some(next_value(&mut args, "--log-level")?),
             _ if arg.starts_with("--log-level=") => {
                 cli.overrides.log_level = Some(value_after_equals(&arg, "--log-level")?);
@@ -108,6 +111,10 @@ fn parse_cli() -> Result<Cli> {
                 return Err(anyhow::anyhow!("daklak: unknown subcommand {other:?}"));
             }
         }
+    }
+
+    if cli.gen_keymap_symbols && !matches!(cli.command, Some(Command::GenKeymap)) {
+        return Err(anyhow::anyhow!("daklak: --symbols is only valid with gen-keymap"));
     }
 
     Ok(cli)
@@ -210,7 +217,11 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::GenKeymap) => {
-            print!("{}", viet_ime_keymap::keymap_text());
+            if cli.gen_keymap_symbols {
+                print!("{}", viet_ime_keymap::symbols_text());
+            } else {
+                print!("{}", viet_ime_keymap::keymap_text());
+            }
             return Ok(());
         }
         None => {}
