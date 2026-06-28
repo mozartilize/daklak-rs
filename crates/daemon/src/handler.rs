@@ -823,6 +823,20 @@ mod tests {
         }
 
         #[test]
+        fn v1_level_shifted_passthrough_is_not_recorded_as_raw_forward() {
+            let mut d = daemon();
+
+            let decision = key(&mut d, ImProtocol::ImV1, 'L');
+
+            assert!(matches!(decision, KeyDecision::Apply { .. }));
+            assert_eq!(
+                d.router.composer.as_ref().unwrap().shadow_text(),
+                "",
+                "the deferred Apply will record the committed char; pre-recording it as raw input doubles the shadow"
+            );
+        }
+
+        #[test]
         fn v1_base_level_passthrough_still_forwards_raw() {
             let mut d = daemon();
             // 'l' IS the base level for key 38 → not level-shifted → the common

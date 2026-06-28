@@ -494,6 +494,10 @@ impl Composer {
         }
     }
 
+    pub fn unrecord_forwarded_char(&mut self) {
+        self.edit.pop_forwarded_char();
+    }
+
     pub fn feed_backspace(&mut self) -> KeyDecision {
         let r = self.engine.process_backspace();
         tracing::debug!(
@@ -739,7 +743,7 @@ impl Composer {
     }
 
     #[cfg(test)]
-    fn shadow_text(&self) -> &str {
+    pub(crate) fn shadow_text(&self) -> &str {
         self.edit.shadow_text()
     }
 

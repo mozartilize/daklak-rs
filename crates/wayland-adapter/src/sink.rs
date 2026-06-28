@@ -30,12 +30,29 @@ enum V1CommitRoute {
     Keysym,
 }
 
-fn v1_commit_route(is_unmapped: bool, commit_string_functional: bool) -> V1CommitRoute {
-    if !is_unmapped && commit_string_functional {
+fn v1_commit_route(c: char, is_unmapped: bool, commit_string_functional: bool) -> V1CommitRoute {
+    if commit_string_functional && (c.is_ascii() || !is_unmapped) {
         V1CommitRoute::CommitString
     } else {
         V1CommitRoute::Keysym
     }
+}
+
+fn v1_keysym_needs_modifier_guard(
+    is_unmapped: bool,
+    commit_string_functional: bool,
+    raw_mods: (u32, u32, u32, u32),
+) -> bool {
+    let (depressed, latched, locked, _) = raw_mods;
+    !is_unmapped && !commit_string_functional && (depressed | latched | locked) != 0
+}
+
+fn forward_backspace_needs_modifier_guard(
+    key_code: u32,
+    raw_mods: (u32, u32, u32, u32),
+) -> bool {
+    let (depressed, latched, locked, _) = raw_mods;
+    key_code == 14 && (depressed | latched | locked) != 0
 }
 
 /// Bridges `edit_strategy::OutputSink` to live Wayland proxy calls.
@@ -170,8 +187,28 @@ impl OutputSink for AdapterSink<'_> {
         // commit_string (text-input-v3) channels. Lets a live log confirm
         // whether ForwardKey backspaces actually fire and in what order vs the
         // commit on a contenteditable that reorders the two channels.
+        let guard_modifiers = forward_backspace_needs_modifier_guard(key_code, self.raw_mods);
+        if guard_modifiers && state == KeyState::Pressed {
+            tracing::trace!(
+                raw_mods = ?self.raw_mods,
+                "vk_key Backspace modifier guard: clear modifiers"
+            );
+            self.forward_emitter.emit_modifiers(0, 0, 0, self.raw_mods.3);
+        }
         tracing::trace!(key_code, value, "vk_key emit (forward channel)");
         self.forward_emitter.emit_key(time, key_code, value);
+        if guard_modifiers && state == KeyState::Released {
+            tracing::trace!(
+                raw_mods = ?self.raw_mods,
+                "vk_key Backspace modifier guard: restore modifiers"
+            );
+            self.forward_emitter.emit_modifiers(
+                self.raw_mods.0,
+                self.raw_mods.1,
+                self.raw_mods.2,
+                self.raw_mods.3,
+            );
+        }
     }
 
     fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
@@ -318,7 +355,7 @@ impl AdapterSink<'_> {
             // telex tails) has a standard keysym present in the layout, so KWin
             // forwards the real keycode (no kc 247 dance); single-channel
             // ordering is preserved.
-            if v1_commit_route(is_unmapped, self.commit_string_functional)
+            if v1_commit_route(c, is_unmapped, self.commit_string_functional)
                 == V1CommitRoute::CommitString
             {
                 ascii_buf.push(c);
@@ -356,8 +393,24 @@ impl AdapterSink<'_> {
             // per-sym temp keymap (kc 247) for unmapped keysyms → foot
             // recompiles xkb. Flush + sleep so foot finishes before the
             // next char or forwarded physical key arrives.
+            let guard_modifiers = v1_keysym_needs_modifier_guard(
+                is_unmapped,
+                self.commit_string_functional,
+                self.raw_mods,
+            );
+            if guard_modifiers {
+                self.forward_emitter.emit_modifiers(0, 0, 0, self.raw_mods.3);
+            }
             ctx.keysym(serial, time, sym.raw(), PRESSED, 0);
             ctx.keysym(serial, time, sym.raw(), RELEASED, 0);
+            if guard_modifiers {
+                self.forward_emitter.emit_modifiers(
+                    self.raw_mods.0,
+                    self.raw_mods.1,
+                    self.raw_mods.2,
+                    self.raw_mods.3,
+                );
+            }
             if let Some(conn) = self.conn {
                 let _ = conn.flush();
             }
@@ -380,17 +433,39 @@ mod tests {
 
     #[test]
     fn v1_ascii_uses_keysym_when_commit_string_is_not_functional() {
-        assert_eq!(v1_commit_route(false, false), V1CommitRoute::Keysym);
+        assert_eq!(v1_commit_route('d', false, false), V1CommitRoute::Keysym);
     }
 
     #[test]
     fn v1_ascii_uses_commit_string_when_commit_string_is_functional() {
-        assert_eq!(v1_commit_route(false, true), V1CommitRoute::CommitString);
+        assert_eq!(v1_commit_route('d', false, true), V1CommitRoute::CommitString);
     }
 
     #[test]
-    fn v1_unmapped_chars_always_use_keysym() {
-        assert_eq!(v1_commit_route(true, true), V1CommitRoute::Keysym);
-        assert_eq!(v1_commit_route(true, false), V1CommitRoute::Keysym);
+    fn v1_ascii_uses_commit_string_when_shifted_char_is_not_in_current_xkb_level() {
+        assert_eq!(v1_commit_route('D', true, true), V1CommitRoute::CommitString);
+    }
+
+    #[test]
+    fn v1_unmapped_non_ascii_chars_always_use_keysym() {
+        assert_eq!(v1_commit_route('é', true, true), V1CommitRoute::Keysym);
+        assert_eq!(v1_commit_route('é', true, false), V1CommitRoute::Keysym);
+    }
+
+    #[test]
+    fn v1_mapped_keysym_under_depressed_modifier_needs_modifier_guard() {
+        assert!(v1_keysym_needs_modifier_guard(false, false, (1, 0, 0, 0)));
+        assert!(!v1_keysym_needs_modifier_guard(false, true, (1, 0, 0, 0)));
+        assert!(!v1_keysym_needs_modifier_guard(true, false, (1, 0, 0, 0)));
+        assert!(!v1_keysym_needs_modifier_guard(false, false, (0, 0, 0, 0)));
+        assert!(!v1_keysym_needs_modifier_guard(false, false, (0, 0, 0, 1)));
+    }
+
+    #[test]
+    fn forward_backspace_under_depressed_modifier_needs_modifier_guard() {
+        assert!(forward_backspace_needs_modifier_guard(14, (1, 0, 0, 0)));
+        assert!(!forward_backspace_needs_modifier_guard(14, (0, 0, 0, 0)));
+        assert!(!forward_backspace_needs_modifier_guard(14, (0, 0, 0, 1)));
+        assert!(!forward_backspace_needs_modifier_guard(30, (1, 0, 0, 0)));
     }
 }

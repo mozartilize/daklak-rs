@@ -276,8 +276,11 @@ impl AdapterHandler for Daemon {
             let method = self
                 .router
                 .composer
-                .as_ref()
-                .map(|w| w.method())
+                .as_mut()
+                .map(|w| {
+                    w.unrecord_forwarded_char();
+                    w.method()
+                })
                 .unwrap_or(BackspaceMethod::ForwardKey);
             tracing::debug!(ch = %ch, "level-shifted passthrough → commit (v1 keycode loses modifier level)");
             return KeyDecision::Apply {

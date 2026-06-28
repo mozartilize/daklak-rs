@@ -38,8 +38,8 @@ fn normalize_level(raw: &str) -> Result<String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "error" => Ok("error".to_owned()),
         "info" => Ok("info".to_owned()),
-        "debug" | "trace" => Ok("debug".to_owned()),
-        other => Err(anyhow!("invalid log level {other:?}; use error, info, debug, or trace")),
+        "debug" => Ok("trace".to_owned()),
+        other => Err(anyhow!("invalid log level {other:?}; use error, info, or debug")),
     }
 }
 
@@ -106,18 +106,20 @@ mod tests {
             &["daklak=debug".to_owned(), "viet_ime_wayland_adapter=info".to_owned()],
         )
         .unwrap();
-        assert_eq!(s, "error,daklak=debug,viet_ime_wayland_adapter=info");
+        assert_eq!(s, "error,daklak=trace,viet_ime_wayland_adapter=info");
     }
 
     #[test]
-    fn trace_aliases_to_debug() {
-        let s = build_directives("trace", &["daklak=trace".to_owned()]).unwrap();
-        assert_eq!(s, "debug,daklak=debug");
+    fn debug_maps_to_trace() {
+        let s = build_directives("debug", &["daklak=debug".to_owned()]).unwrap();
+        assert_eq!(s, "trace,daklak=trace");
     }
 
     #[test]
     fn rejects_bad_levels() {
         assert!(build_directives("warn", &[]).is_err());
+        assert!(build_directives("trace", &[]).is_err());
         assert!(build_directives("error", &["daklak=warn".to_owned()]).is_err());
+        assert!(build_directives("error", &["daklak=trace".to_owned()]).is_err());
     }
 }
