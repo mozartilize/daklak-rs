@@ -919,8 +919,6 @@ mod tests {
 
         fn vk_modifiers(&mut self, _depressed: u32, _latched: u32, _locked: u32, _group: u32) {}
 
-        fn uinput_key(&mut self, _code: u16, _value: i32) {}
-
         fn vk_commit_char(&mut self, _time: u32, _ch: char) -> bool {
             false
         }

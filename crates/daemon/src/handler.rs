@@ -113,10 +113,6 @@ impl Daemon {
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
-            Some("uinput") => {
-                tracing::info!("DAKLAK_TERMINAL_TIER=uinput → terminals route to Tier 3 UInput");
-                Some(BackspaceMethod::UInput)
-            }
             Some("surrounding") | Some("surrounding_text") | Some("tier1") => {
                 tracing::info!(
                     "DAKLAK_TERMINAL_TIER=surrounding → terminals route to Tier 1 SurroundingText"
@@ -158,12 +154,10 @@ impl Daemon {
             purpose: frame.purpose,
             surrounding_text_seen: frame.surrounding_text.is_some(),
             app_id: self.router.focused_app_id.clone(),
-            force_uinput_apps: self.config.force_uinput_apps.clone(),
             force_vk_only_apps: self.config.force_vk_only_apps.clone(),
             terminal_override: self.terminal_override,
             // Sourced from `TransportProfile.has_vk_keyboard` by the caller.
-            // `detect_method` clamps VkOnly→UInput when false — the single home
-            // of the downgrade that used to be an inline backend-name check.
+            // `detect_method` clamps VkOnly→ForwardKey when false.
             vk_keyboard_available,
         };
         detect_method(&probe)
@@ -492,7 +486,6 @@ mod tests {
                 self.vk_keys.push((time, key_code, state));
             }
             fn vk_modifiers(&mut self, _depressed: u32, _latched: u32, _locked: u32, _group: u32) {}
-            fn uinput_key(&mut self, _key_code: u16, _value: i32) {}
             fn vk_commit_char(&mut self, _time: u32, _c: char) -> bool {
                 false
             }
@@ -513,8 +506,7 @@ mod tests {
         fn detect_capability_clamps_vk_only_when_transport_lacks_vk() {
             // force_vk_only_apps would pick VkOnly, but on a transport with no
             // virtual keyboard (vk_keyboard_available=false, e.g. KWin/ImV1)
-            // detect_capability must resolve to UInput — the clamp now lives in
-            // detect_method, fed by TransportProfile.has_vk_keyboard (#3, M2c).
+            // detect_capability must resolve to ForwardKey.
             let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
             d.config.force_vk_only_apps = vec!["chromium".to_owned()];
             d.router.focused_app_id = Some("chromium".to_owned());
@@ -522,8 +514,8 @@ mod tests {
 
             assert_eq!(
                 d.detect_capability(&f, false),
-                BackspaceMethod::UInput,
-                "no vk keyboard → VkOnly clamps to UInput"
+                BackspaceMethod::ForwardKey,
+                "no vk keyboard → VkOnly clamps to ForwardKey"
             );
             assert_eq!(
                 d.detect_capability(&f, true),

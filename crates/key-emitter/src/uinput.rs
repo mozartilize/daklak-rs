@@ -4,12 +4,6 @@
 //! kernel input events; the focused client sees them via
 //! libinput → compositor → wl_keyboard.
 //!
-//! Uinput events on the wayland-adapter Tier 3 path DO round-trip through
-//! the IME's own `zwp_input_method_keyboard_grab_v2`. That suppression
-//! queue currently lives at the call site
-//! (`AdapterState::pending_self_emits`); this emitter only owns the
-//! device. (Phase B may move the queue ownership in here.)
-//!
 //! `time` is ignored — uinput events carry a kernel-stamped timestamp
 //! from `evdev`. `value` is interpreted directly:
 //!
@@ -39,13 +33,6 @@ impl UinputEmitter {
 
     pub fn from_device(dev: UinputDevice) -> Self {
         Self { dev }
-    }
-
-    /// Raw emit ignoring the `value: u32` widening. Useful for callers
-    /// (Tier 3 backspace) that already speak `i32` press/release and want
-    /// to handle errors themselves.
-    pub fn raw_emit(&mut self, code: u16, value: i32) -> std::io::Result<()> {
-        self.dev.emit(code, value)
     }
 }
 

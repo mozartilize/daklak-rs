@@ -12,21 +12,13 @@ pub struct CapabilityProbe {
     /// stay in the transport/composer path so probing does not clone text.
     pub surrounding_text_seen: bool,
     /// Focused window's `app_id` at activate (Sway IPC). Matched
-    /// case-insensitively against `force_uinput_apps` to escalate any
-    /// known-broken app (terminal or otherwise) to Tier 3 UInput. `None` on
+    /// case-insensitively against `force_vk_only_apps`. `None` on
     /// non-Sway compositors → fall through to purpose-based default.
     pub app_id: Option<String>,
-    /// Apps whose `app_id` forces Tier 3 UInput regardless of purpose.
-    /// Loaded by the daemon from config (`force_uinput_apps` in
-    /// config.toml) and the env var `DAKLAK_FORCE_UINPUT_APPS`.
-    /// Daklak ships with no opinionated default.
-    pub force_uinput_apps: Vec<String>,
     /// Apps whose `app_id` forces Tier 4 VkOnly. Loaded from
     /// `force_vk_only_apps` in config.toml and env var
-    /// `DAKLAK_FORCE_VK_ONLY_APPS`. Wins over the purpose default but
-    /// loses to `force_uinput_apps` (UInput is the older, more
-    /// battle-tested escape hatch). Daklak ships with no default — both
-    /// lists are user-curated.
+    /// `DAKLAK_FORCE_VK_ONLY_APPS`. Wins over the purpose default.
+    /// Daklak ships with no opinionated default.
     pub force_vk_only_apps: Vec<String>,
 
     /// Forced tier for `purpose == PURPOSE_TERMINAL`, set by the daemon from
@@ -35,8 +27,8 @@ pub struct CapabilityProbe {
 
     /// Whether the active transport exposes a virtual keyboard
     /// (`zwp_virtual_keyboard_v1`). VkOnly (Tier 4) is infeasible
-    /// without it, so `detect_method` clamps VkOnly → UInput when this is
-    /// false. Sourced once from `TransportProfile.has_vk_keyboard`; the
+    /// without it, so `detect_method` clamps VkOnly → ForwardKey when this
+    /// is false. Sourced once from `TransportProfile.has_vk_keyboard`; the
     /// decision lives here so no use site re-checks the backend by name.
     pub vk_keyboard_available: bool,
 }
@@ -52,16 +44,12 @@ const PURPOSE_TERMINAL: u32 = 13;
 ///
 /// Priority:
 /// 1. Env override (terminal-only): `DAKLAK_TERMINAL_TIER` wins for purpose=13.
-/// 2. App-id list — `force_uinput_apps` (any purpose) → Tier 3 UInput.
-/// 3. App-id list — `force_vk_only_apps` (any purpose) → Tier 4 VkOnly
-///    (VkOnly). Routes everything through `zwp_virtual_keyboard_v1::key()`
-///    using daklak's synthesized Vietnamese keymap — bypasses
-///    `text_input_v3` entirely. Safe target: clients with NO
-///    `text_input_v3` at all (Qt5/XWayland-via-vk). Unsafe target:
-///    Chromium-class apps — their renderer has hard-coded
-///    `LinuxKeyCode → DomCode` tables and crashes when fed evdev 200+
-///    attached to Unicode keysyms. For those, use `force_uinput_apps`.
-/// 4. Purpose-based default:
+/// 2. App-id list — `force_vk_only_apps` (any purpose) → Tier 4 VkOnly.
+///    Routes everything through `zwp_virtual_keyboard_v1::key()` using
+///    daklak's synthesized Vietnamese keymap — bypasses `text_input_v3`
+///    entirely. Safe target: clients with NO `text_input_v3` at all
+///    (Qt5/XWayland-via-vk).
+/// 3. Purpose-based default:
 ///    - Terminals → ForwardKey (foot composes correctly here; cosmetic
 ///      upstream preedit bug aside).
 ///    - Non-terminals → SurroundingText if app sent a surrounding_text frame
@@ -71,10 +59,9 @@ pub fn detect_method(probe: &CapabilityProbe) -> BackspaceMethod {
     // Feasibility clamp: never emit a tier the transport cannot deliver.
     // VkOnly (Tier 4) needs `zwp_virtual_keyboard_v1`; on a transport
     // without it (the KWin/Mutter v1 IM relay exposes no vk to the IME side)
-    // fall through to UInput. This is the single home of the downgrade that
-    // used to live as a backend-name check in `transport/wayland.rs` (#3).
+    // fall back to ForwardKey.
     match desired {
-        BackspaceMethod::VkOnly if !probe.vk_keyboard_available => BackspaceMethod::UInput,
+        BackspaceMethod::VkOnly if !probe.vk_keyboard_available => BackspaceMethod::ForwardKey,
         other => other,
     }
 }
@@ -86,24 +73,20 @@ fn desired_method(probe: &CapabilityProbe) -> BackspaceMethod {
         }
     }
     if let Some(ref app_id) = probe.app_id {
-        if app_id_matches(app_id, &probe.force_uinput_apps) {
-            return BackspaceMethod::UInput;
-        }
         if app_id_matches(app_id, &probe.force_vk_only_apps) {
             return BackspaceMethod::VkOnly;
         }
     }
     // Terminals: default to ForwardKey regardless of surrounding_text
     // presence. SurroundingText would self-emit-loop and drop commits on
-    // foot/ghostty. UInput would
-    // race the terminal's own read loop. ForwardKey is the only safe
-    // default; users can override via DAKLAK_TERMINAL_TIER.
+    // foot/ghostty. ForwardKey is the only safe default; users can
+    // override via DAKLAK_TERMINAL_TIER.
     if probe.purpose == PURPOSE_TERMINAL {
         return BackspaceMethod::ForwardKey;
     }
     // XXX Some/None here conflates "explicit unsupported" with "no evidence
     // within probe window" (delayed frame, focus race, async client).
-    // Currently safe because branches 1-3 (terminal_override, force_uinput_apps,
+    // Currently safe because branches 1-3 (terminal_override,
     // force_vk_only_apps, terminal-purpose) short-circuit every app we have
     // empirical data on. Only unknown apps with `purpose != PURPOSE_TERMINAL`
     // land here. If a Tier 1 ↔ Tier 2 flap is ever observed on such an app,
@@ -119,7 +102,7 @@ fn desired_method(probe: &CapabilityProbe) -> BackspaceMethod {
 }
 
 /// Case-insensitive match of `app_id` against a user-supplied list of
-/// apps. Used by both `force_uinput_apps` and `force_vk_only_apps`.
+/// apps. Used by `force_vk_only_apps`.
 ///
 /// `app_id` is trimmed defensively — the source is either Sway IPC (which
 /// shouldn't pad) or the `WM_CLASS` fallback for XWayland (which can have
@@ -140,7 +123,6 @@ mod tests {
             purpose,
             surrounding_text_seen,
             app_id: None,
-            force_uinput_apps: Vec::new(),
             force_vk_only_apps: Vec::new(),
             terminal_override: None,
             // Default to the common case (v2+VK / v1 keysym both feasible for
@@ -152,12 +134,6 @@ mod tests {
     fn probe_with_app_id(purpose: u32, app_id: &str) -> CapabilityProbe {
         let mut p = probe(purpose, false);
         p.app_id = Some(app_id.to_owned());
-        p
-    }
-
-    fn probe_with_app_id_and_list(purpose: u32, app_id: &str, list: &[&str]) -> CapabilityProbe {
-        let mut p = probe_with_app_id(purpose, app_id);
-        p.force_uinput_apps = list.iter().map(|s| (*s).to_owned()).collect();
         p
     }
 
@@ -182,13 +158,6 @@ mod tests {
             detect_method(&probe_with_app_id(13, "com.mitchellh.ghostty")),
             BackspaceMethod::ForwardKey
         );
-    }
-
-    #[test]
-    fn terminal_override_uinput_beats_app_id() {
-        let mut p = probe_with_app_id(13, "footclient");
-        p.terminal_override = Some(BackspaceMethod::UInput);
-        assert_eq!(detect_method(&p), BackspaceMethod::UInput);
     }
 
     #[test]
@@ -234,23 +203,6 @@ mod tests {
     }
 
     #[test]
-    fn non_terminal_app_id_match_escalates_to_uinput() {
-        // Config-driven list: chromium with purpose=0 escalates to UInput.
-        let p = probe_with_app_id_and_list(0, "chromium", &["chromium"]);
-        assert_eq!(detect_method(&p), BackspaceMethod::UInput);
-        // Not in list → falls through to ForwardKey default for purpose=0.
-        let p = probe_with_app_id_and_list(0, "gedit", &["chromium"]);
-        assert_eq!(detect_method(&p), BackspaceMethod::ForwardKey);
-    }
-
-    #[test]
-    fn terminal_app_id_match_escalates_to_uinput() {
-        // Config-driven list: ghostty with purpose=13 escalates to UInput.
-        let p = probe_with_app_id_and_list(13, "com.mitchellh.ghostty", &["com.mitchellh.ghostty"]);
-        assert_eq!(detect_method(&p), BackspaceMethod::UInput);
-    }
-
-    #[test]
     fn force_vk_only_routes_to_vk_only() {
         // Chromium scenario: app advertises text_input_v3 so real Activate
         // fires, but user listed it in force_vk_only_apps because commit
@@ -269,20 +221,9 @@ mod tests {
     }
 
     #[test]
-    fn force_uinput_beats_force_vk_only() {
-        // Both lists contain the app — UInput wins (older, more
-        // battle-tested escape hatch). Documented in detect_method's
-        // priority comment.
-        let mut p = probe_with_app_id(0, "chromium");
-        p.force_uinput_apps = vec!["chromium".to_owned()];
-        p.force_vk_only_apps = vec!["chromium".to_owned()];
-        assert_eq!(detect_method(&p), BackspaceMethod::UInput);
-    }
-
-    #[test]
     fn empty_list_never_escalates() {
-        // Default config (no force_uinput_apps): chromium stays on ForwardKey
-        // for purpose=0, ghostty stays on ForwardKey for purpose=13.
+        // Default config: chromium stays on ForwardKey for purpose=0,
+        // ghostty stays on ForwardKey for purpose=13.
         let p = probe_with_app_id(0, "chromium");
         assert_eq!(detect_method(&p), BackspaceMethod::ForwardKey);
         let p = probe_with_app_id(13, "com.mitchellh.ghostty");
@@ -290,13 +231,13 @@ mod tests {
     }
 
     #[test]
-    fn vk_only_falls_back_to_uinput_when_no_vk_keyboard() {
+    fn vk_only_falls_back_to_forward_key_when_no_vk_keyboard() {
         // force_vk_only_apps would pick VkOnly, but the transport has no
-        // virtual keyboard (e.g. KWin/Mutter v1) → clamp to UInput.
+        // virtual keyboard (e.g. KWin/Mutter v1) → fall back to ForwardKey.
         let mut p = probe_with_app_id(0, "chromium");
         p.force_vk_only_apps = vec!["chromium".to_owned()];
         p.vk_keyboard_available = false;
-        assert_eq!(detect_method(&p), BackspaceMethod::UInput);
+        assert_eq!(detect_method(&p), BackspaceMethod::ForwardKey);
     }
 
     #[test]
@@ -308,13 +249,13 @@ mod tests {
     }
 
     #[test]
-    fn terminal_override_vk_only_also_clamped_without_vk() {
+    fn terminal_override_vk_only_also_falls_back_to_forward_key_without_vk() {
         // The clamp is on the final tier, so even an explicit terminal
         // override of VkOnly is downgraded when no vk keyboard exists.
         let mut p = probe(13, false);
         p.terminal_override = Some(BackspaceMethod::VkOnly);
         p.vk_keyboard_available = false;
-        assert_eq!(detect_method(&p), BackspaceMethod::UInput);
+        assert_eq!(detect_method(&p), BackspaceMethod::ForwardKey);
     }
 
     #[test]
@@ -329,8 +270,6 @@ mod tests {
     fn non_terminal_no_surrounding_is_forward_key() {
         // VSCode / chromium / Electron-class path: doesn't proactively send
         // surrounding_text at activate. Falls through to ForwardKey default.
-        // (chromium's first-compose BS-drop is mitigated by adding its app_id
-        // to FORWARD_KEY_BROKEN_APPS to force UInput.)
         assert_eq!(detect_method(&probe(0, false)), BackspaceMethod::ForwardKey);
     }
 

@@ -44,7 +44,7 @@ about where app identity came from.
 
 ### Why focus matters
 
-- **Per-app routing** — apply force-uinput / force-chars-delete / terminal
+- **Per-app routing** — apply force-vk-only / force-chars-delete / terminal
   overrides to the right application (see [Backspace tiers](backspace-tiers.md#per-app-overrides)).
 - **XWayland detection** — XWayland clients behave differently from native
   Wayland clients on some compositors, so daklak distinguishes them.

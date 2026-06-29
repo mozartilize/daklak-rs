@@ -49,15 +49,6 @@ pub struct Config {
     #[serde(default)]
     pub log_modules: Vec<String>,
 
-    /// Apps whose `app_id` (case-insensitive) forces Tier 3 UInput routing
-    /// regardless of `purpose` or other capability signals. Use this for
-    /// apps confirmed broken on both Tier 2 ForwardKey and Tier 1
-    /// SurroundingText — e.g. chromium drops first-compose vk_key BS AND
-    /// drops every delete_surrounding_text. Env override
-    /// `DAKLAK_FORCE_UINPUT_APPS` (comma-separated) replaces this list.
-    #[serde(default)]
-    pub force_uinput_apps: Vec<String>,
-
     /// Apps that never advertise `zwp_text_input_v3` (Qt5,
     /// XWayland-via-virtual-keyboard, etc.) — daklak synthesizes an
     /// "activate" via Sway IPC focus polling and routes them through
@@ -73,10 +64,7 @@ pub struct Config {
     /// a synthetic VkOnly session for it. Useful as a blanket policy
     /// when most XWayland apps benefit from Tier 4 routing (OnlyOffice,
     /// XWayland-bridged Qt5, JetBrains IDEs in X mode, etc.) without
-    /// the user having to enumerate every WM_CLASS. `force_uinput_apps`
-    /// still wins on conflict — chromium-class XWayland apps remain
-    /// routable to Tier 3 via that list to avoid the evdev-200+ render
-    /// crash. Env override
+    /// the user having to enumerate every WM_CLASS. Env override
     /// `DAKLAK_AUTO_VK_ONLY_XWAYLAND` (any non-empty/non-"0"/non-"false"
     /// value enables).
     #[serde(default)]
@@ -134,7 +122,6 @@ impl Default for Config {
             log_level: default_log_level(),
             log_path: default_log_path(),
             log_modules: Vec::new(),
-            force_uinput_apps: Vec::new(),
             force_vk_only_apps: Vec::new(),
             auto_vk_only_for_xwayland: true,
             enable_evdev_grab: false,
@@ -150,8 +137,6 @@ impl Config {
     /// Load config from $XDG_CONFIG_HOME/daklak/config.toml, with env
     /// overrides:
     /// - `DAKLAK_METHOD={telex|vni|viqr}` overrides `method`.
-    /// - `DAKLAK_FORCE_UINPUT_APPS=app1,app2,...` replaces `force_uinput_apps`
-    ///   (empty string clears the list).
     ///
     /// `load_from(Some(path))` loads that file directly and errors loudly on
     /// missing or invalid input.
@@ -179,10 +164,6 @@ impl Config {
                 "viqr" => MethodConfig::Viqr,
                 _ => MethodConfig::Telex,
             };
-        }
-
-        if let Ok(apps) = std::env::var("DAKLAK_FORCE_UINPUT_APPS") {
-            cfg.force_uinput_apps = parse_app_list(&apps);
         }
 
         if let Ok(apps) = std::env::var("DAKLAK_FORCE_VK_ONLY_APPS") {
@@ -243,7 +224,6 @@ impl Config {
             );
         }
 
-        cfg.force_uinput_apps = canonicalize_app_list(cfg.force_uinput_apps);
         cfg.force_vk_only_apps = canonicalize_app_list(cfg.force_vk_only_apps);
 
         Ok(cfg)

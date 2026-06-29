@@ -4,8 +4,7 @@
 //! - `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` proxies
 //! - xkb keymap loading + char translation
 //! - Daklak synthetic keymap upload to vk (Tier 4 VkOnly enablement)
-//! - Tier 3 grab-release/regrab dance around /dev/uinput emissions
-//! - Self-emit suppression queue + synthetic-mods echo suppression
+//! - Synthetic-mods echo suppression
 //! - Focus tracking via `wlr-foreign-toplevel-management-v1` + X11 bridge
 //! - `last_forwarded_key` / `last_forwarded_release` bookkeeping for the tail-char-drop fix
 //!
@@ -56,7 +55,7 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_m
 use crate::focus::wlr::WlrForeignToplevelBackend;
 
 pub use crate::sink::AdapterSink;
-pub use crate::state::{AdapterState, PendingSelfEmit};
+pub use crate::state::AdapterState;
 pub use viet_ime_edit_strategy::{BackspaceMethod, KeyState, ModifierState, OutputSink};
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -174,9 +173,9 @@ pub trait AdapterHandler: 'static {
         ch: Option<char>,
     ) -> KeyDecision;
 
-    /// Called by the adapter inside the Tier-3 grab dance (if applicable),
-    /// with `raw_mods` and `held_user_kc` snapshotted just before this call.
-    /// Daemon constructs a sink via `ctx.with_sink` and runs `strategy.apply`.
+    /// Called by the adapter with `raw_mods` and `held_user_kc` snapshotted
+    /// just before this call. Daemon constructs a sink via `ctx.with_sink`
+    /// and runs `strategy.apply`.
     fn apply_pending(
         &mut self,
         ctx: &mut AdapterCtx<'_>,
@@ -320,8 +319,6 @@ impl<'a> AdapterCtx<'a> {
                     text_ops: crate::sink::TextOpsTarget::V2 { im },
                     forward_emitter: &mut vk_forward,
                     synth_keymap_emitter: Some(synth_dyn),
-                    uinput: self.state.uinput.as_mut(),
-                    pending_self_emits: &mut self.state.pending_self_emits,
                     synthetic_mods_pending: &mut self.state.synthetic_mods_pending,
                     synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
                     raw_mods,
@@ -344,8 +341,6 @@ impl<'a> AdapterCtx<'a> {
                     text_ops: crate::sink::TextOpsTarget::V1 { ctx, serial },
                     forward_emitter: &mut vk_forward,
                     synth_keymap_emitter: None,
-                    uinput: self.state.uinput.as_mut(),
-                    pending_self_emits: &mut self.state.pending_self_emits,
                     synthetic_mods_pending: &mut self.state.synthetic_mods_pending,
                     synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
                     raw_mods,
@@ -372,10 +367,6 @@ pub struct WaylandAdapter<H: AdapterHandler> {
 impl<H: AdapterHandler> WaylandAdapter<H> {
     pub(crate) fn dispatch_key_release(&mut self, time: u32, key: u32) {
         tracing::info!(key, "dispatch_key_release: IM grab delivered release");
-        if self.state.suppress_self_emit(key, 0) {
-            tracing::trace!(key, value = 0, "self-emit suppressed (IM grab roundtrip)");
-            return;
-        }
         // Releases route through the same forward path as presses so the
         // focused app sees a balanced press/release pair.
         self.state.emit_forward_key(time, key, 0);
@@ -388,11 +379,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
 
     pub(crate) fn dispatch_key_press(&mut self, time: u32, key: u32) {
         tracing::info!(key, "dispatch_key_press: IM grab delivered press");
-        if self.state.suppress_self_emit(key, 1) {
-            tracing::trace!(key, value = 1, "self-emit suppressed");
-            return;
-        }
-
         let ch = self.state.xkb.as_ref().and_then(|x| x.key_to_char(key));
 
         let decision = {
@@ -413,20 +399,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 backspaces,
                 commit,
             } => {
-                let uinput_path = method == BackspaceMethod::UInput;
-
-                if uinput_path {
-                    if let Some(g) = self.state.grab.take() {
-                        g.release();
-                    }
-                    if let Some(c) = &self.state.conn {
-                        let _ = c.flush();
-                    }
-                    tokio::task::block_in_place(|| {
-                        std::thread::sleep(Duration::from_millis(3));
-                    });
-                }
-
                 let held_user_kc = self.state.held_user_kc();
 
                 if method == BackspaceMethod::VkOnly {
@@ -455,20 +427,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 // the kc 247 forwardKeySym race explanation. No
                 // additional post-apply sleep needed at this boundary.)
 
-                if uinput_path {
-                    if let Some(c) = &self.state.conn {
-                        let _ = c.flush();
-                    }
-                    tokio::task::block_in_place(|| {
-                        std::thread::sleep(Duration::from_millis(3));
-                    });
-                    if let (Some(im), Some(qh)) = (self.state.im.as_ref(), self.qh.as_ref()) {
-                        self.state.grab = Some(im.grab_keyboard(qh, ()));
-                        if let Some(c) = &self.state.conn {
-                            let _ = c.flush();
-                        }
-                    }
-                }
             }
         }
     }
@@ -483,12 +441,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
     /// `ctx.is_repeat()` to skip re-composition), and never re-Apply a commit.
     pub(crate) fn dispatch_key_repeat(&mut self, time: u32, key: u32) {
         tracing::trace!(key, "dispatch_key_repeat: IM grab delivered repeat");
-        // A repeat of our own synthetic emit shouldn't loop back, but guard
-        // identically to a press to stay safe against grab roundtrips.
-        if self.state.suppress_self_emit(key, 1) {
-            return;
-        }
-
         let ch = self.state.xkb.as_ref().and_then(|x| x.key_to_char(key));
 
         self.state.forwarding_repeat = true;
@@ -977,20 +929,6 @@ mod tests {
         s.last_forwarded_key = Some((spec.keycode, Instant::now()));
 
         s.log_duplicate_tail_diagnostic("a", 0, s.held_user_kc());
-    }
-
-    #[test]
-    fn suppress_self_emit_matches_named_pending_emit_fields() {
-        let mut s = AdapterState::new();
-        s.pending_self_emits
-            .push_back(crate::state::PendingSelfEmit {
-                keycode: 42,
-                value: 1,
-                emitted_at: Instant::now(),
-            });
-
-        assert!(s.suppress_self_emit(42, 1));
-        assert!(!s.suppress_self_emit(42, 1));
     }
 
     #[test]

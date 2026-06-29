@@ -37,8 +37,8 @@ impl AdapterHandler for Daemon {
             self.router.current_active = true;
             self.router.focused_app_id = app_id;
 
-            // VkOnly→UInput when the transport has no vk keyboard is clamped
-            // inside detect_method now (no inline backend-name check — #3).
+            // VkOnly→ForwardKey when the transport has no vk keyboard is
+            // clamped inside detect_method.
             let method = self.detect_capability(frame, ctx.profile().has_vk_keyboard);
             tracing::info!("capability detected: {:?}", method);
             let mut c = Composer::new(
@@ -127,7 +127,6 @@ impl AdapterHandler for Daemon {
                     purpose: frame.purpose,
                     surrounding_text_seen: true,
                     app_id: focused_app_id.clone(),
-                    force_uinput_apps: self.config.force_uinput_apps.clone(),
                     force_vk_only_apps: self.config.force_vk_only_apps.clone(),
                     terminal_override: self.terminal_override,
                     vk_keyboard_available: ctx.profile().has_vk_keyboard,
@@ -326,15 +325,6 @@ impl AdapterHandler for Daemon {
         is_xwayland: bool,
     ) {
         let lower = app_id.as_deref().map(str::to_ascii_lowercase);
-        let in_force_uinput = lower
-            .as_deref()
-            .map(|id| {
-                self.config
-                    .force_uinput_apps
-                    .iter()
-                    .any(|t| t.eq_ignore_ascii_case(id))
-            })
-            .unwrap_or(false);
         let in_force_vk_only = lower
             .as_deref()
             .map(|id| {
@@ -347,7 +337,7 @@ impl AdapterHandler for Daemon {
 
         let auto_xwayland_vk_only =
             self.config.auto_vk_only_for_xwayland && is_xwayland && app_id.is_some();
-        let vk_only_matched = !in_force_uinput && (in_force_vk_only || auto_xwayland_vk_only);
+        let vk_only_matched = in_force_vk_only || auto_xwayland_vk_only;
         let vk_available = ctx.profile().has_vk_keyboard;
         let matched = vk_only_matched && vk_available;
 
@@ -376,7 +366,6 @@ impl AdapterHandler for Daemon {
                 old = ?self.router.focused_app_id,
                 new = ?app_id,
                 is_xwayland,
-                in_force_uinput,
                 "synthetic deactivate (no longer matches VkOnly conditions)"
             );
             self.router.current_active = false;

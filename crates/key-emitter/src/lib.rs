@@ -4,7 +4,7 @@
 //!
 //! - `zwp_virtual_keyboard_v1` (wlroots / IM v2 path).
 //! - `zwp_input_method_context_v1.key()` (KWin / IM v1 path).
-//! - `/dev/uinput` (evdev-only mode, plus Tier 3 backspace).
+//! - `/dev/uinput` (evdev-only mode).
 //!
 //! They all reduce to `key(time, keycode, value)` + optional
 //! `modifiers(dep, lat, lock, group)`. This crate is the single trait
@@ -17,7 +17,6 @@
 //! Chromium has its own hard-coded `LinuxKeyCode → DomCode` table for
 //! keyboard introspection. Evdev codes 200+ are KEY_KBDILLUMUP/KEY_FN_F*
 //! in that table — feeding them Unicode keysyms crashes the renderer.
-//! Use `force_uinput_apps` for chromium-class instead.
 
 mod emit_char_impl;
 mod keymap;

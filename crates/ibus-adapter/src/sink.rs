@@ -95,19 +95,6 @@ impl OutputSink for IbusSink {
         // IBus engines don't control the compositor keymap; no-op.
     }
 
-    fn uinput_key(&mut self, key_code: u16, value: i32) {
-        // UInput path shouldn't fire for GNOME apps (SurroundingText is used),
-        // but handle backspace gracefully just in case.
-        let kc = key_code as u32;
-        let keyval = if kc == 14 { XK_BACKSPACE } else { return };
-        let s = IBUS_FORWARD_MASK | if value == 0 { IBUS_RELEASE_MASK } else { 0 };
-        self.forwards.push(PendingForward {
-            keyval,
-            keycode: kc,
-            state: s,
-        });
-    }
-
     fn vk_commit_char(&mut self, _time: u32, c: char) -> bool {
         self.commits.push(c.to_string());
         true
@@ -137,21 +124,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn uinput_key_uses_evdev_keycode_for_forward_event() {
-        let mut sink = IbusSink::default();
-        sink.uinput_key(14, 1);
-        sink.uinput_key(14, 0);
 
-        assert_eq!(sink.forwards.len(), 2);
-        assert_eq!(sink.forwards[0].keycode, 14);
-        assert_eq!(sink.forwards[0].keyval, XK_BACKSPACE);
-        assert_eq!(sink.forwards[0].state, IBUS_FORWARD_MASK);
-        assert_eq!(sink.forwards[1].keycode, 14);
-        assert_eq!(sink.forwards[1].keyval, XK_BACKSPACE);
-        assert_eq!(
-            sink.forwards[1].state,
-            IBUS_FORWARD_MASK | IBUS_RELEASE_MASK
-        );
-    }
 }

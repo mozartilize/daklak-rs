@@ -39,9 +39,6 @@ pub const DAKLAK_UINPUT_VERSION: u16 = 0x0001;
 /// keybindings as a security measure (only kernel-level evdev sources
 /// trigger them).
 ///
-/// Tier 3 (Backspace-only) still uses this device; the wider key surface
-/// is forward-compatible.
-///
 /// Requires `/dev/uinput` to be writable (udev rule or
 /// `sudo chmod 666 /dev/uinput`).
 pub struct UinputDevice {

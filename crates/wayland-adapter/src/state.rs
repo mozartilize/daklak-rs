@@ -1,9 +1,8 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::sync::mpsc;
-use viet_ime_edit_strategy::uinput_device::UinputDevice;
 use viet_ime_edit_strategy::ModifierState;
 use wayland_client::backend::ObjectId;
 use wayland_client::Connection;
@@ -36,17 +35,6 @@ use crate::focus::kde::PlasmaToplevelEntry;
 #[cfg(feature = "kde")]
 use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_window_management::OrgKdePlasmaWindowManagement;
 
-/// Window in which to drop daklak's own uinput round-trips. ~3× Tier 3
-/// grab-dance budget (~9ms) keeps clear of any human keystroke interval.
-pub(crate) const SELF_EMIT_WINDOW: Duration = Duration::from_millis(20);
-
-#[derive(Debug, Clone, Copy)]
-pub struct PendingSelfEmit {
-    pub keycode: u16,
-    pub value: i32,
-    pub emitted_at: Instant,
-}
-
 /// Adapter-side state. Owns Wayland proxies + emit-history. The handler
 /// (daemon) never sees these directly — it interacts via `AdapterCtx`.
 pub struct AdapterState {
@@ -58,8 +46,7 @@ pub struct AdapterState {
     pub grab: Option<ZwpInputMethodKeyboardGrabV2>,
     pub vk: Option<ZwpVirtualKeyboardV1>,
 
-    /// Connection clone for grab-release/regrab flush around Tier 3 uinput
-    /// emission.
+    /// Connection clone used for explicit flushes after batched key emits.
     pub conn: Option<Connection>,
 
     // xkb state (set on first Keymap event from the grab)
@@ -86,14 +73,6 @@ pub struct AdapterState {
     // Prevents apply_done_frame spam when KWin sends events in batches.
     pub pending_commit: bool,
 
-    // uinput device for Tier 3 — None if /dev/uinput is not accessible
-    pub uinput: Option<UinputDevice>,
-
-    /// Queue of kernel events daklak just synthesized via /dev/uinput. Each
-    /// entry is round-tripped through the
-    /// IM grab; on_key_pressed / on_key_released match and drop the matching
-    /// entry so we don't re-process our own emissions.
-    pub pending_self_emits: VecDeque<PendingSelfEmit>,
 
     /// Counter of outgoing `vk.modifiers` calls daklak has made but not yet
     /// seen mirrored back through the IM grab's `Modifiers` event. Used by
@@ -166,17 +145,6 @@ pub struct AdapterState {
 
 impl AdapterState {
     pub fn new() -> Self {
-        let uinput = match UinputDevice::open() {
-            Ok(d) => {
-                tracing::info!("uinput device opened (Tier 3 available)");
-                Some(d)
-            }
-            Err(e) => {
-                tracing::warn!("uinput unavailable ({e}); Tier 3 demoted to ForwardKey");
-                None
-            }
-        };
-
         Self {
             seat: None,
             im_manager: None,
@@ -208,8 +176,6 @@ impl AdapterState {
             modifiers: ModifierState::empty(),
             raw_mods: (0, 0, 0, 0),
             pending_frame: DoneFrame::default(),
-            uinput,
-            pending_self_emits: VecDeque::new(),
             synthetic_mods_pending: 0,
             synthetic_mods_emitted_at: None,
             last_forwarded_key: None,
@@ -233,28 +199,6 @@ impl AdapterState {
             plasma_toplevels: HashMap::new(),
             #[cfg(feature = "kde")]
             plasma_manager: None,
-        }
-    }
-
-    /// Check whether the incoming grab key event matches a recent self-emit
-    /// from /dev/uinput. Drains expired entries (>20ms old) before matching.
-    /// Returns true if the event should be suppressed (i.e. dropped silently).
-    ///
-    /// Matching is **strict FIFO**.
-    pub fn suppress_self_emit(&mut self, key: u32, value: i32) -> bool {
-        while let Some(emit) = self.pending_self_emits.front() {
-            if emit.emitted_at.elapsed() > SELF_EMIT_WINDOW {
-                self.pending_self_emits.pop_front();
-            } else {
-                break;
-            }
-        }
-        match self.pending_self_emits.front() {
-            Some(emit) if emit.keycode as u32 == key && emit.value == value => {
-                self.pending_self_emits.pop_front();
-                true
-            }
-            _ => false,
         }
     }
 

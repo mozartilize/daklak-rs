@@ -10,12 +10,12 @@ ranks several mechanisms by cleanliness and picks the best one available.
 
 ## Contents
 
-- [The four tiers](#the-four-tiers)
+- [The active tiers](#the-active-tiers)
 - [Selection logic](#selection-logic)
 - [Per-app overrides](#per-app-overrides)
 - [The shadow buffer](#the-shadow-buffer)
 
-## The four tiers
+## The active tiers
 
 The concrete enum and emit code live in the `edit-strategy` crate. Treat the
 source as authoritative for names and module layout.
@@ -24,17 +24,14 @@ source as authoritative for names and module layout.
 | ---- | --------- | ----------- |
 | 1 | `delete_surrounding_text` over the text-input protocol | cleanest — the app deletes exactly the range we name |
 | 2 | synthesize `BackSpace` keysyms through the IM grab / virtual keyboard | good — but relies on the client treating forwarded keys as edits |
-| 3 | inject `KEY_BACKSPACE` at the input-device level via `/dev/uinput` | deprecated fallback; bypasses text-input entirely |
 | 4 | synthesize a daklak xkb keymap at spare keycodes and drive it via the virtual keyboard | last resort for clients with no text-input support |
 
-### Why four?
+### Why these tiers?
 
 - **Tier 1** is preferred whenever the client advertises surrounding-text
   support — it is unambiguous and atomic.
 - **Tier 2** is the general default when there's no surrounding-text channel:
   forward backspaces as key events.
-- **Tier 3** injected backspaces at the uinput layer for environments that
-  dropped forwarded keys. Prefer Tier 1 or Tier 2 for new routing decisions.
 - **Tier 4** handles clients that expose no text-input protocol at all (some Qt
   applications): daklak builds its own keymap so it can emit arbitrary
   characters as keycodes through a virtual keyboard.
@@ -49,8 +46,7 @@ capabilities. The important rules:
 - **Terminals get ForwardKey.** Clients with the terminal content purpose route
   to Tier 2 (`ForwardKey`) regardless of surrounding-text, unless a
   `terminal_override` (or the `DAKLAK_TERMINAL_TIER` env var) says otherwise.
-  Surrounding-text would self-emit-loop and drop commits in a PTY; the uinput
-  tier would race the terminal's read loop. See
+  Surrounding-text would self-emit-loop and drop commits in a PTY. See
   [Compositor quirks](compositor-quirks.md#terminals--forwarded-key-routing).
 - **VkOnly requires a virtual-keyboard-capable transport.** If that channel is
   unavailable, the strategy must choose another feasible tier.
@@ -64,8 +60,8 @@ execution are independent of which transport is live.
 Some clients misbehave in tier-specific ways, so configuration can pin behavior
 per application:
 
-- **force-uinput apps** — force Tier 3 for clients that crash on the Tier 4
-  synthesized-keymap path.
+- **force-vk-only apps** — force Tier 4 for clients with no usable text-input
+  path.
 - **force-chars-delete apps** — treat the Tier 1 delete length as a count of
   characters rather than bytes, for clients that misread the spec.
 - **terminal override** — pin a specific method for terminals.

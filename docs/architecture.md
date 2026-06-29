@@ -89,7 +89,7 @@ A single composing keystroke, end to end:
 5. The sink, inside the transport adapter, executes it using the
    [backspace tier](backspace-tiers.md) chosen for the current
    [capability profile](capability-model.md) — surrounding-text delete, forwarded
-   `BackSpace` keys, uinput injection, or the synthesized-keymap path — and then
+   `BackSpace` keys, or the synthesized-keymap path — and then
    commits the corrected text.
 6. The shadow is updated to match.
 

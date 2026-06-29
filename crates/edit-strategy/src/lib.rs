@@ -3,7 +3,6 @@ pub mod shadow;
 
 mod forward_key;
 mod surrounding;
-mod uinput_backspace;
 pub mod uinput_device;
 mod vk_only;
 
@@ -12,14 +11,13 @@ pub use shadow::ShadowBuffer;
 
 use bitflags::bitflags;
 
-/// Which Wayland/uinput mechanism a given text-input object gets.
+/// Which edit mechanism a given text-input object gets.
 /// One per text_input_object, NOT per window — Firefox has separate objects
 /// for address bar vs page content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackspaceMethod {
     SurroundingText, // Tier 1 — delete_surrounding_text
     ForwardKey,      // Tier 2 — zwp_virtual_keyboard_v1 synthetic BS
-    UInput,          // Tier 3 — /dev/uinput synthetic BS with modifier guard
     /// Tier 4 (VkOnly) — everything via `zwp_virtual_keyboard_v1::key()`,
     /// using daklak's synthesized xkb keymap that maps spare evdev slots
     /// (200+) to Vietnamese precomposed chars. No `commit_string`, no
@@ -44,9 +42,8 @@ pub enum KeyDecision {
     /// press on wayland, raw uinput passthrough on evdev) and stamps
     /// `last_forwarded_key` where applicable.
     ForwardRaw,
-    /// Engine consumed and produced an edit. Adapter wraps `apply_pending`
-    /// in the Tier-3 grab dance (when method == UInput) and computes
-    /// `held_user_kc` (tail-char-drop fix) before passing both to the handler.
+    /// Engine consumed and produced an edit. Adapter computes `held_user_kc`
+    /// (tail-char-drop fix) before passing it to the handler.
     Apply {
         method: BackspaceMethod,
         backspaces: usize,
@@ -73,21 +70,8 @@ bitflags! {
     }
 }
 
-impl ModifierState {
-    /// Iterator over the individual set bits — used by uinput_backspace to
-    /// release/restore each modifier individually.
-    pub fn all_bits() -> [ModifierState; 4] {
-        [
-            ModifierState::SHIFT,
-            ModifierState::CTRL,
-            ModifierState::ALT,
-            ModifierState::SUPER,
-        ]
-    }
-}
-
-/// The sink the daemon implements. Each method maps to exactly one Wayland
-/// request or one uinput emit. The order matters and is fixed by Strategy.
+/// The sink the daemon implements. Each method maps to one transport-level
+/// edit or key-emission operation. The order matters and is fixed by Strategy.
 pub trait OutputSink {
     // Tier 1
     /// Delete text around the cursor. `before_bytes`/`after_bytes` are
@@ -109,8 +93,6 @@ pub trait OutputSink {
     // Tier 2 — zwp_virtual_keyboard_v1
     fn vk_key(&mut self, time: u32, key_code: u32, state: KeyState);
     fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32);
-    // Tier 3 — /dev/uinput
-    fn uinput_key(&mut self, key_code: u16, value: i32); // 1=press, 0=release
     /// Tier 4 — emit `c` via `vk_key()` using daklak's synthesized
     /// Vietnamese keymap. Returns `false` if `c` isn't in the keymap
     /// inventory (caller should fall back).
@@ -184,16 +166,6 @@ impl Strategy {
                     false,
                 );
             }
-            BackspaceMethod::UInput => {
-                uinput_backspace::apply(
-                    &mut self.shadow,
-                    backspaces,
-                    commit,
-                    serial,
-                    self.modifiers,
-                    sink,
-                );
-            }
             BackspaceMethod::VkOnly => {
                 vk_only::apply(&mut self.shadow, backspaces, commit, time, sink);
             }
@@ -235,7 +207,6 @@ impl Strategy {
     }
 
     /// Update modifier state from a Modifiers event on the keyboard grab.
-    /// Called by the daemon; used by Tier 3's modifier guard.
     pub fn set_modifiers(&mut self, m: ModifierState) {
         self.modifiers = m;
     }
@@ -278,7 +249,6 @@ mod tests {
         Commit(u32),
         VkKey(u32, u32, KeyState),
         VkModifiers(u32, u32, u32, u32),
-        UinputKey(u16, i32),
         VkCommitChar(u32, char),
     }
 
@@ -309,9 +279,6 @@ mod tests {
         fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
             self.calls
                 .push(Call::VkModifiers(depressed, latched, locked, group));
-        }
-        fn uinput_key(&mut self, key_code: u16, value: i32) {
-            self.calls.push(Call::UinputKey(key_code, value));
         }
         fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
             self.calls.push(Call::VkCommitChar(time, c));
@@ -435,96 +402,6 @@ mod tests {
         let mut sink = MockSink::default();
         s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
         assert_eq!(s.shadow.text(), "abâ");
-    }
-
-    // ── Tier 3 — UInput ───────────────────────────────────────────────────────
-
-    #[test]
-    fn tier3_no_mods_single_backspace() {
-        let mut s = Strategy::new(BackspaceMethod::UInput);
-        s.set_modifiers(ModifierState::empty());
-        s.shadow.append("a");
-        let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
-        assert_eq!(
-            sink.calls,
-            vec![
-                // No mod release (no mods held)
-                Call::UinputKey(14, 1), // BS press
-                Call::UinputKey(14, 0), // BS release
-                // No mod restore
-                Call::CommitString("â".to_owned()),
-                Call::Commit(1),
-            ]
-        );
-    }
-
-    #[test]
-    fn tier3_shift_held_single_backspace() {
-        // Shift held: release Shift, BS, restore Shift
-        let mut s = Strategy::new(BackspaceMethod::UInput);
-        s.set_modifiers(ModifierState::SHIFT);
-        s.shadow.append("a");
-        let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
-        assert_eq!(
-            sink.calls,
-            vec![
-                Call::UinputKey(42, 0), // LEFTSHIFT release
-                Call::UinputKey(14, 1), // BS press
-                Call::UinputKey(14, 0), // BS release
-                Call::UinputKey(42, 1), // LEFTSHIFT restore
-                Call::CommitString("â".to_owned()),
-                Call::Commit(1),
-            ]
-        );
-    }
-
-    #[test]
-    fn tier3_ctrl_shift_held() {
-        let mut s = Strategy::new(BackspaceMethod::UInput);
-        s.set_modifiers(ModifierState::SHIFT | ModifierState::CTRL);
-        s.shadow.append("a");
-        let mut sink = MockSink::default();
-        s.apply(1, "x", 1, 0, &mut sink, DeleteUnit::Bytes);
-        let calls = &sink.calls;
-        // Release phase: SHIFT(42)=0, CTRL(29)=0 — order by ModifierState::all_bits()
-        assert!(calls.contains(&Call::UinputKey(42, 0)));
-        assert!(calls.contains(&Call::UinputKey(29, 0)));
-        // BS
-        assert!(calls.contains(&Call::UinputKey(14, 1)));
-        assert!(calls.contains(&Call::UinputKey(14, 0)));
-        // Restore phase: SHIFT(42)=1, CTRL(29)=1
-        assert!(calls.contains(&Call::UinputKey(42, 1)));
-        assert!(calls.contains(&Call::UinputKey(29, 1)));
-        // Commit at the end
-        assert_eq!(*calls.last().unwrap(), Call::Commit(1));
-    }
-
-    #[test]
-    fn tier3_two_backspaces_mods_touched_once() {
-        // Modifier release/restore wraps ALL backspaces — not once per BS.
-        let mut s = Strategy::new(BackspaceMethod::UInput);
-        s.set_modifiers(ModifierState::SHIFT);
-        s.shadow.append("ab");
-        let mut sink = MockSink::default();
-        s.apply(2, "x", 1, 0, &mut sink, DeleteUnit::Bytes);
-        // Count UinputKey(42, ...) calls — should be exactly 2 (1 release + 1 restore)
-        let shift_calls: Vec<_> = sink
-            .calls
-            .iter()
-            .filter(|c| matches!(c, Call::UinputKey(42, _)))
-            .collect();
-        assert_eq!(shift_calls.len(), 2);
-        assert_eq!(shift_calls[0], &Call::UinputKey(42, 0)); // release
-        assert_eq!(shift_calls[1], &Call::UinputKey(42, 1)); // restore
-                                                             // BS×2 = 4 events
-        let bs_calls: Vec<_> = sink
-            .calls
-            .iter()
-            .filter(|c| matches!(c, Call::UinputKey(14, _)))
-            .collect();
-        assert_eq!(bs_calls.len(), 4);
     }
 
     // ── Tier 4 — VkOnly ──────────────────────────────────────────────

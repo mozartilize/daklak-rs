@@ -161,8 +161,7 @@ log_modules = ["daklak=debug", "viet_ime_wayland_adapter=info"]
 
 Notable per-app routing options:
 
-- **force-uinput apps** — apps that must use the uinput tier (e.g. clients that
-  crash on the synthesized-keymap path).
+- **force-vk-only apps** — apps that must use the synthesized-keymap path.
 - **force-chars-delete apps** — apps whose surrounding-text delete length is
   interpreted in characters rather than bytes.
 - **terminal override** — force a specific backspace method for terminals.

@@ -1,15 +1,11 @@
-use std::collections::VecDeque;
 use std::time::Instant;
 
-use viet_ime_edit_strategy::uinput_device::UinputDevice;
 use viet_ime_edit_strategy::{KeyState, OutputSink};
 use viet_ime_key_emitter::KeyEmitter;
 use viet_ime_keymap::xkb::XkbState;
 
 use wayland_protocols::wp::input_method::zv1::client::zwp_input_method_context_v1::ZwpInputMethodContextV1;
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2;
-
-use crate::state::PendingSelfEmit;
 
 /// Backend selection for the text-input-v3-shaped operations (the ones
 /// `KeyEmitter` doesn't cover): `commit_string`, `commit(serial)`,
@@ -75,10 +71,6 @@ pub struct AdapterSink<'a> {
     pub(crate) text_ops: TextOpsTarget<'a>,
     pub(crate) forward_emitter: &'a mut dyn KeyEmitter,
     pub(crate) synth_keymap_emitter: Option<&'a mut dyn KeyEmitter>,
-    pub(crate) uinput: Option<&'a mut UinputDevice>,
-    /// Queue daklak's own uinput emissions go into so the grab handler can
-    /// match and drop their round-trips. AdapterState owns it.
-    pub(crate) pending_self_emits: &'a mut VecDeque<PendingSelfEmit>,
     /// Counter of `vk.modifiers` calls daklak has emitted but not yet seen
     /// echoed back through the IM grab's `Modifiers` event. Incremented per
     /// emit in `vk_commit_char`; AdapterState's `on_modifiers` handler decrements
@@ -212,28 +204,11 @@ impl OutputSink for AdapterSink<'_> {
     }
 
     fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        // Modifier echo around forwards / Tier 3 mod-guard → forward_emitter.
-        // Tier 4's modifier dance runs inside emit_char on synth_keymap_emitter
-        // and is wired directly there.
+        // Modifier echo around forwards → forward_emitter. Tier 4's modifier
+        // dance runs inside emit_char on synth_keymap_emitter and is wired
+        // directly there.
         self.forward_emitter
             .emit_modifiers(depressed, latched, locked, group);
-    }
-
-    fn uinput_key(&mut self, key_code: u16, value: i32) {
-        if let Some(u) = &mut self.uinput {
-            match u.emit(key_code, value) {
-                Ok(()) => {
-                    self.pending_self_emits.push_back(PendingSelfEmit {
-                        keycode: key_code,
-                        value,
-                        emitted_at: Instant::now(),
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(?e, key_code, value, "uinput emit failed");
-                }
-            }
-        }
     }
 
     fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
