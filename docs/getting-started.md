@@ -162,8 +162,6 @@ log_modules = ["daklak=debug", "viet_ime_wayland_adapter=info"]
 Notable per-app routing options:
 
 - **force-vk-only apps** — apps that must use the synthesized-keymap path.
-- **force-chars-delete apps** — apps whose surrounding-text delete length is
-  interpreted in characters rather than bytes.
 - **terminal override** — force a specific backspace method for terminals.
 
 See [Backspace tiers](backspace-tiers.md) and [Compositor quirks](compositor-quirks.md)

@@ -26,11 +26,6 @@ force_vk_only_apps = []
 # default: true
 auto_vk_only_for_xwayland = true
 
-# Apps that should use character-count delete_surrounding_text handling
-# on the V1Kde sink.
-# default: ["firefox", "firefox-dev"]
-force_chars_delete_apps = ["firefox", "firefox-dev"]
-
 # Open and grab /dev/input/event* keyboards at startup.
 # default: false
 enable_evdev_grab = false

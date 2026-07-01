@@ -62,8 +62,6 @@ per application:
 
 - **force-vk-only apps** — force Tier 4 for clients with no usable text-input
   path.
-- **force-chars-delete apps** — treat the Tier 1 delete length as a count of
-  characters rather than bytes, for clients that misread the spec.
 - **terminal override** — pin a specific method for terminals.
 
 See [Compositor quirks](compositor-quirks.md) for the concrete behaviors that

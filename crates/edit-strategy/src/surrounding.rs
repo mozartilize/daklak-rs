@@ -7,10 +7,9 @@ const KEY_BACKSPACE: u32 = 14;
 /// (Tier 1 — BackspaceMethod::SurroundingText).
 ///
 /// Pass both byte and char counts: per the v2/v3 spec
-/// (zwp-input-method-unstable-v2.xml:262-281) `before_length` is bytes,
-/// but firefox's v3 client on the KWin v1↔v3 path interprets it as
-/// chars. The sink picks the right unit based on
-/// `force_chars_delete_apps`.
+/// (zwp-input-method-unstable-v2.xml:262-281) `before_length` is bytes.
+/// Firefox stale-echo handling can request char-count fallback for one
+/// correction; otherwise sinks use the spec-compliant byte counts.
 ///
 /// When the compositor reports a selection (anchor ≠ cursor), Chromium may
 /// reject `delete_surrounding_text` because the client's selection state

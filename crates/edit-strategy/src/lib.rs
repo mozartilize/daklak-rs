@@ -77,9 +77,8 @@ pub trait OutputSink {
     /// Delete text around the cursor. `before_bytes`/`after_bytes` are
     /// UTF-8 byte counts (what wlroots v2/v3 IM and all spec-compliant
     /// v3 clients want); `before_chars`/`after_chars` are Unicode scalar
-    /// counts (what firefox's v3 client wants on its KWin v1↔v3 path —
-    /// see `force_chars_delete_apps` config). The sink picks whichever
-    /// unit its backend + the per-window app match dictates.
+    /// counts for the rare Firefox stale-echo fallback. The sink picks the
+    /// unit requested by the current correction.
     fn delete_surrounding_text(
         &mut self,
         before_bytes: u32,
