@@ -379,6 +379,7 @@ impl Daemon {
             BackspaceMethod::VkOnly,
             self.config.bracket_shortcuts,
         );
+        c.set_modern_style(self.config.modern_style);
         c.set_modifiers(self.router.modifiers);
         self.router.current_active = true;
         self.router.synthetic_active = true;
@@ -396,6 +397,7 @@ impl Daemon {
             method,
             self.config.bracket_shortcuts,
         );
+        c.set_modern_style(self.config.modern_style);
         c.set_modifiers(self.router.modifiers);
         self.router.composer = Some(c);
         self.router.current_active = true;
@@ -455,7 +457,9 @@ mod tests {
         use crate::config::Config;
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
-        use viet_ime_edit_strategy::{BackspaceMethod, KeyState, OutputSink};
+        use viet_ime_edit_strategy::{
+            BackspaceMethod, KeyDecision, KeyState, OutputSink,
+        };
         use viet_ime_engine::InputMethod;
         use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, AdapterState, FrameSnapshot};
 
@@ -500,6 +504,42 @@ mod tests {
                 app_id: None,
                 is_xwayland: false,
             }
+        }
+
+        #[test]
+        fn activation_honors_legacy_tone_config() {
+            let mut cfg = Config::default();
+            cfg.modern_style = false;
+            let mut daemon = Daemon::new(
+                cfg,
+                Arc::new(AtomicBool::new(true)),
+                super::super::noop_config_rx(),
+            );
+
+            let mut state = AdapterState::new();
+            let mut ctx = AdapterCtx { state: &mut state };
+            let mut activate = frame("", 0, 0);
+            activate.activate = true;
+            activate.surrounding_text = None;
+            daemon.on_done_frame(&mut ctx, &activate);
+
+            let mut visible = String::new();
+            for ch in "hoaf".chars() {
+                match daemon.handle_char(ch) {
+                    KeyDecision::ForwardRaw => visible.push(ch),
+                    KeyDecision::Apply {
+                        backspaces, commit, ..
+                    } => {
+                        for _ in 0..backspaces {
+                            visible.pop();
+                        }
+                        visible.push_str(&commit);
+                    }
+                    KeyDecision::Consumed => {}
+                }
+            }
+
+            assert_eq!(visible, "hòa");
         }
 
         #[test]
@@ -866,7 +906,7 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
         use tokio::sync::watch;
-        use viet_ime_edit_strategy::BackspaceMethod;
+        use viet_ime_edit_strategy::{BackspaceMethod, KeyDecision};
         use viet_ime_engine::InputMethod;
 
         #[test]
@@ -953,6 +993,53 @@ mod tests {
             // Both fields must reflect the LATEST send, not an intermediate.
             assert_eq!(d.config.method, MethodConfig::Telex);
             assert!(!d.config.modern_style, "modern_style from the second send");
+        }
+
+        #[test]
+        fn method_change_preserves_legacy_tone_placement() {
+            // A mode switch resets the underlying engine. If legacy tone
+            // placement was already active, that reset must not silently
+            // restore vnkey-engine's default modern placement.
+            let (tx, rx) = watch::channel(ConfigChange {
+                method: MethodConfig::Telex,
+                modern_style: false,
+            });
+            let mut cfg = Config::default();
+            cfg.modern_style = false;
+            let mut d = Daemon::new(cfg, Arc::new(AtomicBool::new(true)), rx);
+            d.router.current_active = true;
+            let mut composer = Composer::new(
+                InputMethod::Telex,
+                BackspaceMethod::SurroundingText,
+                false,
+            );
+            composer.set_modern_style(false);
+            d.router.composer = Some(composer);
+
+            let _ = tx.send(ConfigChange {
+                method: MethodConfig::Vni,
+                modern_style: false,
+            });
+            d.sync_config();
+            assert_eq!(d.config.method, MethodConfig::Vni);
+
+            let mut visible = String::new();
+            for ch in "hoa2".chars() {
+                match d.handle_char(ch) {
+                    KeyDecision::ForwardRaw => visible.push(ch),
+                    KeyDecision::Apply {
+                        backspaces, commit, ..
+                    } => {
+                        for _ in 0..backspaces {
+                            visible.pop();
+                        }
+                        visible.push_str(&commit);
+                    }
+                    KeyDecision::Consumed => {}
+                }
+            }
+
+            assert_eq!(visible, "hòa");
         }
 
         #[test]

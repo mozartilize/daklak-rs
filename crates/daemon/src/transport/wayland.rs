@@ -46,6 +46,7 @@ impl AdapterHandler for Daemon {
                 method,
                 self.config.bracket_shortcuts,
             );
+            c.set_modern_style(self.config.modern_style);
             // `commit_string_functional` starts true (the spec default: a v3
             // client is obligated to apply commit_string). It is driven down
             // ONLY by the runtime ST-liveness probe at the ST→FK downgrade —
@@ -359,6 +360,7 @@ impl AdapterHandler for Daemon {
                 BackspaceMethod::VkOnly,
                 self.config.bracket_shortcuts,
             );
+            c.set_modern_style(self.config.modern_style);
             c.set_modifiers(self.router.modifiers);
             self.router.composer = Some(c);
         } else if self.router.synthetic_active && !matched {

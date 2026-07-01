@@ -378,8 +378,10 @@ impl Composer {
 
     /// Change input method at runtime. Resets all composition state.
     pub fn set_input_method(&mut self, method: InputMethod) {
+        let modern_style = self.engine.modern_style();
         self.full_reset();
         self.engine = EngineState::new_with_options(method, self.bracket_shortcuts);
+        self.engine.set_modern_style(modern_style);
     }
 
     /// Toggle modern-style tone placement. `false` = legacy `òa` instead of `oà`.

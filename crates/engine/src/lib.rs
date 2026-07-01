@@ -48,6 +48,7 @@ pub struct EngineState {
     /// configuration to round-trip-check a reconstructed seed.
     method: InputMethod,
     bracket_shortcuts: bool,
+    modern_style: bool,
 }
 
 impl EngineState {
@@ -63,10 +64,12 @@ impl EngineState {
             engine.input.set_user_key_map(&key_map);
         }
         engine.set_viet_mode(true);
+        let modern_style = engine.options.modern_style;
         Self {
             engine,
             method,
             bracket_shortcuts,
+            modern_style,
         }
     }
 
@@ -76,6 +79,7 @@ impl EngineState {
     /// telex seed actually round-trips back to the glyphs it came from.
     fn render(&self, raw: &str) -> String {
         let mut scratch = Self::new_with_options(self.method, self.bracket_shortcuts);
+        scratch.set_modern_style(self.modern_style);
         let mut screen = String::new();
         for ch in raw.chars() {
             let r = scratch.process_key(ch);
@@ -127,12 +131,18 @@ impl EngineState {
     pub fn set_input_method(&mut self, method: InputMethod) {
         self.engine.reset();
         self.engine.set_input_method(method.to_vnkey());
+        self.engine.options.modern_style = self.modern_style;
         self.method = method;
+    }
+
+    pub fn modern_style(&self) -> bool {
+        self.modern_style
     }
 
     /// Toggle modern-style tone placement. `false` = legacy `òa` instead of `oà`.
     /// Does NOT reset composition — the change takes effect on the next tone.
     pub fn set_modern_style(&mut self, enabled: bool) {
+        self.modern_style = enabled;
         self.engine.options.modern_style = enabled;
     }
 
