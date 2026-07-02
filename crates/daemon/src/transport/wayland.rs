@@ -122,9 +122,7 @@ impl AdapterHandler for Daemon {
             // downgrade ST → FK here.
             if !activate && w.method() == BackspaceMethod::ForwardKey {
                 let probe = CapabilityProbe {
-                    purpose: frame.purpose,
                     surrounding_text_seen: true,
-                    terminal_override: self.terminal_override,
                 };
                 let upgraded = detect_method(&probe);
                 if upgraded == BackspaceMethod::SurroundingText {

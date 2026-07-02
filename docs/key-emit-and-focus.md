@@ -44,8 +44,6 @@ about where app identity came from.
 
 ### Why focus matters
 
-- **Per-app routing** — apply the terminal override to the right application
-  (see [Backspace tiers](backspace-tiers.md#per-app-overrides)).
 - **No-text-input fallback** — a focused client that never enables text-input
   gets a ForwardKey session synthesized from focus metadata.
 - **XWayland detection** — XWayland clients behave differently from native

@@ -109,9 +109,10 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodContextV1, ()> for WaylandAdapter
             zwp_input_method_context_v1::Event::ContentType { hint: _, purpose } => {
                 // text-input-unstable-v1 purpose enum differs from
                 // text-input-v3: v3 added `pin=9`, shifting everything
-                // 9+ by one. `edit-strategy::PURPOSE_TERMINAL=13` is v3
-                // numbering. Translate at this boundary so KWin's v1
-                // value 12 (=terminal in v1) becomes 13 (=terminal in v3).
+                // 9+ by one. The v3 numbering (terminal=13) is what the
+                // logged `purpose` diagnostic expects. Translate at this
+                // boundary so KWin's v1 value 12 (=terminal in v1) becomes 13
+                // (=terminal in v3).
                 //
                 //   v1 0..=8  → v3 0..=8   (normal/alpha/.../password)
                 //   v1 9 date → v3 10 date

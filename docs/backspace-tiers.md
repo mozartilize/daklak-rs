@@ -12,7 +12,6 @@ ranks several mechanisms by cleanliness and picks the best one available.
 
 - [The active tiers](#the-active-tiers)
 - [Selection logic](#selection-logic)
-- [Per-app overrides](#per-app-overrides)
 - [The shadow buffer](#the-shadow-buffer)
 
 ## The active tiers
@@ -58,10 +57,15 @@ capabilities. The important rules:
 
 - **Surrounding text wins.** If the probe shows surrounding-text was observed,
   use Tier 1.
-- **Terminals get ForwardKey.** Clients with the terminal content purpose route
-  to Tier 2 (`ForwardKey`) regardless of surrounding-text, unless a
-  `terminal_override` (or the `DAKLAK_TERMINAL_TIER` env var) says otherwise.
-  Surrounding-text would self-emit-loop and drop commits in a PTY. See
+- **Terminals are not special-cased at detection.** The compositor's terminal
+  content purpose no longer forces a tier. A terminal that advertises an empty
+  surrounding-text frame (foot on KWin) is initially detected as Tier 1
+  `SurroundingText`, then caught by the **runtime ST→FK liveness downgrade**:
+  the watchdog observes dead surrounding-text frames during the first
+  non-destructive keystrokes and downgrades to `ForwardKey` *before* any
+  `delete_surrounding_text` is issued, so no PTY self-emit-loop or dropped
+  commit occurs. On wlroots, terminals (foot, Ghostty) send no surrounding-text
+  at all, so they resolve directly to `ForwardKey`. See
   [Compositor quirks](compositor-quirks.md#terminals--forwarded-key-routing).
 - **No text-input at all → synthesized ForwardKey.** Clients that never enable
   text-input fire no `Activate`, so capability detection never runs. When the
@@ -76,17 +80,6 @@ capabilities. The important rules:
 
 Tier output is delivered through the `OutputSink` trait, so the selection and
 execution are independent of which transport is live.
-
-## Per-app overrides
-
-Some clients misbehave in tier-specific ways, so configuration can pin behavior
-per application:
-
-- **terminal override** — pin a specific method for terminals
-  (`DAKLAK_TERMINAL_TIER`).
-
-See [Compositor quirks](compositor-quirks.md) for the concrete behaviors that
-motivate each override.
 
 ## The shadow buffer
 
