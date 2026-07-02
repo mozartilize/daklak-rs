@@ -20,20 +20,6 @@ pub(crate) enum TextOpsTarget<'a> {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum V1CommitRoute {
-    CommitString,
-    Keysym,
-}
-
-fn v1_commit_route(c: char, is_unmapped: bool, commit_string_functional: bool) -> V1CommitRoute {
-    if commit_string_functional && (c.is_ascii() || !is_unmapped) {
-        V1CommitRoute::CommitString
-    } else {
-        V1CommitRoute::Keysym
-    }
-}
-
 /// Routing decision for an entire KWin IMv1 replacement string.
 /// Always emit whole replacement through keysym on KWin; splitting a single
 /// logical replacement between keysym and commit_string creates non-atomic
@@ -41,7 +27,6 @@ fn v1_commit_route(c: char, is_unmapped: bool, commit_string_functional: bool) -
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum V1ReplacementRoute {
     WholeKeysym,
-    WholeCommitString,
 }
 
 fn v1_replacement_route(_text: &str, _commit_string_functional: bool) -> V1ReplacementRoute {
@@ -124,10 +109,9 @@ pub struct AdapterSink<'a> {
     /// contenteditable) — the same dead text-input-v3 contract drops
     /// `commit_string` too. When `false`, `commit_via_keysym` routes the whole
     /// commit through `vk_commit_char` (v2/sway) or `ctx.keysym` (v1/KWin)
-    /// instead of `commit_string`; on v1 this also keeps every char on the
-    /// single keysym channel so a contenteditable can't reorder a split commit
-    /// (`ếng` → `…nế…`). When `true`, v1 keeps the terminal split (Vietnamese
-    /// via keysym, ASCII via commit_string) and v2 falls back to commit_string.
+    /// instead of `commit_string`. KWin v1 always keeps replacements on the
+    /// single keysym channel; v2 with working commit_string still falls back to
+    /// one whole commit_string on the normal path.
     pub(crate) commit_string_functional: bool,
     /// V2 only: flipped to true by `commit()` so `apply_done_frame` can
     /// detect whether daklak already acked the compositor's done event,
@@ -293,6 +277,32 @@ impl OutputSink for AdapterSink<'_> {
             TextOpsTarget::V2 { .. } => false,
         }
     }
+
+    fn commit_key_channel_text(&mut self, _serial: u32, time: u32, text: &str) -> bool {
+        match &self.text_ops {
+            // ImV2: preflight all chars are in the synth keymap, then emit.
+            TextOpsTarget::V2 { .. } => {
+                if !text.chars().all(|c| {
+                    viet_ime_keymap::char_to_emit(c).is_some()
+                }) {
+                    return false;
+                }
+                for c in text.chars() {
+                    if !self.vk_commit_char(time, c) {
+                        return false;
+                    }
+                    if let Some(conn) = self.conn {
+                        let _ = conn.flush();
+                    }
+                }
+                true
+            }
+            // ImV1: delegate to whole-keysym path.
+            TextOpsTarget::V1 { ctx, .. } => {
+                self.commit_via_keysym_v1(ctx, _serial, time, text)
+            }
+        }
+    }
 }
 
 impl AdapterSink<'_> {
@@ -384,27 +394,6 @@ impl AdapterSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn v1_ascii_uses_keysym_when_commit_string_is_not_functional() {
-        assert_eq!(v1_commit_route('d', false, false), V1CommitRoute::Keysym);
-    }
-
-    #[test]
-    fn v1_ascii_uses_commit_string_when_commit_string_is_functional() {
-        assert_eq!(v1_commit_route('d', false, true), V1CommitRoute::CommitString);
-    }
-
-    #[test]
-    fn v1_ascii_uses_commit_string_when_shifted_char_is_not_in_current_xkb_level() {
-        assert_eq!(v1_commit_route('D', true, true), V1CommitRoute::CommitString);
-    }
-
-    #[test]
-    fn v1_unmapped_non_ascii_chars_always_use_keysym() {
-        assert_eq!(v1_commit_route('é', true, true), V1CommitRoute::Keysym);
-        assert_eq!(v1_commit_route('é', true, false), V1CommitRoute::Keysym);
-    }
 
     #[test]
     fn v1_mapped_keysym_under_depressed_modifier_needs_modifier_guard() {
