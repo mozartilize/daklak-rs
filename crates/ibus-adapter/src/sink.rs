@@ -95,9 +95,12 @@ impl OutputSink for IbusSink {
         // IBus engines don't control the compositor keymap; no-op.
     }
 
-    fn vk_commit_char(&mut self, _time: u32, c: char) -> bool {
-        self.commits.push(c.to_string());
-        true
+    fn vk_commit_char(&mut self, _time: u32, _c: char) -> bool {
+        false
+    }
+
+    fn commit_key_channel_text(&mut self, _serial: u32, _time: u32, _text: &str) -> bool {
+        false
     }
 }
 
@@ -124,5 +127,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ibus_does_not_claim_key_channel_commit_support() {
+        let mut sink = IbusSink::default();
 
+        assert!(!sink.vk_commit_char(0, 'ậ'));
+        assert!(!sink.commit_key_channel_text(0, 0, "ập"));
+        assert!(sink.commits.is_empty());
+    }
+
+    #[test]
+    fn ibus_forward_key_replacement_is_one_whole_commit_text() {
+        let mut sink = IbusSink::default();
+        let mut strategy = viet_ime_edit_strategy::Strategy::new(
+            viet_ime_edit_strategy::BackspaceMethod::ForwardKey,
+        );
+
+        strategy.apply(
+            2,
+            "ập",
+            0,
+            0,
+            &mut sink,
+            viet_ime_edit_strategy::DeleteUnit::Bytes,
+        );
+
+        assert_eq!(sink.forwards.len(), 4);
+        assert_eq!(sink.commits, vec!["ập".to_owned()]);
+    }
 }
