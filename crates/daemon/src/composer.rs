@@ -518,7 +518,20 @@ impl Composer {
             }
         } else {
             tracing::trace!("BS not consumed → forward");
+            let deleted_visible = self.edit.shadow_text().chars().last();
             self.edit.pop_forwarded_char();
+            // `processed=false` can still carry a positive backspace count:
+            // vnkey recognized that an owned glyph was deleted but did not emit
+            // an edit for the daemon. The app will perform that delete through
+            // the forwarded Backspace; when the deleted visible glyph is a
+            // composed non-ASCII char (e.g. `u`+`w` -> `ư`), drop stale raw
+            // history before a later raw restore resurrects the deleted prefix
+            // (`sưi`+`t` -> `uswit`). Plain ASCII English backspaces keep their
+            // engine history so retyping `doesnt` stays raw.
+            if r.backspaces > 0 && matches!(deleted_visible, Some(ch) if !ch.is_ascii()) {
+                self.engine.reset();
+                self.retroactive_context = false;
+            }
             self.last_keystroke_at = Instant::now();
             self.firefox.clear();
             KeyDecision::ForwardRaw
@@ -1584,6 +1597,71 @@ mod tests {
                     assert_eq!(commit, "sixsxi");
                 }
                 _ => panic!("expected raw restore"),
+            }
+        }
+
+        #[test]
+        fn forwarded_backspace_after_telex_u_w_drops_deleted_raw_context() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+            let mut visible = "đoạn trước ".to_owned();
+            let cursor = visible.len() as u32;
+            c.observe_surrounding_bytes(&visible, ByteCursor(cursor), ByteCursor(cursor), true);
+
+            for ch in ['u', 'w'] {
+                c.mark_action();
+                match c.feed_key(ch) {
+                    KeyDecision::Apply {
+                        backspaces, commit, ..
+                    } => {
+                        for _ in 0..backspaces {
+                            visible.pop();
+                        }
+                        visible.push_str(&commit);
+                        c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                    }
+                    _ => panic!("expected Telex edit for {ch:?}"),
+                }
+            }
+            assert!(visible.ends_with('ư'));
+
+            c.mark_action();
+            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+            visible.pop();
+            assert_eq!(visible, "đoạn trước ");
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('s'), KeyDecision::ForwardRaw));
+            visible.push('s');
+
+            c.mark_action();
+            match c.feed_key('w') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    for _ in 0..backspaces {
+                        visible.pop();
+                    }
+                    visible.push_str(&commit);
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                _ => panic!("expected Telex edit for 'w'"),
+            }
+            assert_eq!(visible, "đoạn trước sư");
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('i'), KeyDecision::ForwardRaw));
+            visible.push('i');
+
+            c.mark_action();
+            match c.feed_key('t') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 3);
+                    assert_eq!(commit, "swit");
+                }
+                _ => panic!("expected raw restore to English word"),
             }
         }
 
