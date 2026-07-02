@@ -34,6 +34,20 @@ fn v1_commit_route(c: char, is_unmapped: bool, commit_string_functional: bool) -
     }
 }
 
+/// Routing decision for an entire KWin IMv1 replacement string.
+/// Always emit whole replacement through keysym on KWin; splitting a single
+/// logical replacement between keysym and commit_string creates non-atomic
+/// edits that terminals like Ghostty and xfce4-terminal render incorrectly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V1ReplacementRoute {
+    WholeKeysym,
+    WholeCommitString,
+}
+
+fn v1_replacement_route(_text: &str, _commit_string_functional: bool) -> V1ReplacementRoute {
+    V1ReplacementRoute::WholeKeysym
+}
+
 fn v1_keysym_needs_modifier_guard(
     is_unmapped: bool,
     commit_string_functional: bool,
@@ -282,11 +296,10 @@ impl OutputSink for AdapterSink<'_> {
 }
 
 impl AdapterSink<'_> {
-    /// ImV1 keysym-path commit. Splits ASCII (commit_string) from
-    /// Vietnamese (ctx.keysym) when commit_string_functional is true; keeps
-    /// every char on the keysym channel when it is false (contenteditable
-    /// clients with a dead commit_string that would reorder cross-channel
-    /// commits).
+    /// ImV1 keysym-path commit. Emits the whole replacement through the
+    /// keysym channel to avoid non-atomic split-channel edits (keysym for
+    /// Vietnamese chars + commit_string for ASCII tails), which terminals
+    /// like Ghostty and xfce4-terminal render incorrectly.
     fn commit_via_keysym_v1(
         &mut self,
         ctx: &ZwpInputMethodContextV1,
@@ -297,49 +310,18 @@ impl AdapterSink<'_> {
         const PRESSED: u32 = 1;
         const RELEASED: u32 = 0;
 
-        // Collect consecutive ASCII chars into buf and flush them as a
-        // single ctx.commit_string(). This goes through text-input-v3,
-        // which has NO dedup (unlike ctx.key() / ctx.keysym() → MAPPED
-        // forwardKeySym, both of which hit KWin's KeyboardInterface::
-        // updateKey pressedKeys check). When the physical keycode for
-        // an ASCII char in the commit is still held by the user (e.g. 'g'
-        // while typing "ếng"), KWin drops the synthetic press because that
-        // keycode is already in pressedKeys from the forwarded physical
-        // press. commit_string() via text-input-v3 bypasses this
-        // deduplication entirely.
+        let _route = v1_replacement_route(text, self.commit_string_functional);
+
         tracing::trace!(text = %text, "commit_via_keysym: enter (v1 keysym path)");
-        let mut ascii_buf = String::new();
-        let flush_ascii = |buf: &mut String, ctx: &ZwpInputMethodContextV1, serial: u32| {
-            if !buf.is_empty() {
-                // TRACE the channel split: ASCII runs go through text-input-v3
-                // commit_string while Vietnamese chars go through the keysym
-                // (wl_keyboard) channel — the suspected source of word reorder
-                // ("ếng" → keysym 'ế' + commit_string "ng") on contenteditable.
-                tracing::trace!(ascii = %buf, "commit_via_keysym: flush ASCII via commit_string (text-input channel)");
-                ctx.commit_string(serial, std::mem::take(buf));
-            }
-        };
 
         for c in text.chars() {
             let is_unmapped = match self.xkb {
                 Some(xkb) => xkb.char_to_keycode(c).is_none(),
                 None => true,
             };
-            // Clients with a dead commit_string keep every char on the keysym
-            // channel — see `commit_string_functional`. Mapped ASCII (a-z,
-            // telex tails) has a standard keysym present in the layout, so KWin
-            // forwards the real keycode (no kc 247 dance); single-channel
-            // ordering is preserved.
-            if v1_commit_route(c, is_unmapped, self.commit_string_functional)
-                == V1CommitRoute::CommitString
-            {
-                ascii_buf.push(c);
-                continue;
-            }
-
-            // Vietnamese (unmapped) char — flush pending ASCII first so
-            // commit_string arrives before the keysym's keymap dance.
-            flush_ascii(&mut ascii_buf, ctx, serial);
+            // Whole replacement stays on the keysym channel. No per-char
+            // commit_string split — mixed key/text-input replacement is not
+            // a coherent edit for KWin terminals.
 
             // Tail-char-drop fix: for mapped ASCII chars whose
             // physical keycode the user is still holding, emit a
@@ -392,9 +374,6 @@ impl AdapterSink<'_> {
             tracing::trace!(c = %c, sym = sym.raw(), "commit_via_keysym: keysym emit + barrier (unmapped)");
         }
 
-        // Flush any trailing ASCII.
-        flush_ascii(&mut ascii_buf, ctx, serial);
-
         if let Some(conn) = self.conn {
             let _ = conn.flush();
         }
@@ -442,5 +421,35 @@ mod tests {
         assert!(!forward_backspace_needs_modifier_guard(14, (0, 0, 0, 0)));
         assert!(!forward_backspace_needs_modifier_guard(14, (0, 0, 0, 1)));
         assert!(!forward_backspace_needs_modifier_guard(30, (1, 0, 0, 0)));
+    }
+
+    // ── V1ReplacementRoute tests ───────────────────────────────────────
+
+    #[test]
+    fn v1_replacement_uses_whole_keysym_even_when_commit_string_functional() {
+        assert_eq!(
+            v1_replacement_route("ập", true),
+            V1ReplacementRoute::WholeKeysym
+        );
+    }
+
+    #[test]
+    fn v1_replacement_uses_whole_keysym_when_commit_string_is_not_functional() {
+        assert_eq!(
+            v1_replacement_route("ập", false),
+            V1ReplacementRoute::WholeKeysym
+        );
+    }
+
+    #[test]
+    fn v1_mapped_ascii_tail_is_allowed_on_keysym_channel() {
+        assert_eq!(
+            v1_replacement_route("ếng", true),
+            V1ReplacementRoute::WholeKeysym
+        );
+        assert_eq!(
+            v1_replacement_route("ập", false),
+            V1ReplacementRoute::WholeKeysym
+        );
     }
 }
