@@ -12,7 +12,6 @@ not re-litigate or add ad-hoc workarounds beyond what's described here.
 - [GNOME / IBus ForwardKeyEvent fails in Mutter](#gnome--ibus-forwardkeyevent-fails-in-mutter)
 - [Terminals — forwarded-key routing](#terminals--forwarded-key-routing)
 - [Firefox contenteditable: stale-echo delete bypass](#firefox-contenteditable-stale-echo-delete-bypass)
-- [Synthesized-keymap channel crashes some clients](#synthesized-keymap-channel-crashes-some-clients)
 - [Tail-drop after tone + space](#tail-drop-after-tone--space)
 - [Preedit rendering of forwarded keys](#preedit-rendering-of-forwarded-keys)
 
@@ -98,28 +97,19 @@ KWin/im-v1 terminal paths. KWin/im-v1 keeps the whole replacement on the keysym
 channel because splitting keysym and `commit_string` is not a coherent edit for
 some terminals.
 
-## Synthesized-keymap channel crashes some clients
-
-**Behavior:** The virtual-keyboard synthesized-keymap replacement channel (the
-keymap-swap emit that ForwardKey uses when no working text-input commit exists)
-crashes some chromium-class applications.
-
-**Resolution:** This channel is only reached automatically where there is no
-usable text-input commit: a client that never enables text-input (session
-synthesized from focus metadata with `commit_string_functional = false`), or a
-client whose surrounding-text bridge proved dead and was downgraded to
-ForwardKey. Clients with a healthy text-input commit keep
-`commit_string_functional = true` and never touch this channel.
-
 ## Tail-drop after tone + space
 
 **Behavior:** On some compositor/client combinations, committing a tone change
 immediately followed by a space can race the client's keymap recompilation
 against per-keysym keycode installation, dropping the tail of the edit.
 
-**Resolution:** Two short sleep barriers on the forward-key path — one between
-keysyms and one after applying the edit — serialize the two windows so the
-client settles before the next event.
+**Resolution:** The KWin keysym path (`commit_via_keysym_v1` in
+`crates/wayland-adapter/src/sink.rs`) inserts a per-char Wayland `conn.flush()`
+after every keysym pair so each char's keymap dance fully settles before the
+next event. A modifier guard avoids the kc 247 temp-keymap swap for mapped
+keysyms, eliminating the race for common telex tails. No wall-clock sleep is
+needed — the Wayland round-trip barrier is sufficient. There is no post-apply
+barrier; the per-char flush + guard handles it.
 
 ## Preedit rendering of forwarded keys
 
