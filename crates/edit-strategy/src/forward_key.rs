@@ -25,28 +25,18 @@ pub fn apply(
         sink.vk_key(time, KEY_BACKSPACE, KeyState::Released);
     }
 
-    // Firefox/contenteditable on wlroots can reorder cross-channel edits
-    // (vk-key delete + text-input commit_string). When requested, keep the
-    // replacement on the key channel too: first try vk_commit_char per-char,
-    // then keysym (v1), then commit_string fallback for unmapped chars.
+    // Whole replacement channel selection.
+    // Never split one logical replacement across channels.
     if prefer_key_channel_commit {
-        let mut fallback = String::new();
-        for c in commit.chars() {
-            if !sink.vk_commit_char(time, c) {
-                fallback.push(c);
-            }
-        }
-        if !fallback.is_empty() {
-            if !sink.commit_via_keysym(serial, time, &fallback) {
-                sink.commit_string(&fallback);
-                sink.commit(serial);
-            }
+        // Key-channel fallback (e.g. dead text-input).
+        // Try whole key-channel emit; fall back to whole commit_string.
+        if !sink.commit_key_channel_text(serial, time, commit) {
+            sink.commit_string(commit);
+            sink.commit(serial);
         }
     } else if !sink.commit_via_keysym(serial, time, commit) {
-        // Prefer per-char keysym emission on ImV1 — real wl_keyboard.key
-        // events via KWin's forwardKeySym + temporary-keymap synthesis.
-        // Terminals like foot ignore commit_string but honor wl_keyboard.
-        // Other backends return false → fall through to commit_string.
+        // Normal path: whole commit_string where that is the working
+        // channel (e.g. foot on wlroots/IMv2 with commit_string_functional=true).
         sink.commit_string(commit);
         sink.commit(serial);
     }

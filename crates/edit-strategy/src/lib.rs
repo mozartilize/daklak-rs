@@ -98,17 +98,19 @@ pub trait OutputSink {
     fn vk_commit_char(&mut self, time: u32, c: char) -> bool;
 
     /// Emit `text` as a sequence of `(press, release)` keysym pairs.
-    /// Only implemented on ImV1 via `zwp_input_method_context_v1::keysym`,
-    /// which KWin synthesises into real `wl_keyboard.key` events (using a
-    /// temporary keymap with `unmappedKeyCode=247` for Unicode keysyms
-    /// that don't exist in the system layout). This is the only path that
-    /// delivers Vietnamese precomposed chars to **terminal** clients on
-    /// KWin: terminals don't honor `commit_string` (text-input-v3 →
-    /// editable widget) but do honor `wl_keyboard.key` (→ PTY UTF-8).
-    ///
+    /// Implemented on ImV1 via `zwp_input_method_context_v1::keysym`.
     /// Returns `true` if emitted; `false` if the backend has no keysym
     /// path (caller falls back to `commit_string` + `commit`).
     fn commit_via_keysym(&mut self, _serial: u32, _time: u32, _text: &str) -> bool {
+        false
+    }
+
+    /// Emit `text` as a single whole-replacement through the backend's key
+    /// channel (keysym for KWin IMv1, VK synthetic keymap for IMv2+VK).
+    /// Returns `true` if the whole text was emitted; `false` if the backend
+    /// lacks a key channel or any char is not in the key inventory (caller
+    /// should fall back to one whole `commit_string`).
+    fn commit_key_channel_text(&mut self, _serial: u32, _time: u32, _text: &str) -> bool {
         false
     }
 }
@@ -526,5 +528,87 @@ mod tests {
         s.shadow.append("hello");
         s.reset_shadow();
         assert_eq!(s.shadow.text(), "");
+    }
+
+    // ── Whole-replacement channel tests ───────────────────────────────────
+
+    #[derive(Default)]
+    struct WholeChannelSink {
+        ops: Vec<String>,
+        key_channel_ok: bool,
+    }
+
+    impl OutputSink for WholeChannelSink {
+        fn delete_surrounding_text(&mut self, _: u32, _: u32, _: u32, _: u32) {}
+        fn commit_string(&mut self, text: &str) {
+            self.ops.push(format!("commit_string:{text}"));
+        }
+        fn commit(&mut self, _: u32) {}
+        fn vk_key(&mut self, _: u32, key_code: u32, state: KeyState) {
+            self.ops.push(format!("key:{key_code}:{state:?}"));
+        }
+        fn vk_modifiers(&mut self, _: u32, _: u32, _: u32, _: u32) {}
+        fn vk_commit_char(&mut self, _: u32, _c: char) -> bool {
+            false
+        }
+        fn commit_key_channel_text(&mut self, _: u32, _: u32, text: &str) -> bool {
+            if !self.key_channel_ok {
+                return false;
+            }
+            for c in text.chars() {
+                self.ops.push(format!("vk_char:{c}"));
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn forward_key_replacement_does_not_split_when_key_channel_is_available() {
+        let mut shadow = ShadowBuffer::new();
+        shadow.append("lâp");
+        let mut sink = WholeChannelSink {
+            ops: Vec::new(),
+            key_channel_ok: true,
+        };
+
+        crate::forward_key::apply(&mut shadow, 2, "ập", 1, 0, &mut sink, true);
+
+        assert!(sink.ops.iter().any(|op| op == "vk_char:ậ"));
+        assert!(sink.ops.iter().any(|op| op == "vk_char:p"));
+        assert!(!sink.ops.iter().any(|op| op.starts_with("commit_string:")));
+    }
+
+    #[test]
+    fn forward_key_replacement_falls_back_as_whole_commit_string() {
+        let mut shadow = ShadowBuffer::new();
+        shadow.append("lâp");
+        let mut sink = WholeChannelSink {
+            ops: Vec::new(),
+            key_channel_ok: false,
+        };
+
+        crate::forward_key::apply(&mut shadow, 2, "ập", 1, 0, &mut sink, true);
+
+        assert!(sink.ops.iter().any(|op| op == "commit_string:ập"));
+        assert!(!sink.ops.iter().any(|op| op == "commit_string:p"));
+        assert!(!sink.ops.iter().any(|op| op == "commit_string:ậ"));
+    }
+
+    #[test]
+    fn forward_key_replacement_uses_whole_commit_string_on_normal_path() {
+        let mut shadow = ShadowBuffer::new();
+        shadow.append("lâp");
+        let mut sink = WholeChannelSink {
+            ops: Vec::new(),
+            key_channel_ok: false,
+        };
+
+        // Normal path (prefer_key_channel_commit=false) falls through to
+        // commit_via_keysym which returns false → whole commit_string.
+        crate::forward_key::apply(&mut shadow, 2, "ập", 1, 0, &mut sink, false);
+
+        assert!(sink.ops.iter().any(|op| op == "commit_string:ập"));
+        assert!(!sink.ops.iter().any(|op| op == "commit_string:p"));
+        assert!(!sink.ops.iter().any(|op| op == "commit_string:ậ"));
     }
 }
