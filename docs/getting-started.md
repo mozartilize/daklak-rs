@@ -66,7 +66,6 @@ Development run with logging overrides:
 ```sh
 DAKLAK_LOG_LEVEL=error \
 DAKLAK_LOG_MODULES=daklak=debug,viet_ime_wayland_adapter=info \
-DAKLAK_FORCE_VK_ONLY_APPS=org.keepassxc.KeePassXC,xfce4-terminal \
 cargo run -p viet-ime-daemon
 ```
 
@@ -161,8 +160,8 @@ log_modules = ["daklak=debug", "viet_ime_wayland_adapter=info"]
 
 Notable per-app routing options:
 
-- **force-vk-only apps** — apps that must use the synthesized-keymap path.
-- **terminal override** — force a specific backspace method for terminals.
+- **terminal override** — force a specific backspace method for terminals
+  (`DAKLAK_TERMINAL_TIER`).
 
 See [Backspace tiers](backspace-tiers.md) and [Compositor quirks](compositor-quirks.md)
 for why these exist.

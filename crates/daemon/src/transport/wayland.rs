@@ -15,7 +15,7 @@ use crate::composer::{ByteCursor, Composer};
 use crate::handler::{Daemon, KEY_BACKSPACE, NAV_KEYS};
 
 impl AdapterHandler for Daemon {
-    fn on_done_frame(&mut self, ctx: &mut AdapterCtx<'_>, frame: &FrameSnapshot) {
+    fn on_done_frame(&mut self, _ctx: &mut AdapterCtx<'_>, frame: &FrameSnapshot) {
         self.sync_config();
 
         if frame.activate && self.router.synthetic_active {
@@ -37,9 +37,7 @@ impl AdapterHandler for Daemon {
             self.router.current_active = true;
             self.router.focused_app_id = app_id;
 
-            // VkOnly→ForwardKey when the transport has no vk keyboard is
-            // clamped inside detect_method.
-            let method = self.detect_capability(frame, ctx.profile().has_vk_keyboard);
+            let method = self.detect_capability(frame);
             tracing::info!("capability detected: {:?}", method);
             let mut c = Composer::new(
                 self.config.method.to_engine(),
@@ -62,7 +60,6 @@ impl AdapterHandler for Daemon {
         }
 
         // After deactivate, composer is None — nothing more to do.
-        let focused_app_id = self.router.focused_app_id.clone();
         let Some(w) = self.router.composer.as_mut() else {
             return;
         };
@@ -127,10 +124,7 @@ impl AdapterHandler for Daemon {
                 let probe = CapabilityProbe {
                     purpose: frame.purpose,
                     surrounding_text_seen: true,
-                    app_id: focused_app_id.clone(),
-                    force_vk_only_apps: self.config.force_vk_only_apps.clone(),
                     terminal_override: self.terminal_override,
-                    vk_keyboard_available: ctx.profile().has_vk_keyboard,
                 };
                 let upgraded = detect_method(&probe);
                 if upgraded == BackspaceMethod::SurroundingText {
@@ -325,28 +319,18 @@ impl AdapterHandler for Daemon {
         app_id: Option<String>,
         is_xwayland: bool,
     ) {
-        let lower = app_id.as_deref().map(str::to_ascii_lowercase);
-        let in_force_vk_only = lower
-            .as_deref()
-            .map(|id| {
-                self.config
-                    .force_vk_only_apps
-                    .iter()
-                    .any(|t| t.eq_ignore_ascii_case(id))
-            })
-            .unwrap_or(false);
-
-        let auto_xwayland_vk_only =
-            self.config.auto_vk_only_for_xwayland && is_xwayland && app_id.is_some();
-        // Native Wayland clients may focus and deliver IM keyboard-grab keys
-        // without ever enabling text-input. With a real virtual keyboard
-        // available, synthesize a key-channel session so terminals such as
-        // Ghostty compose without requiring force_vk_only_apps.
-        let auto_no_text_input_focus_vk_only = app_id.is_some();
-        let vk_only_matched =
-            in_force_vk_only || auto_xwayland_vk_only || auto_no_text_input_focus_vk_only;
+        // Native clients (wlroots terminals like Ghostty, XWayland apps like
+        // OnlyOffice) focus and deliver IM keyboard-grab keys without ever
+        // enabling text-input, so no compositor `Activate` fires and capability
+        // detection never runs. When the transport exposes a virtual keyboard,
+        // synthesize a ForwardKey session from focus metadata: its key-channel
+        // fallback (`commit_string_functional = false`) emits every replacement
+        // through daklak's synthetic Vietnamese keymap on
+        // `zwp_virtual_keyboard_v1` — the route that reliably reaches
+        // no-text-input clients (incl. XWayland). A real `Activate` always
+        // wins and replaces this synthetic session (see `on_done_frame`).
         let vk_available = ctx.profile().has_vk_keyboard;
-        let matched = vk_only_matched && vk_available;
+        let matched = app_id.is_some() && vk_available;
 
         let synthetic_target_changed = self.router.synthetic_active
             && matched
@@ -354,33 +338,30 @@ impl AdapterHandler for Daemon {
 
         if matched && (!self.router.current_active || synthetic_target_changed) {
             let id = app_id.clone().unwrap_or_default();
-            let reason = if in_force_vk_only {
-                "force_vk_only_apps"
-            } else if auto_xwayland_vk_only {
-                "auto_vk_only_for_xwayland"
-            } else {
-                "auto_no_text_input_focus"
-            };
 
-            tracing::info!(app_id = %id, reason, is_xwayland,
-                "synthetic activate → VkOnly");
+            tracing::info!(app_id = %id, is_xwayland,
+                "synthetic activate → ForwardKey (focus without text-input)");
             self.router.current_active = true;
             self.router.synthetic_active = true;
             self.router.focused_app_id = app_id;
             let mut c = Composer::new(
                 self.config.method.to_engine(),
-                BackspaceMethod::VkOnly,
+                BackspaceMethod::ForwardKey,
                 self.config.bracket_shortcuts,
             );
             c.set_modern_style(self.config.modern_style);
             c.set_modifiers(self.router.modifiers);
+            // No text-input session exists for this client, so commit_string is
+            // dead. Force ForwardKey to route replacements through the virtual
+            // keyboard's synthetic keymap instead.
+            c.commit_string_functional = false;
             self.router.composer = Some(c);
         } else if self.router.synthetic_active && !matched {
             tracing::info!(
                 old = ?self.router.focused_app_id,
                 new = ?app_id,
                 is_xwayland,
-                "synthetic deactivate (no longer matches VkOnly conditions)"
+                "synthetic deactivate (focus lost / no virtual keyboard)"
             );
             self.router.current_active = false;
             self.router.synthetic_active = false;

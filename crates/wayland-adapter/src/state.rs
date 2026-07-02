@@ -76,7 +76,7 @@ pub struct AdapterState {
 
     /// Counter of outgoing `vk.modifiers` calls daklak has made but not yet
     /// seen mirrored back through the IM grab's `Modifiers` event. Used by
-    /// `vk_commit_char`'s level-selecting dance (Tier 4).
+    /// `vk_commit_char`'s level-selecting dance (key-channel commit).
     pub synthetic_mods_pending: u32,
 
     /// Timestamp of the last `vk.modifiers` emit that bumped
@@ -160,7 +160,7 @@ impl AdapterState {
                     tracing::info!(
                         size = km.size,
                         vn_pairs = keymap::vn_pairs(),
-                        "synthetic Vietnamese keymap built (Tier 4 VkOnly, FOUR_LEVEL ≤255)"
+                        "synthetic Vietnamese keymap built (key-channel commit, FOUR_LEVEL ≤255)"
                     );
                     Some(km)
                 }
@@ -210,54 +210,13 @@ impl AdapterState {
         }
     }
 
-    pub(crate) fn log_duplicate_tail_diagnostic(
-        &self,
-        commit: &str,
-        backspaces: usize,
-        held_user_kc: Option<u32>,
-    ) {
-        let Some(tail) = commit.chars().last() else {
-            return;
-        };
-        let Some(spec) = crate::keymap::char_to_emit(tail) else {
-            return;
-        };
-        let press_match = self.last_forwarded_key.filter(|(kc, _)| *kc == spec.keycode);
-        let release_match = self
-            .last_forwarded_release
-            .filter(|(kc, _)| *kc == spec.keycode);
-        let press_gap_us = press_match.map(|(_, t)| t.elapsed().as_micros() as u64);
-        let release_gap_us = release_match.map(|(_, t)| t.elapsed().as_micros() as u64);
-        let held = held_user_kc == Some(spec.keycode);
-        if press_match.is_some() || release_match.is_some() {
-            tracing::warn!(
-                tail = %tail,
-                tail_kc = spec.keycode,
-                ?press_gap_us,
-                ?release_gap_us,
-                held,
-                backspaces,
-                commit,
-                "DUPLICATE-TAIL: vk_only commit tail keycode matches user's last forwarded press/release → tail-drop prelude release will be emitted if held"
-            );
-        } else {
-            tracing::debug!(
-                tail = %tail,
-                tail_kc = spec.keycode,
-                last_press_kc = ?self.last_forwarded_key.map(|(k, _)| k),
-                last_release_kc = ?self.last_forwarded_release.map(|(k, _)| k),
-                "tail-check: vk_only commit tail keycode differs from last forwarded"
-            );
-        }
-    }
-
     /// Forward-path key emit. Falls through to `zwp_virtual_keyboard_v1`
     /// (v2) or `zwp_input_method_context_v1.key` (v1). Used by
     /// `forward_press` / `dispatch_key_release` / `KeyDecision::ForwardRaw`.
     ///
-    /// Tier 4 (VkOnly Vietnamese precomposed chars) does NOT route here;
-    /// it goes through `with_sink → synth_keymap_emitter` which is always
-    /// vk_v2.
+    /// Vietnamese precomposed chars committed via the synthetic keymap do
+    /// NOT route here; they go through `with_sink → synth_keymap_emitter`
+    /// which is always vk_v2.
     /// The wl_keyboard key state for a press: `2` (Repeated) while dispatching
     /// a repeat, else `1` (Pressed). Release is always `0` (passed explicitly).
     pub fn press_value(&self) -> u32 {

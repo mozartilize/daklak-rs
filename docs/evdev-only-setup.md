@@ -35,9 +35,9 @@ active layout. Without a layout that knows Vietnamese precomposed chars at the
 slot keycodes daklak picks, those commits would render as the keycode's default
 keysym (a Japanese IME function, an F13+ keysym, etc).
 
-Daklak generates the same synthetic keymap the Wayland Tier 4 (`VkOnly`) path
-uploads to `zwp_virtual_keyboard_v1` — 17 `EIGHT_LEVEL` custom slots over evdev
-keycodes ≤ 255 so XWayland clients receive them too:
+Daklak generates the same synthetic keymap the Wayland ForwardKey
+virtual-keyboard channel uploads to `zwp_virtual_keyboard_v1` — 17 `EIGHT_LEVEL`
+custom slots over evdev keycodes ≤ 255 so XWayland clients receive them too:
 
 - **IME zone** (kc 85,86,89-95 with 92 reserved): `<ZEHA>`, `<LSGT>`, `<AB11>`,
   `<KATA>`, `<HIRA>`, `<HKTG>`, `<MUHE>`, `<JPCM>` — 8 slots.

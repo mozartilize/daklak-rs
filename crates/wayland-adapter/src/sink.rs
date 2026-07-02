@@ -63,9 +63,10 @@ fn forward_backspace_needs_modifier_guard(
 ///   `vk_v1` on KWin / `vk_v2` everywhere else.
 /// - `synth_keymap_emitter` emits **daklak's synthesised keymap slots**
 ///   (Vietnamese precomposed chars at evdev kc ≤ 191). Drives
-///   `vk_commit_char` (Tier 4 VkOnly). Only `vk_v2` qualifies — v1 has
-///   no `vk_commit_char` parity.
-///   `None` on backends where Tier 4 is unsupported (KWin v1).
+///   `vk_commit_char` (the key-channel Vietnamese commit). Only `vk_v2`
+///   qualifies — v1 has no `vk_commit_char` parity.
+///   `None` on backends where the vk synthetic-keymap commit is
+///   unsupported (KWin v1).
 pub struct AdapterSink<'a> {
     pub(crate) text_ops: TextOpsTarget<'a>,
     pub(crate) forward_emitter: &'a mut dyn KeyEmitter,
@@ -202,20 +203,21 @@ impl OutputSink for AdapterSink<'_> {
     }
 
     fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        // Modifier echo around forwards → forward_emitter. Tier 4's modifier
-        // dance runs inside emit_char on synth_keymap_emitter and is wired
-        // directly there.
+        // Modifier echo around forwards → forward_emitter. The key-channel
+        // commit's modifier dance runs inside emit_char on
+        // synth_keymap_emitter and is wired directly there.
         self.forward_emitter
             .emit_modifiers(depressed, latched, locked, group);
     }
 
     fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
-        // Tier 4 (VkOnly) needs daklak's synthesised keymap. Only the
+        // The key-channel Vietnamese commit needs daklak's synthesised
+        // keymap. Only the
         // synth_keymap_emitter knows how to drive it — KWin v1 leaves
         // this slot `None` and the caller falls back to `commit_string`.
         let Some(emitter) = self.synth_keymap_emitter.as_deref_mut() else {
             tracing::trace!(
-                "vk_commit_char: no synth_keymap_emitter available (Tier 4 unsupported on this backend)"
+                "vk_commit_char: no synth_keymap_emitter available (vk synthetic-keymap commit unsupported on this backend)"
             );
             return false;
         };

@@ -33,13 +33,16 @@ distinct compositor families through two input-method protocol versions.
 ### Input-method v2 (wlroots / Sway)
 
 - Uses `zwp_input_method_v2` plus `zwp_virtual_keyboard_v1`.
-- Has a real **virtual keyboard**, so it can drive Tier 2 (`ForwardKey`) and
-  Tier 4 (`VkOnly`).
+- Has a real **virtual keyboard**, so Tier 2 (`ForwardKey`) can drive both the
+  synthesized backspaces and the virtual-keyboard synthetic-keymap replacement
+  channel.
 - Commits text via the commit-string path when that channel is healthy;
   daklak's own commit acknowledges the frame (the v2 client does not heartbeat
-  `done` on its own). When ForwardKey must avoid a stale text-input channel,
-  replacement text can instead go through the virtual keyboard's synthetic
-  keymap as one whole key-channel replacement.
+  `done` on its own). When ForwardKey must avoid a stale or absent text-input
+  channel (`commit_string_functional = false`), replacement text instead goes
+  through the virtual keyboard's synthetic keymap as one whole key-channel
+  replacement. Clients that never enable text-input get a ForwardKey session
+  synthesized from focus metadata, which uses exactly this channel.
 
 ### Input-method v1 (KWin / Plasma)
 
