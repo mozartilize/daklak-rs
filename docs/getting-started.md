@@ -158,14 +158,6 @@ log_modules = ["daklak=debug", "viet_ime_wayland_adapter=info"]
 - **log path** — destination for tracing output (default `/dev/stdout`).
 - **log modules** — per-target overrides such as `daklak=debug`.
 
-Notable per-app routing options:
-
-- **terminal override** — force a specific backspace method for terminals
-  (`DAKLAK_TERMINAL_TIER`).
-
-See [Backspace tiers](backspace-tiers.md) and [Compositor quirks](compositor-quirks.md)
-for why these exist.
-
 ## Tests
 
 ```sh

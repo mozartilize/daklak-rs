@@ -53,11 +53,17 @@ input APIs, not the IBus engine path.
 
 ## Terminals — forwarded-key routing
 
-**Decision:** Clients with the terminal content purpose default to forwarded-key
-routing, regardless of surrounding-text. Surrounding-text can self-emit-loop and
-drop commits in a terminal's PTY, while device-level backspace can race the
-terminal's own read loop. Users can override per session with
-`DAKLAK_TERMINAL_TIER`, or per configuration with `terminal_override`.
+**Decision:** Terminals are not special-cased at capability detection. A
+terminal that advertises an empty surrounding-text frame (foot on KWin) is
+initially detected as Tier 1 `SurroundingText`, then the **runtime ST→FK
+liveness downgrade** takes over: the watchdog sees dead surrounding-text frames
+(`text="" cursor=0`) during the first non-destructive keystrokes — KWin re-emits
+several per keystroke, so the strike limit is reached within the first letter or
+two — and downgrades to `ForwardKey` *before* the first `delete_surrounding_text`
+is issued. Because Vietnamese Telex words begin with base letters that commit
+with no delete, no surrounding-text delete ever reaches the PTY, so there is no
+self-emit-loop or dropped commit. On wlroots, terminals (foot, Ghostty) send no
+surrounding-text at all and resolve directly to `ForwardKey`.
 
 ## Firefox contenteditable: stale-echo delete bypass
 
@@ -129,11 +135,10 @@ client should be fixed upstream.
 ## A note on philosophy
 
 daklak's bias is to keep the protocol path correct and **not** accumulate per-app
-hacks. The handful of per-app overrides that do exist
-([backspace tiers](backspace-tiers.md#per-app-overrides)) are deliberate,
-narrowly-scoped responses to concrete upstream bugs — not a general escape
-hatch. When a new client misbehaves, first confirm whether a correctly-behaving
-client uses the same path before adding any special case.
+hacks. The quirk responses documented here are deliberate, narrowly-scoped
+responses to concrete upstream bugs — not a general escape hatch. When a new
+client misbehaves, first confirm whether a correctly-behaving client uses the
+same path before adding any special case.
 
 ## Next
 

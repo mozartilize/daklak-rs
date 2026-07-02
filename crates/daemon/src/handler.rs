@@ -77,10 +77,6 @@ pub struct Daemon {
 
     pub router: Router,
 
-    /// Forced tier for `purpose == PURPOSE_TERMINAL`, read once from
-    /// `DAKLAK_TERMINAL_TIER` at startup. None → detect_method default.
-    pub terminal_override: Option<BackspaceMethod>,
-
     /// Shared on/off flag — written by the control task, read each keystroke.
     pub enabled: Arc<AtomicBool>,
 
@@ -107,35 +103,12 @@ impl Daemon {
         enabled: Arc<AtomicBool>,
         config_change_rx: tokio::sync::watch::Receiver<control::ConfigChange>,
     ) -> Self {
-        let terminal_override = match std::env::var("DAKLAK_TERMINAL_TIER")
-            .ok()
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("surrounding") | Some("surrounding_text") | Some("tier1") => {
-                tracing::info!(
-                    "DAKLAK_TERMINAL_TIER=surrounding → terminals route to Tier 1 SurroundingText"
-                );
-                Some(BackspaceMethod::SurroundingText)
-            }
-            Some("forward") | Some("forward_key") | Some("tier2") | Some("") | None => None,
-            Some(other) => {
-                tracing::warn!(
-                    value = other,
-                    "DAKLAK_TERMINAL_TIER unrecognized; falling back to default (ForwardKey)"
-                );
-                None
-            }
-        };
-
         let initial_method = config.method;
         let initial_modern_style = config.modern_style;
 
         Self {
             config,
             router: Router::new(),
-            terminal_override,
             enabled,
             config_change_rx,
             last_config: control::ConfigChange {
@@ -147,9 +120,7 @@ impl Daemon {
 
     pub(crate) fn detect_capability(&self, frame: &FrameSnapshot) -> BackspaceMethod {
         let probe = CapabilityProbe {
-            purpose: frame.purpose,
             surrounding_text_seen: frame.surrounding_text.is_some(),
-            terminal_override: self.terminal_override,
         };
         detect_method(&probe)
     }
@@ -536,12 +507,33 @@ mod tests {
         }
 
         #[test]
-        fn detect_capability_terminal_defaults_to_forward_key() {
-            // Terminal purpose (13) with no override resolves to ForwardKey
-            // regardless of surrounding_text presence.
-            let d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
+        fn detect_capability_present_surrounding_is_surrounding_text() {
+            // A present surrounding_text frame at activate resolves to
+            // SurroundingText — even for a terminal purpose (13), which is no
+            // longer special-cased. Terminals whose frames stay dead (foot on
+            // KWin) are caught later by the runtime ST→FK liveness downgrade
+            // before any delete_surrounding_text is issued.
+            let d = Daemon::new(
+                Config::default(),
+                Arc::new(AtomicBool::new(true)),
+                super::super::noop_config_rx(),
+            );
             let mut f = frame("", 0, 0);
             f.purpose = 13;
+            assert_eq!(d.detect_capability(&f), BackspaceMethod::SurroundingText);
+        }
+
+        #[test]
+        fn detect_capability_absent_surrounding_is_forward_key() {
+            // No surrounding_text frame at activate → ForwardKey (wlroots
+            // terminals such as foot/ghostty land here directly).
+            let d = Daemon::new(
+                Config::default(),
+                Arc::new(AtomicBool::new(true)),
+                super::super::noop_config_rx(),
+            );
+            let mut f = frame("", 0, 0);
+            f.surrounding_text = None;
             assert_eq!(d.detect_capability(&f), BackspaceMethod::ForwardKey);
         }
 

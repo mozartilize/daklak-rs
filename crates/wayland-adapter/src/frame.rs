@@ -30,9 +30,9 @@ impl DoneFrame {
 
     /// Called when a deactivate frame applies — the next activate is a fresh
     /// text-input session and must not inherit the previous app's purpose.
-    /// Without this, e.g. focusing chromium right after foot keeps purpose=13
-    /// (PURPOSE_TERMINAL) and mis-routes chromium through the terminal arm of
-    /// `detect_method`.
+    /// Nothing routes on `purpose` any more, but it is still logged per frame;
+    /// clearing it here keeps that diagnostic accurate (e.g. focusing chromium
+    /// right after foot must not keep the stale purpose=13 terminal hint).
     pub fn end_session(&mut self) {
         self.purpose = 0; // PURPOSE_NORMAL default
     }
