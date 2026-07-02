@@ -49,27 +49,6 @@ pub struct Config {
     #[serde(default)]
     pub log_modules: Vec<String>,
 
-    /// Apps that never advertise `zwp_text_input_v3` (Qt5,
-    /// XWayland-via-virtual-keyboard, etc.) — daklak synthesizes an
-    /// "activate" via Sway IPC focus polling and routes them through
-    /// Tier 4 VkOnly: all output via `vk_key` using daklak's
-    /// synthesized Vietnamese keymap. Match is case-insensitive on
-    /// `app_id`. Env override `DAKLAK_FORCE_VK_ONLY_APPS` replaces this
-    /// list.
-    #[serde(default)]
-    pub force_vk_only_apps: Vec<String>,
-
-    /// When true, the Sway IPC focus poller treats any XWayland-backed
-    /// focused window as if it were on `force_vk_only_apps` — bootstrap
-    /// a synthetic VkOnly session for it. Useful as a blanket policy
-    /// when most XWayland apps benefit from Tier 4 routing (OnlyOffice,
-    /// XWayland-bridged Qt5, JetBrains IDEs in X mode, etc.) without
-    /// the user having to enumerate every WM_CLASS. Env override
-    /// `DAKLAK_AUTO_VK_ONLY_XWAYLAND` (any non-empty/non-"0"/non-"false"
-    /// value enables).
-    #[serde(default)]
-    pub auto_vk_only_for_xwayland: bool,
-
     /// Master switch for evdev-grab mode. When true, daklak opens
     /// `/dev/input/event*` devices and takes a kernel-level `EVIOCGRAB`
     /// at startup, acquiring all physical keyboards for exclusive use.
@@ -122,8 +101,6 @@ impl Default for Config {
             log_level: default_log_level(),
             log_path: default_log_path(),
             log_modules: Vec::new(),
-            force_vk_only_apps: Vec::new(),
-            auto_vk_only_for_xwayland: true,
             enable_evdev_grab: false,
             bracket_shortcuts: false,
             enable_ibus: false,
@@ -166,10 +143,6 @@ impl Config {
             };
         }
 
-        if let Ok(apps) = std::env::var("DAKLAK_FORCE_VK_ONLY_APPS") {
-            cfg.force_vk_only_apps = parse_app_list(&apps);
-        }
-
         if let Ok(v) = std::env::var("DAKLAK_ENABLE_WAYLAND") {
             cfg.enable_wayland = matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -187,13 +160,6 @@ impl Config {
 
         if let Ok(v) = std::env::var("DAKLAK_LOG_MODULES") {
             cfg.log_modules = parse_directive_list(&v);
-        }
-
-        if let Ok(v) = std::env::var("DAKLAK_AUTO_VK_ONLY_XWAYLAND") {
-            cfg.auto_vk_only_for_xwayland = matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
         }
 
         if let Ok(v) = std::env::var("DAKLAK_ENABLE_EVDEV_GRAB") {
@@ -223,8 +189,6 @@ impl Config {
                 "1" | "true" | "yes" | "on"
             );
         }
-
-        cfg.force_vk_only_apps = canonicalize_app_list(cfg.force_vk_only_apps);
 
         Ok(cfg)
     }
@@ -256,29 +220,12 @@ impl Config {
     }
 }
 
-/// Parse a comma-separated env-var list into canonical app_id entries.
-fn parse_app_list(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect()
-}
-
 /// Parse a comma-separated list of logging directives.
 fn parse_directive_list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .collect()
-}
-
-/// Normalize a user-supplied list (TOML): trim, drop empties, lowercase.
-fn canonicalize_app_list(list: Vec<String>) -> Vec<String> {
-    list.into_iter()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
         .collect()
 }
 
@@ -295,33 +242,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_app_list_trims_and_lowercases() {
-        let r = parse_app_list("  Chromium , com.MITCHELLH.ghostty  ,, KeePassXC");
-        assert_eq!(r, vec!["chromium", "com.mitchellh.ghostty", "keepassxc"]);
-    }
-
-    #[test]
-    fn parse_app_list_empty_input_yields_empty() {
-        assert!(parse_app_list("").is_empty());
-        assert!(parse_app_list("   ").is_empty());
-        assert!(parse_app_list(",,,").is_empty());
-    }
-
-    #[test]
-    fn canonicalize_app_list_trims_and_lowercases() {
-        let r = canonicalize_app_list(vec![
-            "  Chromium  ".to_owned(),
-            "".to_owned(),
-            "ONLYOFFICE".to_owned(),
-            "\tkeepassxc ".to_owned(),
-        ]);
-        assert_eq!(r, vec!["chromium", "onlyoffice", "keepassxc"]);
-    }
-
-    #[test]
-    fn auto_vk_only_for_xwayland_defaults_enabled() {
-        let cfg = Config::default();
-        assert!(cfg.auto_vk_only_for_xwayland);
+    fn parse_directive_list_trims_and_preserves_case() {
+        let r = parse_directive_list("  daklak=Debug , viet_ime=info  ,,");
+        assert_eq!(r, vec!["daklak=Debug", "viet_ime=info"]);
     }
 
     #[test]

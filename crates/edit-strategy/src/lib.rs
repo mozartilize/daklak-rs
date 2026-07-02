@@ -4,7 +4,6 @@ pub mod shadow;
 mod forward_key;
 mod surrounding;
 pub mod uinput_device;
-mod vk_only;
 
 pub use capability::{detect_method, CapabilityProbe};
 pub use shadow::ShadowBuffer;
@@ -18,12 +17,6 @@ use bitflags::bitflags;
 pub enum BackspaceMethod {
     SurroundingText, // Tier 1 — delete_surrounding_text
     ForwardKey,      // Tier 2 — zwp_virtual_keyboard_v1 synthetic BS
-    /// Tier 4 (VkOnly) — everything via `zwp_virtual_keyboard_v1::key()`,
-    /// using daklak's synthesized xkb keymap that maps spare evdev slots
-    /// (200+) to Vietnamese precomposed chars. No `commit_string`, no
-    /// `zwp_text_input_v3` — usable for clients that never advertise
-    /// text-input-v3 (Qt5/XWayland-via-vk).
-    VkOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,9 +159,6 @@ impl Strategy {
                     sink,
                     false,
                 );
-            }
-            BackspaceMethod::VkOnly => {
-                vk_only::apply(&mut self.shadow, backspaces, commit, time, sink);
             }
         }
     }
@@ -403,64 +393,6 @@ mod tests {
         let mut sink = MockSink::default();
         s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
         assert_eq!(s.shadow.text(), "abâ");
-    }
-
-    // ── Tier 4 — VkOnly ──────────────────────────────────────────────
-
-    #[test]
-    fn tier4_single_backspace_and_commit() {
-        let mut s = Strategy::new(BackspaceMethod::VkOnly);
-        s.shadow.append("a");
-        let mut sink = MockSink::default();
-        s.apply(1, "â", 7, 42, &mut sink, DeleteUnit::Bytes);
-        assert_eq!(
-            sink.calls,
-            vec![
-                Call::VkKey(42, 14, KeyState::Pressed),
-                Call::VkKey(42, 14, KeyState::Released),
-                Call::VkCommitChar(42, 'â'),
-            ]
-        );
-        assert!(!sink
-            .calls
-            .iter()
-            .any(|c| matches!(c, Call::CommitString(_))));
-        assert!(!sink.calls.iter().any(|c| matches!(c, Call::Commit(_))));
-        assert_eq!(s.shadow.text(), "â");
-    }
-
-    #[test]
-    fn tier4_multichar_commit_each_via_vk() {
-        let mut s = Strategy::new(BackspaceMethod::VkOnly);
-        s.shadow.append("ph");
-        let mut sink = MockSink::default();
-        s.apply(0, "ởn", 0, 5, &mut sink, DeleteUnit::Bytes);
-        assert_eq!(
-            sink.calls,
-            vec![Call::VkCommitChar(5, 'ở'), Call::VkCommitChar(5, 'n'),]
-        );
-        assert_eq!(s.shadow.text(), "phởn");
-    }
-
-    #[test]
-    fn tier4_three_backspaces() {
-        let mut s = Strategy::new(BackspaceMethod::VkOnly);
-        s.shadow.append("abc");
-        let mut sink = MockSink::default();
-        s.apply(3, "x", 1, 0, &mut sink, DeleteUnit::Bytes);
-        assert_eq!(
-            sink.calls,
-            vec![
-                Call::VkKey(0, 14, KeyState::Pressed),
-                Call::VkKey(0, 14, KeyState::Released),
-                Call::VkKey(0, 14, KeyState::Pressed),
-                Call::VkKey(0, 14, KeyState::Released),
-                Call::VkKey(0, 14, KeyState::Pressed),
-                Call::VkKey(0, 14, KeyState::Released),
-                Call::VkCommitChar(0, 'x'),
-            ]
-        );
-        assert_eq!(s.shadow.text(), "x");
     }
 
     // ── Shadow invalidation ───────────────────────────────────────────────────

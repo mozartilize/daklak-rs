@@ -24,7 +24,11 @@ source as authoritative for names and module layout.
 | ---- | --------- | ----------- |
 | 1 | `delete_surrounding_text` over the text-input protocol | cleanest — the app deletes exactly the range we name |
 | 2 | synthesize `BackSpace` key events, then emit the replacement through one whole backend-selected channel | good — but relies on the client treating forwarded deletes as edits |
-| 4 | synthesize a daklak xkb keymap at spare keycodes and drive it via the virtual keyboard | last resort for clients with no text-input support |
+
+`BackspaceMethod` has exactly two variants: `SurroundingText` (Tier 1) and
+`ForwardKey` (Tier 2). There is no separate "VkOnly" tier — the
+synthetic-keymap virtual-keyboard emit that used to be its own tier is now one
+of ForwardKey's replacement channels (see below).
 
 ### Why these tiers?
 
@@ -32,12 +36,20 @@ source as authoritative for names and module layout.
   support — it is unambiguous and atomic.
 - **Tier 2** is the general default when there's no surrounding-text channel:
   forward backspaces as key events, then emit the replacement as one whole
-  string through a single channel. KWin/im-v1 uses the keysym channel;
-  im-v2/vk can use the synthetic virtual-keyboard channel when text-input is
-  stale; IBus uses one whole `CommitText` after the forwarded deletes.
-- **Tier 4** handles clients that expose no text-input protocol at all (some Qt
-  applications): daklak builds its own keymap so it can emit arbitrary
-  characters as keycodes through a virtual keyboard.
+  string through a single channel. It has three possible replacement channels,
+  chosen by the sink, never split within one replacement:
+  - **whole `commit_string`** — for clients with a working text-input commit
+    (e.g. foot on wlroots/im-v2, where `commit_string_functional` is true);
+  - **keysym channel** — KWin/im-v1 emits the whole replacement through
+    `zwp_input_method_context_v1::keysym`;
+  - **virtual-keyboard synthetic keymap** — im-v2/vk emits each replacement
+    char as a keycode against daklak's synthesized xkb keymap (Vietnamese
+    precomposed chars at spare keycodes). This is the channel that reaches
+    clients with **no usable text-input at all** (some Qt apps, XWayland apps
+    such as OnlyOffice, wlroots terminals such as Ghostty). Such clients never
+    fire an `Activate`, so daklak synthesizes a ForwardKey session from focus
+    metadata with `commit_string_functional = false`, which forces this
+    channel. IBus uses one whole `CommitText` after the forwarded deletes.
 
 ## Selection logic
 
@@ -51,8 +63,15 @@ capabilities. The important rules:
   `terminal_override` (or the `DAKLAK_TERMINAL_TIER` env var) says otherwise.
   Surrounding-text would self-emit-loop and drop commits in a PTY. See
   [Compositor quirks](compositor-quirks.md#terminals--forwarded-key-routing).
-- **VkOnly requires a virtual-keyboard-capable transport.** If that channel is
-  unavailable, the strategy must choose another feasible tier.
+- **No text-input at all → synthesized ForwardKey.** Clients that never enable
+  text-input fire no `Activate`, so capability detection never runs. When the
+  transport exposes a virtual keyboard, daklak synthesizes a ForwardKey session
+  from focus metadata with `commit_string_functional = false`, routing the
+  replacement through the virtual-keyboard synthetic keymap. A real `Activate`
+  always wins and replaces the synthesized session.
+- **The synthetic-keymap channel requires a virtual-keyboard-capable
+  transport.** On the KWin/Mutter im-v1 relay (no vk keyboard), that channel is
+  unavailable, so ForwardKey emits through the keysym channel instead.
 - **Default is ForwardKey.** With no surrounding text and nothing special, Tier 2.
 
 Tier output is delivered through the `OutputSink` trait, so the selection and
@@ -63,9 +82,8 @@ execution are independent of which transport is live.
 Some clients misbehave in tier-specific ways, so configuration can pin behavior
 per application:
 
-- **force-vk-only apps** — force Tier 4 for clients with no usable text-input
-  path.
-- **terminal override** — pin a specific method for terminals.
+- **terminal override** — pin a specific method for terminals
+  (`DAKLAK_TERMINAL_TIER`).
 
 See [Compositor quirks](compositor-quirks.md) for the concrete behaviors that
 motivate each override.

@@ -3,7 +3,7 @@
 //! Owns:
 //! - `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` proxies
 //! - xkb keymap loading + char translation
-//! - Daklak synthetic keymap upload to vk (Tier 4 VkOnly enablement)
+//! - Daklak synthetic keymap upload to vk (key-channel Vietnamese emit)
 //! - Synthetic-mods echo suppression
 //! - Focus tracking via `wlr-foreign-toplevel-management-v1` + X11 bridge
 //! - `last_forwarded_key` / `last_forwarded_release` bookkeeping for the tail-char-drop fix
@@ -62,8 +62,9 @@ pub use viet_ime_edit_strategy::{BackspaceMethod, KeyState, ModifierState, Outpu
 
 /// Which input-method protocol the connected compositor speaks.
 /// Set during `connect()` and surfaced via `AdapterCtx::protocol()`.
-/// The daemon matches on this to adjust tier routing (e.g. VkOnly is
-/// unavailable on v1 because there's no separate vk keyboard).
+/// The daemon matches on this to adjust tier routing (e.g. the key-channel
+/// synthetic-keymap commit is unavailable on v1 because there's no separate
+/// vk keyboard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImProtocol {
     /// `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` — wlroots path.
@@ -86,8 +87,9 @@ pub struct TransportProfile {
     /// `for_protocol` leaves this `None`; `connect()` overwrites it after the
     /// focus probe.
     pub focus: crate::focus::FocusSource,
-    /// `zwp_virtual_keyboard_v1` is available. Required for Tier 2 ForwardKey's
-    /// BS emit on v2 and for Tier 4 VkOnly. False on the v1 IM relay.
+    /// `zwp_virtual_keyboard_v1` is available. Required for ForwardKey's BS
+    /// emit on v2 and for the key-channel synthetic-keymap commit. False on
+    /// the v1 IM relay.
     pub has_vk_keyboard: bool,
     /// Commit chars can be synthesized via `zwp_input_method_context_v1::keysym`
     /// (the v1 terminal path). True on ImV1, false on ImV2.
@@ -395,16 +397,13 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 self.state.last_forwarded_key = Some((key, Instant::now()));
             }
             KeyDecision::Apply {
-                method,
+                // `method` is carried for diagnostics/parity but the emit path
+                // is selected inside the sink via `commit_string_functional`.
+                method: _,
                 backspaces,
                 commit,
             } => {
                 let held_user_kc = self.state.held_user_kc();
-
-                if method == BackspaceMethod::VkOnly {
-                    self.state
-                        .log_duplicate_tail_diagnostic(&commit, backspaces, held_user_kc);
-                }
 
                 let raw_mods = self.state.raw_mods;
                 {
@@ -808,7 +807,8 @@ mod tests {
     #[test]
     fn vk_keyboard_capability_follows_protocol_not_name() {
         // The whole point of #3/#5: feasibility reads the bool, and the bool
-        // differs by protocol — v1 cannot run VkOnly, v2 can.
+        // differs by protocol — v1 cannot run the vk synthetic-keymap commit,
+        // v2 can.
         assert!(!TransportProfile::for_protocol(ImProtocol::ImV1).has_vk_keyboard);
         assert!(TransportProfile::for_protocol(ImProtocol::ImV2).has_vk_keyboard);
     }
@@ -920,15 +920,6 @@ mod tests {
             None,
             "matching release after the press clears the held key"
         );
-    }
-
-    #[test]
-    fn duplicate_tail_diagnostic_accepts_keymap_tail_lookup() {
-        let mut s = AdapterState::new();
-        let spec = crate::keymap::char_to_emit('a').expect("test keymap emits ASCII a");
-        s.last_forwarded_key = Some((spec.keycode, Instant::now()));
-
-        s.log_duplicate_tail_diagnostic("a", 0, s.held_user_kc());
     }
 
     #[test]

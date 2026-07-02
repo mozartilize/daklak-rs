@@ -36,9 +36,9 @@ pub struct Router {
     pub modifiers: ModifierState,
     pub current_active: bool,
 
-    /// True when `current_active` was synthesized by daklak (Tier 4 VkOnly —
-    /// FocusBackend reported a focused toplevel with a virtual keyboard but no
-    /// active text-input session) rather than driven by a compositor
+    /// True when `current_active` was synthesized by daklak (a focused
+    /// toplevel exposed a virtual keyboard but never enabled text-input, so
+    /// no compositor `Activate` fired) rather than driven by a compositor
     /// `zwp_input_method_v2::Activate` event. Real activate always wins.
     pub synthetic_active: bool,
 
@@ -145,20 +145,11 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn detect_capability(
-        &self,
-        frame: &FrameSnapshot,
-        vk_keyboard_available: bool,
-    ) -> BackspaceMethod {
+    pub(crate) fn detect_capability(&self, frame: &FrameSnapshot) -> BackspaceMethod {
         let probe = CapabilityProbe {
             purpose: frame.purpose,
             surrounding_text_seen: frame.surrounding_text.is_some(),
-            app_id: self.router.focused_app_id.clone(),
-            force_vk_only_apps: self.config.force_vk_only_apps.clone(),
             terminal_override: self.terminal_override,
-            // Sourced from `TransportProfile.has_vk_keyboard` by the caller.
-            // `detect_method` clamps VkOnly→ForwardKey when false.
-            vk_keyboard_available,
         };
         detect_method(&probe)
     }
@@ -370,13 +361,15 @@ impl Daemon {
     // ── focus / session lifecycle ──────────────────────────────────────────
 
     /// Bootstrap a synthetic session for evdev-only mode. Sets up a composer
-    /// with VkOnly routing so `handle_char` / `handle_backspace` work without a
-    /// Wayland compositor.
+    /// so `handle_char` / `handle_backspace` work without a Wayland
+    /// compositor. The evdev adapter emits backspaces + the replacement string
+    /// directly via uinput and ignores `BackspaceMethod`, so the tier here is
+    /// only a label.
     #[cfg(feature = "evdev_grab")]
     pub fn activate_evdev(&mut self) {
         let mut c = Composer::new(
             self.config.method.to_engine(),
-            BackspaceMethod::VkOnly,
+            BackspaceMethod::ForwardKey,
             self.config.bracket_shortcuts,
         );
         c.set_modern_style(self.config.modern_style);
@@ -543,29 +536,17 @@ mod tests {
         }
 
         #[test]
-        fn detect_capability_clamps_vk_only_when_transport_lacks_vk() {
-            // force_vk_only_apps would pick VkOnly, but on a transport with no
-            // virtual keyboard (vk_keyboard_available=false, e.g. KWin/ImV1)
-            // detect_capability must resolve to ForwardKey.
-            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
-            d.config.force_vk_only_apps = vec!["chromium".to_owned()];
-            d.router.focused_app_id = Some("chromium".to_owned());
-            let f = frame("", 0, 0);
-
-            assert_eq!(
-                d.detect_capability(&f, false),
-                BackspaceMethod::ForwardKey,
-                "no vk keyboard → VkOnly clamps to ForwardKey"
-            );
-            assert_eq!(
-                d.detect_capability(&f, true),
-                BackspaceMethod::VkOnly,
-                "vk keyboard present → VkOnly stands"
-            );
+        fn detect_capability_terminal_defaults_to_forward_key() {
+            // Terminal purpose (13) with no override resolves to ForwardKey
+            // regardless of surrounding_text presence.
+            let d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
+            let mut f = frame("", 0, 0);
+            f.purpose = 13;
+            assert_eq!(d.detect_capability(&f), BackspaceMethod::ForwardKey);
         }
 
         #[test]
-        fn native_focus_without_text_input_synthesizes_vk_session() {
+        fn native_focus_without_text_input_synthesizes_forward_key_session() {
             let mut daemon = Daemon::new(
                 Config::default(),
                 Arc::new(AtomicBool::new(true)),
@@ -586,10 +567,12 @@ mod tests {
                 daemon.router.focused_app_id.as_deref(),
                 Some("com.mitchellh.ghostty")
             );
-            assert_eq!(
-                daemon.router.composer.as_ref().map(|c| c.method()),
-                Some(BackspaceMethod::VkOnly)
-            );
+            // The synthetic session merges the former Tier 4 VkOnly into
+            // ForwardKey with a dead commit_string, so replacements route
+            // through the virtual keyboard's synthetic keymap.
+            let composer = daemon.router.composer.as_ref().expect("composer");
+            assert_eq!(composer.method(), BackspaceMethod::ForwardKey);
+            assert!(!composer.commit_string_functional);
         }
 
         #[test]

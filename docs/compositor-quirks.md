@@ -12,7 +12,7 @@ not re-litigate or add ad-hoc workarounds beyond what's described here.
 - [GNOME / IBus ForwardKeyEvent fails in Mutter](#gnome--ibus-forwardkeyevent-fails-in-mutter)
 - [Terminals — forwarded-key routing](#terminals--forwarded-key-routing)
 - [Firefox contenteditable: stale-echo delete bypass](#firefox-contenteditable-stale-echo-delete-bypass)
-- [VkOnly crashes some clients](#vkonly-crashes-some-clients)
+- [Synthesized-keymap channel crashes some clients](#synthesized-keymap-channel-crashes-some-clients)
 - [Tail-drop after tone + space](#tail-drop-after-tone--space)
 - [Preedit rendering of forwarded keys](#preedit-rendering-of-forwarded-keys)
 
@@ -92,14 +92,18 @@ KWin/im-v1 terminal paths. KWin/im-v1 keeps the whole replacement on the keysym
 channel because splitting keysym and `commit_string` is not a coherent edit for
 some terminals.
 
-## VkOnly crashes some clients
+## Synthesized-keymap channel crashes some clients
 
-**Behavior:** The Tier 4 synthesized-keymap path (`VkOnly`) crashes
-chromium-class applications.
+**Behavior:** The virtual-keyboard synthesized-keymap replacement channel (the
+keymap-swap emit that ForwardKey uses when no working text-input commit exists)
+crashes some chromium-class applications.
 
-**Resolution:** Those apps are pinned away from the Tier 4 path through
-configuration. Tier 4 itself is reserved for clients that expose no text-input
-protocol and do not crash on the synthesized-keymap path.
+**Resolution:** This channel is only reached automatically where there is no
+usable text-input commit: a client that never enables text-input (session
+synthesized from focus metadata with `commit_string_functional = false`), or a
+client whose surrounding-text bridge proved dead and was downgraded to
+ForwardKey. Clients with a healthy text-input commit keep
+`commit_string_functional = true` and never touch this channel.
 
 ## Tail-drop after tone + space
 
