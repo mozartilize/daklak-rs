@@ -23,7 +23,7 @@ source as authoritative for names and module layout.
 | Tier | Mechanism | Cleanliness |
 | ---- | --------- | ----------- |
 | 1 | `delete_surrounding_text` over the text-input protocol | cleanest — the app deletes exactly the range we name |
-| 2 | synthesize `BackSpace` keysyms through the IM grab / virtual keyboard | good — but relies on the client treating forwarded keys as edits |
+| 2 | synthesize `BackSpace` key events, then emit the replacement through one whole backend-selected channel | good — but relies on the client treating forwarded deletes as edits |
 | 4 | synthesize a daklak xkb keymap at spare keycodes and drive it via the virtual keyboard | last resort for clients with no text-input support |
 
 ### Why these tiers?
@@ -31,7 +31,10 @@ source as authoritative for names and module layout.
 - **Tier 1** is preferred whenever the client advertises surrounding-text
   support — it is unambiguous and atomic.
 - **Tier 2** is the general default when there's no surrounding-text channel:
-  forward backspaces as key events.
+  forward backspaces as key events, then emit the replacement as one whole
+  string through a single channel. KWin/im-v1 uses the keysym channel;
+  im-v2/vk can use the synthetic virtual-keyboard channel when text-input is
+  stale; IBus uses one whole `CommitText` after the forwarded deletes.
 - **Tier 4** handles clients that expose no text-input protocol at all (some Qt
   applications): daklak builds its own keymap so it can emit arbitrary
   characters as keycodes through a virtual keyboard.

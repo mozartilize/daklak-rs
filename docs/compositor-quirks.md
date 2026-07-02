@@ -71,13 +71,14 @@ mutating text ahead of the intended word.
 **Resolution:** Keep spec-correct byte deletes on healthy surrounding-text
 frames. When the Firefox quirk detects a stale correction echo, daklak now
 bypasses `delete_surrounding_text` and emits one ForwardKey Backspace pair per
-requested delete instead (Tier 2 key path). The replacement character is also
-routed through the key channel when possible (vk/keysym), falling back to
-`commit_string` only for chars outside the synthetic key inventory. For
-retroactive reseed sessions this ForwardKey choice is kept sticky, so rapid
-stale cursor shifts cannot alternate between delete channels mid-word. This
-keeps retroactive surrounding-text reseeding but avoids Firefox's mis-targeted
-surrounding deletes and post-first-edit channel desync.
+requested delete instead (Tier 2 key path). Replacement text is emitted as one
+whole string through a single channel: key channel where that fallback is needed
+(vk/keysym), or one whole `commit_string` where text-input commit is the working
+channel. daklak does not split a logical replacement across key events and
+`commit_string`. For retroactive reseed sessions this ForwardKey choice is kept
+sticky, so rapid stale cursor shifts cannot alternate between delete channels
+mid-word. This keeps retroactive surrounding-text reseeding but avoids Firefox's
+mis-targeted surrounding deletes and post-first-edit channel desync.
 
 Implementation note: daemon-local Firefox contenteditable state lives in
 `crates/daemon/src/quirks/firefox.rs`. The ForwardKey bypass is wired in
@@ -86,9 +87,10 @@ Firefox/contenteditable paths consistently echo spec-compliant
 surrounding-text updates, the quirk module and this Composer hook can be
 deleted without touching `crates/engine`.
 
-Validation status: this behavior has been live-validated on wlroots/im-v2.
-KWin/im-v1 uses the same logical routing (ForwardKey delete + key-channel
-commit preference), but has not yet been confirmed by a live repro trace.
+Validation status: this behavior has been live-validated on wlroots/im-v2 and
+KWin/im-v1 terminal paths. KWin/im-v1 keeps the whole replacement on the keysym
+channel because splitting keysym and `commit_string` is not a coherent edit for
+some terminals.
 
 ## VkOnly crashes some clients
 

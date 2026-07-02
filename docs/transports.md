@@ -35,14 +35,18 @@ distinct compositor families through two input-method protocol versions.
 - Uses `zwp_input_method_v2` plus `zwp_virtual_keyboard_v1`.
 - Has a real **virtual keyboard**, so it can drive Tier 2 (`ForwardKey`) and
   Tier 4 (`VkOnly`).
-- Commits text via the commit-string path; daklak's own commit acknowledges the
-  frame (the v2 client does not heartbeat `done` on its own).
+- Commits text via the commit-string path when that channel is healthy;
+  daklak's own commit acknowledges the frame (the v2 client does not heartbeat
+  `done` on its own). When ForwardKey must avoid a stale text-input channel,
+  replacement text can instead go through the virtual keyboard's synthetic
+  keymap as one whole key-channel replacement.
 
 ### Input-method v1 (KWin / Plasma)
 
 - Uses `zwp_input_method_v1` via the input-method context.
-- **No** virtual keyboard exposed; instead it commits characters through the
-  context **keysym** path.
+- **No** virtual keyboard exposed; ForwardKey replacement text is kept on the
+  context **keysym** path as one whole replacement. daklak does not split one
+  replacement between keysym and `commit_string` on this transport.
 - The v1 protocol applies updates immediately per frame and heartbeats the
   text-input-v3 client through its commit state — it does not batch via a `done`
   event the way v2 does.
@@ -71,7 +75,10 @@ daklak registers as a standard **IBus engine** over D-Bus.
 
 - Connects to `ibus-daemon` and serves the engine interface
   (`process_key_event`, focus in/out, etc.).
-- Commits text using the `IBusText` GVariant encoding.
+- Commits text using the `IBusText` GVariant encoding. ForwardKey deletes are
+  sent as `ForwardKeyEvent` Backspace signals, but replacement text stays one
+  whole `CommitText`; IBus does not provide a universal Unicode key-channel
+  replacement equivalent to Wayland `zwp_virtual_keyboard_v1`.
 - Launched either with `daklak --ibus` or by `ibus-daemon` via the IBus
   component exec line; the `--ibus` flag forces IBus mode regardless of config.
 
@@ -88,9 +95,9 @@ ibus restart
 
 Log out and back in if GNOME Settings still does not show Daklak.
 
-> **Important limitation:** GNOME's IBus/Mutter path does not provide a usable
-> ForwardKey fallback for deletion. Use surrounding-text delete when available;
-> otherwise native-client backspace on GNOME remains unsolved — see
+> **Compatibility note:** ForwardKey on IBus depends on the compositor/toolkit
+> honoring `ForwardKeyEvent` Backspace. daklak preserves signal ordering with a
+> barrier before the whole replacement `CommitText`; see
 > [Compositor quirks](compositor-quirks.md#gnome--ibus-forwardkeyevent-fails-in-mutter).
 
 ## evdev
