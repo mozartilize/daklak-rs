@@ -338,16 +338,28 @@ impl AdapterHandler for Daemon {
 
         let auto_xwayland_vk_only =
             self.config.auto_vk_only_for_xwayland && is_xwayland && app_id.is_some();
-        let vk_only_matched = in_force_vk_only || auto_xwayland_vk_only;
+        // Native Wayland clients may focus and deliver IM keyboard-grab keys
+        // without ever enabling text-input. With a real virtual keyboard
+        // available, synthesize a key-channel session so terminals such as
+        // Ghostty compose without requiring force_vk_only_apps.
+        let auto_no_text_input_focus_vk_only = app_id.is_some();
+        let vk_only_matched =
+            in_force_vk_only || auto_xwayland_vk_only || auto_no_text_input_focus_vk_only;
         let vk_available = ctx.profile().has_vk_keyboard;
         let matched = vk_only_matched && vk_available;
 
-        if matched && !self.router.current_active {
+        let synthetic_target_changed = self.router.synthetic_active
+            && matched
+            && self.router.focused_app_id != app_id;
+
+        if matched && (!self.router.current_active || synthetic_target_changed) {
             let id = app_id.clone().unwrap_or_default();
             let reason = if in_force_vk_only {
                 "force_vk_only_apps"
-            } else {
+            } else if auto_xwayland_vk_only {
                 "auto_vk_only_for_xwayland"
+            } else {
+                "auto_no_text_input_focus"
             };
 
             tracing::info!(app_id = %id, reason, is_xwayland,

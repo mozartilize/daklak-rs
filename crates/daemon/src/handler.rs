@@ -37,8 +37,8 @@ pub struct Router {
     pub current_active: bool,
 
     /// True when `current_active` was synthesized by daklak (Tier 4 VkOnly —
-    /// FocusBackend reported a focused toplevel matching `force_vk_only_apps`
-    /// / `auto_vk_only_for_xwayland`) rather than driven by a compositor
+    /// FocusBackend reported a focused toplevel with a virtual keyboard but no
+    /// active text-input session) rather than driven by a compositor
     /// `zwp_input_method_v2::Activate` event. Real activate always wins.
     pub synthetic_active: bool,
 
@@ -562,6 +562,56 @@ mod tests {
                 BackspaceMethod::VkOnly,
                 "vk keyboard present → VkOnly stands"
             );
+        }
+
+        #[test]
+        fn native_focus_without_text_input_synthesizes_vk_session() {
+            let mut daemon = Daemon::new(
+                Config::default(),
+                Arc::new(AtomicBool::new(true)),
+                super::super::noop_config_rx(),
+            );
+            let mut state = AdapterState::new();
+            let mut ctx = AdapterCtx { state: &mut state };
+
+            daemon.on_focus_changed(
+                &mut ctx,
+                Some("com.mitchellh.ghostty".to_owned()),
+                false,
+            );
+
+            assert!(daemon.router.current_active);
+            assert!(daemon.router.synthetic_active);
+            assert_eq!(
+                daemon.router.focused_app_id.as_deref(),
+                Some("com.mitchellh.ghostty")
+            );
+            assert_eq!(
+                daemon.router.composer.as_ref().map(|c| c.method()),
+                Some(BackspaceMethod::VkOnly)
+            );
+        }
+
+        #[test]
+        fn focus_without_vk_does_not_synthesize_session() {
+            let mut daemon = Daemon::new(
+                Config::default(),
+                Arc::new(AtomicBool::new(true)),
+                super::super::noop_config_rx(),
+            );
+            let mut state = AdapterState::new();
+            state.profile.has_vk_keyboard = false;
+            let mut ctx = AdapterCtx { state: &mut state };
+
+            daemon.on_focus_changed(
+                &mut ctx,
+                Some("com.mitchellh.ghostty".to_owned()),
+                false,
+            );
+
+            assert!(!daemon.router.current_active);
+            assert!(!daemon.router.synthetic_active);
+            assert!(daemon.router.composer.is_none());
         }
 
         #[test]
