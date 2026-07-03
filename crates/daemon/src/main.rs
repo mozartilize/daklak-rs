@@ -2,6 +2,7 @@ mod backend;
 mod composer;
 mod config;
 mod control;
+mod evdev_hooks;
 mod handler;
 mod ipc;
 mod logging;
