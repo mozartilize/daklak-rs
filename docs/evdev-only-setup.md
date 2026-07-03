@@ -18,10 +18,22 @@ platform-specific steps to install it.
 
 ## What evdev-only mode is
 
-Daklak's evdev-only mode (`enable_wayland = false && enable_evdev_grab = true`)
-grabs every keyboard via `/dev/input/event*`, runs the engine on raw keycodes,
-and emits both pass-through ASCII and Vietnamese precomposed characters through
-a daklak-owned `daklak` uinput device.
+Daklak's evdev mode (`enable_evdev_grab = true`) grabs every keyboard via
+`/dev/input/event*`, runs the engine on raw keycodes, and emits both
+pass-through ASCII and Vietnamese precomposed characters through a
+daklak-owned `daklak` uinput device.
+
+Evdev mode can be the **startup backend** (`enable_wayland = false`,
+`enable_evdev_grab = true`) or switched to at **runtime** from the native
+desktop backend (IBus/Wayland):
+
+```
+daklak backend evdev       # switch to evdev at runtime
+daklak backend native      # switch back
+```
+
+The tray icon also shows an "Enable evdev" checkbox when evdev-grab support
+is compiled in.
 
 Compared to Wayland mode, no `zwp_input_method_v2` is involved — it works on any
 compositor (sway, scroll, KWin, Mutter, X11) as long as keyboard-class
@@ -363,7 +375,40 @@ stopped (it only redefines high IME slot keycodes that normal typing never
 emits). Re-launch daklak and it works again; clear the option with the revert
 command above if you want it gone.
 
-## Troubleshooting
+## Setup hooks
+
+When switching from a native desktop backend (IBus/Wayland) to evdev at
+runtime, daklak can run **setup hooks** — shell commands that prepare the
+environment (e.g. apply the xkb keymap, toggle `xkbcomp`, or configure an
+xkb option). On switch-back to the native backend daklak runs corresponding
+**cleanup hooks**.
+
+Hooks are configured in the config file:
+
+```toml
+evdev_grab_hooks = [
+    # Setup: keymap on, ibus off, …
+    "xkbcomp /tmp/daklak.xkb $DISPLAY",
+    # Cleanup: keymap off, ibus on, …
+    "setxkbmap us",
+]
+```
+
+Hook names must contain only ASCII alphanumeric characters, underscores, and
+hyphens — no whitespace, path separators, or shell syntax. The hooks are
+executed in order via `std::process::Command` (never through a shell).
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Applied successfully |
+| `10` | Skipped (not applicable — no error) |
+| other | Failure — logged but does not block evdev activation |
+
+### Rollback recovery
+
+If `daklak` is killed (SIGKILL, power loss) while evdev hooks are active, a
+**rollback marker** file is left on disk. On the next startup daklak detects
+the stale marker and runs the cleanup hooks automatically.
 
 **Daklak exits with "no keyboards grabbed".** Check `input` group membership:
 `groups | grep input`. If absent: `sudo usermod -aG input $USER` and re-login.
