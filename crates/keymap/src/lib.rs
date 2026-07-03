@@ -46,10 +46,17 @@ pub const BASE_EVDEV: u32 = SAFE_KEYCODES[0] as u32;
 /// **Why this kc set**: two zones with no userspace handler and no
 /// presence on US/EU keyboards:
 ///
-/// - **IME zone** (kc 85,86,89-95): `KEY_ZENKAKUHANKAKU`, `KEY_102ND`,
+/// - **IME zone** (kc 85,86,89-94): `KEY_ZENKAKUHANKAKU`, `KEY_102ND`,
 ///   `KEY_RO`, `KEY_KATAKANA`, `KEY_HIRAGANA`, `KEY_KATAKANAHIRAGANA`,
-///   `KEY_MUHENKAN`, `KEY_KPJPCOMMA`. `KEY_HENKAN` (92) is reserved
-///   below as the `ISO_Level5_Shift` modifier_map binding.
+///   `KEY_MUHENKAN`. `KEY_HENKAN` (92) is reserved below as the
+///   `ISO_Level5_Shift` modifier_map binding. `KEY_KPJPCOMMA` (95) is
+///   deliberately avoided — Chromium/Electron clients (e.g. VSCode) have
+///   no DomCode for evdev 95, so keysyms bound there never become text
+///   there (see the `SAFE_KEYCODES` slot-7 note).
+///
+/// - **International/Korean** (kc 122,123,124): `KEY_HANGEUL`,
+///   `KEY_HANJA`, `KEY_YEN`. No US keyboard produces them and no system
+///   daemon listens; all three have live Chromium DomCode entries.
 ///
 /// - **F13-F21** (kc 183-191): extended-function range. Default
 ///   desktops have no bindings. F22-F24 (192-194) intentionally
@@ -68,15 +75,23 @@ pub const BASE_EVDEV: u32 = SAFE_KEYCODES[0] as u32;
 /// - 246 `KEY_WWAN`, 247 `KEY_RFKILL` → wireless toggles.
 ///
 /// **Tradeoff — real-keyboard collision**: Japanese keyboards produce
-/// kc 85-95; some EU keyboards have `KEY_102ND` (86); extended kbs
-/// have F13+. If a user fires one of these on their real device, the
+/// kc 85-94 and 122-124; some EU keyboards have `KEY_102ND` (86);
+/// extended kbs have F13+. If a user fires one of these on their real
+/// device, the
 /// real-kb's keymap decodes it (their pc+us+inet etc., NOT daklak's
 /// per-device keymap). Daklak's emit windows are guarded by EVIOCGRAB
 /// (evdev-only mode) or the wayland keyboard grab (wayland-mode), so
 /// no race during commit.
 pub const SAFE_KEYCODES: &[u16] = &[
-    // IME zone (kc 85,86,89-95 with 92=HENKAN reserved for L5 mod binding).
-    85, 86, 89, 90, 91, 93, 94, 95,
+    // IME zone (kc 85,86,89-94 with 92=HENKAN reserved for L5 mod binding).
+    // Slot 7 uses KEY_YEN (124) rather than KEY_KPJPCOMMA (95): Chromium/
+    // Electron (e.g. VSCode) has no DomCode for evdev 95 — it lives on the
+    // commented-out INTERNATIONAL6 line in Chromium's dom_code_data.inc, so
+    // keysyms bound to it never become text in Chromium clients (native xkb
+    // clients like foot/gedit read the keysym directly and are unaffected).
+    // KEY_YEN maps to Chromium's live IntlYen DomCode, like KEY_RO (89) and
+    // KEY_102ND (86), so the i-family (ì í ỉ ĩ) renders everywhere.
+    85, 86, 89, 90, 91, 93, 94, 124,
     // F13-F19 = 183..189. F20 (190) and F21 (191) excluded — empirically
     // some X11 sessions (observed on xfce4) silently filter X11 keycode
     // 198/199 even when a matching keysym is bound. We don't know which
@@ -85,7 +100,8 @@ pub const SAFE_KEYCODES: &[u16] = &[
     183, 184, 185, 186, 187, 188, 189,
     // KEY_HANGEUL (122) and KEY_HANJA (123) — Korean IME keys, no US
     // keyboard produces them, no system daemon listens. Replace the
-    // dropped F20/F21 slots one-for-one.
+    // dropped F20/F21 slots one-for-one. (KEY_YEN=124 is used above for
+    // slot 7; all three are the international/Korean zone.)
     122, 123,
 ];
 
@@ -96,7 +112,7 @@ pub const SAFE_KEYCODES: &[u16] = &[
 /// `<DK##>` aliases. Reusing the existing names avoids the redefinition
 /// warnings `xkbcomp … $DISPLAY` emits when loading session-wide on X11.
 pub const SAFE_KEYCODE_NAMES: &[&str] = &[
-    "ZEHA", "LSGT", "AB11", "KATA", "HIRA", "HKTG", "MUHE", "JPCM",
+    "ZEHA", "LSGT", "AB11", "KATA", "HIRA", "HKTG", "MUHE", "AE13",
     "FK13", "FK14", "FK15", "FK16", "FK17", "FK18", "FK19",
     "HNGL", "HJCV",
 ];
@@ -497,16 +513,17 @@ mod tests {
 
     #[test]
     fn safe_keycodes_in_expected_zones() {
-        // IME zone (85-95 excluding 92), F13-F19 (183-189), or Korean IME
-        // pair (KEY_HANGEUL=122, KEY_HANJA=123). F20/F21 deliberately
-        // dropped — see SAFE_KEYCODES doc.
+        // IME zone (85-94 excluding 92), F13-F19 (183-189), or the
+        // international/Korean group (KEY_HANGEUL=122, KEY_HANJA=123,
+        // KEY_YEN=124). F20/F21 and KEY_KPJPCOMMA=95 deliberately dropped
+        // — see SAFE_KEYCODES doc.
         for &kc in SAFE_KEYCODES {
-            let in_ime = (85..=95).contains(&kc) && kc != 92;
+            let in_ime = (85..=94).contains(&kc) && kc != 92;
             let in_f_keys = (183..=189).contains(&kc);
-            let in_korean = kc == 122 || kc == 123;
+            let in_intl = kc == 122 || kc == 123 || kc == 124;
             assert!(
-                in_ime || in_f_keys || in_korean,
-                "keycode {kc} outside expected IME / F13-F19 / Korean safe zones"
+                in_ime || in_f_keys || in_intl,
+                "keycode {kc} outside expected IME / F13-F19 / international safe zones"
             );
         }
     }
