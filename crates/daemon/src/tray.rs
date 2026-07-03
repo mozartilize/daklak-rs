@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 
 use ksni::TrayMethods;
 
+use tokio::sync::watch;
+
+use crate::backend::{BackendTarget, InputBackend};
 use crate::config::{Config, MethodConfig};
 use crate::control::{CmdKind, CmdTx, Command, ConfigChange, StateRx};
 
@@ -24,6 +27,7 @@ pub struct DaklakTray {
     pub enabled: bool,
     pub method: MethodConfig,
     pub modern_style: bool,
+    pub backend: InputBackend,
 }
 
 impl ksni::Tray for DaklakTray {
@@ -59,7 +63,7 @@ impl ksni::Tray for DaklakTray {
             MethodConfig::Viqr => 2,
         };
 
-        vec![
+        let mut items: Vec<ksni::MenuItem<Self>> = vec![
             StandardItem {
                 label: label.into(),
                 activate: Box::new(move |t: &mut Self| fire(&t.cmd_tx, target)),
@@ -118,13 +122,33 @@ impl ksni::Tray for DaklakTray {
                 ..Default::default()
             }
             .into(),
+        ];
+        if cfg!(feature = "evdev_grab") {
+            let evdev_active = self.backend == InputBackend::Evdev;
+            let (evdev_label, evdev_target) = if evdev_active {
+                ("Disable evdev", CmdKind::SetBackend(BackendTarget::Native))
+            } else {
+                ("Enable evdev", CmdKind::SetBackend(BackendTarget::Evdev))
+            };
+            items.push(
+                CheckmarkItem {
+                    label: evdev_label.into(),
+                    checked: evdev_active,
+                    activate: Box::new(move |t: &mut Self| fire(&t.cmd_tx, evdev_target)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.push(
             StandardItem {
                 label: "Quit".into(),
                 activate: Box::new(|t: &mut Self| fire(&t.cmd_tx, CmdKind::Quit)),
                 ..Default::default()
             }
             .into(),
-        ]
+        );
+        items
     }
 
     fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
@@ -145,7 +169,10 @@ impl DaklakTray {
 
 fn fire(tx: &CmdTx, kind: CmdKind) {
     let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.try_send(Command { kind, resp: resp_tx });
+    let _ = tx.try_send(Command {
+        kind,
+        resp: resp_tx,
+    });
 }
 
 /// Read the config file at `path`, update method + modern_style, and write
@@ -185,6 +212,7 @@ fn save_config(path: &Path, change: ConfigChange) {
 pub fn spawn_tray(
     cmd_tx: CmdTx,
     mut state_rx: StateRx,
+    mut backend_rx: watch::Receiver<InputBackend>,
     config_change_tx: tokio::sync::watch::Sender<ConfigChange>,
     config: &Config,
 ) {
@@ -200,6 +228,7 @@ pub fn spawn_tray(
             enabled: *state_rx.borrow_and_update(),
             method,
             modern_style,
+            backend: *backend_rx.borrow(),
         };
         let handle = match tray.spawn().await {
             Ok(h) => h,
@@ -208,10 +237,21 @@ pub fn spawn_tray(
                 return;
             }
         };
-        // Repaint on every state change so external `daklak toggle` updates the icon/label.
-        while state_rx.changed().await.is_ok() {
-            let on = *state_rx.borrow_and_update();
-            handle.update(|t| t.enabled = on).await;
+        // Repaint on every state or backend change.
+        loop {
+            tokio::select! {
+                biased;
+                changed = state_rx.changed() => {
+                    if changed.is_err() { break; }
+                    let on = *state_rx.borrow_and_update();
+                    handle.update(|t| t.enabled = on).await;
+                }
+                changed = backend_rx.changed() => {
+                    if changed.is_err() { break; }
+                    let b = *backend_rx.borrow_and_update();
+                    handle.update(|t| t.backend = b).await;
+                }
+            }
         }
     });
 }
