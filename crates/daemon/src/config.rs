@@ -27,7 +27,7 @@ impl MethodConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub method: MethodConfig,
@@ -78,6 +78,12 @@ pub struct Config {
     #[serde(default = "default_modern_style")]
     pub modern_style: bool,
 
+    /// Ordered evdev keymap hook names. Each name resolves to
+    /// `$XDG_CONFIG_HOME/daklak/hooks/<name>-set` and `<name>-unset`.
+    /// Hooks may self-filter by desktop/session and exit 10 when not applicable.
+    #[serde(default)]
+    pub evdev_grab_hooks: Vec<String>,
+
     /// Path where this config was loaded from. `None` when using defaults.
     /// Populated by `Config::load()` / `Config::load_from()`. Used by the
     /// tray menu to write method/modern_style changes back to the file.
@@ -104,6 +110,7 @@ impl Default for Config {
             enable_evdev_grab: false,
             bracket_shortcuts: false,
             enable_ibus: false,
+            evdev_grab_hooks: Vec::new(),
             modern_style: default_modern_style(),
             config_path: None,
         }
@@ -273,6 +280,15 @@ log_path = "/tmp/daklak.log"
         assert_eq!(cfg.log_path, "/tmp/daklak.log");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_evdev_grab_hooks_array() {
+        let cfg: Config = toml::from_str(r#"
+            enable_evdev_grab = true
+            evdev_grab_hooks = ["sway", "kde", "x11"]
+        "#).unwrap();
+        assert_eq!(cfg.evdev_grab_hooks, vec!["sway", "kde", "x11"]);
     }
 
     #[test]
