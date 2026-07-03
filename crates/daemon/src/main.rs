@@ -1,3 +1,4 @@
+mod backend;
 mod composer;
 mod config;
 mod control;
@@ -25,6 +26,7 @@ fn print_help() {
     println!("  enable       Turn the input method on.");
     println!("  disable      Turn the input method off.");
     println!("  status       Print 'on' or 'off' and exit.");
+    println!("  backend [native|auto|evdev]  Print active backend or toggle evdev grab.");
     println!(
         "  gen-keymap   Print daklak's synthetic xkb keymap to stdout and exit.\n\
          \x20              Pipe to a file then load it into your compositor manually:\n\
@@ -59,6 +61,7 @@ enum Command {
     Enable,
     Disable,
     Status,
+    Backend,
     GenKeymap,
     Help,
 }
@@ -78,11 +81,19 @@ struct Cli {
     overrides: CliOverrides,
     gen_keymap_symbols: bool,
     gen_keymap_rules: bool,
+    backend_arg: Option<backend::BackendTarget>,
 }
 
 fn parse_cli() -> Result<Cli> {
+    parse_cli_from(std::env::args().skip(1))
+}
+
+fn parse_cli_from<I>(raw_args: I) -> Result<Cli>
+where
+    I: IntoIterator<Item = String>,
+{
     let mut cli = Cli::default();
-    let mut args = std::env::args().skip(1).peekable();
+    let mut args = raw_args.into_iter().peekable();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -93,6 +104,17 @@ fn parse_cli() -> Result<Cli> {
             "disable" => set_command(&mut cli.command, Command::Disable, &arg)?,
             "status" => set_command(&mut cli.command, Command::Status, &arg)?,
             "gen-keymap" => set_command(&mut cli.command, Command::GenKeymap, &arg)?,
+            "backend" => {
+                set_command(&mut cli.command, Command::Backend, &arg)?;
+                if let Some(next) = args.peek() {
+                    if !next.starts_with('-') {
+                        let raw = args.next().unwrap();
+                        cli.backend_arg = Some(backend::BackendTarget::parse(&raw).ok_or_else(|| {
+                            anyhow::anyhow!("daklak: unknown backend {raw:?}; use native, auto, or evdev")
+                        })?);
+                    }
+                }
+            }
             "--symbols" => cli.gen_keymap_symbols = true,
             "--rules" => cli.gen_keymap_rules = true,
             "--config" | "-c" => {
@@ -242,6 +264,15 @@ fn main() -> Result<()> {
             println!("{reply}");
             return Ok(());
         }
+        Some(Command::Backend) => {
+            let cmd = match cli.backend_arg {
+                Some(target) => format!("backend {target}"),
+                None => "backend".to_owned(),
+            };
+            let reply = ipc_send(&cmd)?;
+            println!("{reply}");
+            return Ok(());
+        }
         Some(Command::GenKeymap) => {
             if cli.gen_keymap_rules {
                 print!("{}", viet_ime_keymap::rules_text());
@@ -351,4 +382,28 @@ fn main() -> Result<()> {
 
         anyhow::bail!("no input backend enabled; set enable_wayland=true or enable_evdev_grab=true")
     })
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use crate::backend::BackendTarget;
+
+    fn parse_from(args: &[&str]) -> Result<Cli> {
+        parse_cli_from(args.iter().copied().map(str::to_owned))
+    }
+
+    #[test]
+    fn parses_backend_status_and_switch() {
+        let cli = parse_from(&["backend"]).unwrap();
+        assert_eq!(cli.command, Some(Command::Backend));
+        assert_eq!(cli.backend_arg, None);
+
+        let cli = parse_from(&["backend", "evdev"]).unwrap();
+        assert_eq!(cli.command, Some(Command::Backend));
+        assert_eq!(cli.backend_arg, Some(BackendTarget::Evdev));
+
+        let cli = parse_from(&["backend", "native"]).unwrap();
+        assert_eq!(cli.backend_arg, Some(BackendTarget::Native));
+    }
 }
