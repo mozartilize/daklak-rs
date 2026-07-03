@@ -152,7 +152,20 @@ pub trait IbusHandler: Send {
     fn full_reset(&mut self);
 }
 
-#[zbus::interface(name = "org.freedesktop.IBus.Engine")]
+// `spawn = false`: dispatch Engine method calls inline on the connection's
+// message loop instead of one spawned task per call. IBus/mutter pipelines
+// ProcessKeyEvent (it does not wait for each reply before sending the next
+// key), and it forwards keys to the client in reply order. With the default
+// `spawn = true`, zbus runs each call in its own task, so replies race and
+// come back out of order — a key release can overtake its own press, leaving
+// the client with a dangling press that auto-repeats until the next keystroke.
+// This is visible when daklak's own uinput output re-enters this engine while
+// an evdev grab is layered on top of a live IBus connection (the grab only
+// starves the *physical* device, not daklak's synthetic keys). Serial,
+// in-order dispatch keeps press/release pairs intact. Safe here because every
+// outbound call is a fire-and-forget `#[zbus(signal)]` — no interface method
+// awaits a D-Bus method reply, so the inline loop cannot deadlock.
+#[zbus::interface(name = "org.freedesktop.IBus.Engine", spawn = false)]
 impl<D: IbusHandler + Send + 'static> Engine<D> {
     /// Intercept a key press. Emit output signals BEFORE returning the bool
     /// so D-Bus message ordering ensures signals arrive first.
