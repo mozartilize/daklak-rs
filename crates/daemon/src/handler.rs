@@ -80,6 +80,13 @@ pub struct Daemon {
     /// Shared on/off flag — written by the control task, read each keystroke.
     pub enabled: Arc<AtomicBool>,
 
+    /// Passthrough flag used by IBus transport. When true, the engine forwards
+    /// keys without composing (no output). The evdev grab backend sets this on
+    /// the still-connected IBus engine while evdev owns the keyboard, preventing
+    /// double-processing. Distinct from `enabled` which is the user's on/off
+    /// gate. Never reset by the control task. Write from the supervisor only.
+    pub suspended: Arc<AtomicBool>,
+
     /// Receiver for config changes sent by the tray / IPC menu actions.
     /// Polled before each keystroke handler call to pick up method,
     /// modern_style changes and apply them to the active composer.
@@ -110,12 +117,17 @@ impl Daemon {
             config,
             router: Router::new(),
             enabled,
+            suspended: Arc::new(AtomicBool::new(false)),
             config_change_rx,
             last_config: control::ConfigChange {
                 method: initial_method,
                 modern_style: initial_modern_style,
             },
         }
+    }
+
+    pub fn suspend_flag(&self) -> Arc<AtomicBool> {
+        self.suspended.clone()
     }
 
     pub(crate) fn detect_capability(&self, frame: &FrameSnapshot) -> BackspaceMethod {
@@ -187,6 +199,12 @@ impl Daemon {
             w.check_idle_reset();
         }
         if !self.sync_enabled_edge() {
+            return KeyDecision::ForwardRaw;
+        }
+        if self.suspended.load(Ordering::Acquire) {
+            if let Some(w) = self.router.composer.as_mut() {
+                w.full_reset();
+            }
             return KeyDecision::ForwardRaw;
         }
         let shortcut_mods = ModifierState::CTRL | ModifierState::ALT | ModifierState::SUPER;
