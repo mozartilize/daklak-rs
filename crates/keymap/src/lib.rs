@@ -179,7 +179,7 @@ const _: () = assert!(VN_LOWER.len() == VN_UPPER.len());
 /// `ceil(VN_LOWER.len() / 4)` since each slot holds 4 lowercase letters
 /// (at L1, L3, L5, L7) plus their uppercase mirrors (L2, L4, L6, L8).
 pub const fn slots_needed() -> usize {
-    (VN_LOWER.len() + 3) / 4
+    VN_LOWER.len().div_ceil(4)
 }
 
 const _: () = assert!(SAFE_KEYCODES.len() == slots_needed());
@@ -400,7 +400,7 @@ fn append_symbols_section(s: &mut String, indent: &str, section: &str, include_b
 }
 
 fn append_symbol_rows(s: &mut String, indent: &str) {
-    for i in 0..slots_needed() {
+    for (i, &kc_name) in SAFE_KEYCODE_NAMES.iter().take(slots_needed()).enumerate() {
         let base = i * 4;
         // Collect up to 4 lower/upper pairs, padding shortfall with VoidSymbol.
         let mut keysyms: [u32; 8] = [0xFFFFFF; 8];
@@ -411,7 +411,6 @@ fn append_symbol_rows(s: &mut String, indent: &str) {
                 keysyms[j * 2 + 1] = VN_UPPER[idx] as u32;
             }
         }
-        let kc_name = SAFE_KEYCODE_NAMES[i];
         // Format each keysym slot: VoidSymbol for the padding sentinel,
         // U+XXXX literal otherwise.
         let mut row = String::with_capacity(96);
@@ -422,15 +421,14 @@ fn append_symbol_rows(s: &mut String, indent: &str) {
             if sym == 0xFFFFFF {
                 row.push_str("VoidSymbol");
             } else {
-                row.push_str(&format!("U{:04X}", sym));
+                row.push_str(&format!("U{sym:04X}"));
             }
         }
         // `override` ensures the include's default symbol (e.g. F13 for
         // <FK13>) is replaced rather than merged — without it xkbcomp
         // emits "Multiple symbols for level 1/group 1" warnings.
         s.push_str(&format!(
-            "{indent}  replace key <{}> {{ type[Group1] = \"EIGHT_LEVEL\", [ {} ] }};\n",
-            kc_name, row
+            "{indent}  replace key <{kc_name}> {{ type[Group1] = \"EIGHT_LEVEL\", [ {row} ] }};\n"
         ));
     }
 }

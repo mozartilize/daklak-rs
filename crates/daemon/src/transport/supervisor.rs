@@ -9,8 +9,6 @@ use crate::config::Config;
 use crate::control::{CmdKind, Command, ControlReply};
 use crate::handler::Daemon;
 
-pub type BackendRx = watch::Receiver<InputBackend>;
-
 /// What to do after the current transport stops.
 enum PendingAction {
     SwitchTo(InputBackend),
@@ -33,6 +31,10 @@ pub struct Supervisor {
     /// is consumed by `IbusRuntime`. Kept alive across evdev switches so the
     /// supervisor can gate IBus passthrough without dropping the IBus
     /// connection (which would lose input-context binding).
+    #[cfg_attr(
+        not(all(feature = "ibus", feature = "evdev_grab")),
+        allow(dead_code)
+    )]
     ibus_suspend: Option<Arc<AtomicBool>>,
     /// Set by handle_cmd when the transport needs to stop and switch.
     pending_action: Option<PendingAction>,
@@ -72,6 +74,17 @@ impl Supervisor {
     }
 
     pub async fn run(mut self, mut rx: mpsc::Receiver<Command>) -> Result<()> {
+        // Recover from a prior run that died with evdev hooks applied: a stale
+        // rollback marker on disk means its cleanup hooks never ran. Replay
+        // them once at startup before we (possibly) apply hooks again.
+        #[cfg(feature = "evdev_grab")]
+        {
+            use crate::evdev_hooks::{self, ProcessHookRunner};
+            if let Err(e) = evdev_hooks::recover_stale_rollback(&self.config, &ProcessHookRunner) {
+                tracing::warn!("evdev stale rollback recovery failed: {e}");
+            }
+        }
+
         let mut current = InputBackend::startup_from_config(&self.config);
         if current == InputBackend::Auto {
             return Err(anyhow!(
@@ -238,7 +251,7 @@ impl Supervisor {
         Ok(())
     }
 
-    #[cfg(feature = "evdev_grab")]
+    #[cfg(all(feature = "ibus", feature = "evdev_grab"))]
     async fn run_evdev_in_ibus_slot(&mut self, rx: &mut mpsc::Receiver<Command>) {
         use crate::evdev_hooks::{self, ProcessHookRunner};
 
@@ -336,7 +349,7 @@ impl Supervisor {
         }
     }
 
-    #[cfg(not(feature = "evdev_grab"))]
+    #[cfg(all(feature = "ibus", not(feature = "evdev_grab")))]
     async fn run_evdev_in_ibus_slot(&mut self, _rx: &mut mpsc::Receiver<Command>) {
         tracing::error!("ibus→evdev switch requested but evdev_grab not compiled");
     }

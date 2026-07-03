@@ -2,6 +2,7 @@ mod backend;
 mod composer;
 mod config;
 mod control;
+#[cfg(feature = "evdev_grab")]
 mod evdev_hooks;
 mod handler;
 mod ipc;

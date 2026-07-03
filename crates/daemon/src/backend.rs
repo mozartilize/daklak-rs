@@ -5,6 +5,7 @@ use crate::config::Config;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputBackend {
     Auto,
+    #[cfg_attr(not(feature = "ibus"), allow(dead_code))]
     Ibus,
     Wayland,
     Evdev,
@@ -27,16 +28,6 @@ impl BackendTarget {
 }
 
 impl InputBackend {
-    pub fn parse_status(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(Self::Auto),
-            "ibus" => Some(Self::Ibus),
-            "wayland" => Some(Self::Wayland),
-            "evdev" | "evdev-grab" | "evdev_grab" => Some(Self::Evdev),
-            _ => None,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
