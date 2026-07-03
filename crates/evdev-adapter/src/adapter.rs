@@ -68,6 +68,11 @@ const XKB_MOD3_BIT: u32 = 1 << 5; // LevelFive (daklak's HENK binding)
 const XKB_MOD4_BIT: u32 = 1 << 6; // Super
 const XKB_MOD5_BIT: u32 = 1 << 7; // AltGr / Level3
 
+/// SAFETY: xkbcommon is thread-safe (uses internal mutexes). All other
+/// fields (SelectAll<EventStream>, Box<dyn KeyEmitter + Send>, primitives)
+/// are Send. The raw pointers inside XkbState are usable from any thread.
+unsafe impl Send for EvdevAdapter {}
+
 pub struct EvdevAdapter {
     streams: SelectAll<EventStream>,
     /// Output delivery sink (uinput today).
@@ -88,6 +93,14 @@ pub struct EvdevAdapter {
     /// to clear that state. Same fix as `keymap::emit_char`'s
     /// `held_user_kc` path on the wayland side.
     held_physical: HashSet<u32>,
+    /// Physical keycodes currently held whose *press* was forwarded raw
+    /// (ForwardRaw / shortcut / non-printable). Only these have their
+    /// release and autorepeat forwarded. A key the engine consumed
+    /// (Consumed / Apply) leaves no mark, so its continuation events are
+    /// dropped instead of reaching the client as dangling press-less
+    /// releases — which, through the live IBus passthrough path, can strand
+    /// the client in an auto-repeat.
+    forwarded_press: HashSet<u32>,
     escape_taps: Vec<Instant>,
     should_exit: bool,
 }
@@ -158,6 +171,7 @@ impl EvdevAdapter {
             mod_mask: 0,
             emitted_mods: 0,
             held_physical: HashSet::new(),
+            forwarded_press: HashSet::new(),
             escape_taps: Vec::new(),
             should_exit: false,
         })
@@ -217,6 +231,14 @@ impl EvdevAdapter {
         // we surface a single trace line per attempt.
         self.output.emit_key(0, code, value as u32);
         tracing::trace!(code, value, "output.emit_key dispatched");
+    }
+
+    /// Forward a raw key *press* and record the keycode so its later
+    /// autorepeat/release is forwarded too. Presses the engine consumes are
+    /// never recorded, so their continuation events are dropped as dangling.
+    fn forward_press_raw(&mut self, code: u32, value: i32) {
+        self.forwarded_press.insert(code);
+        self.passthrough(code, value);
     }
 
     /// Adjust uinput-emitted Shift / AltGr (Level3) / HENK (Level5) state
@@ -364,14 +386,25 @@ impl EvdevAdapter {
                 self.escape_taps.clear();
                 self.should_exit = true;
                 handler.clear_session();
-                self.passthrough(KEY_ESC, 1);
+                self.forward_press_raw(KEY_ESC, 1);
                 return;
             }
         }
 
-        // Releases + autorepeats: forward raw (avoids stuck keys).
+        // Releases and autorepeats are continuation events: only meaningful
+        // for a key whose press was forwarded raw. If the engine consumed the
+        // press (Consumed / Apply), the client never saw a matching press, so
+        // forwarding the release/autorepeat would emit a dangling event —
+        // which, through the live IBus passthrough path, can strand the client
+        // in an auto-repeat. Modifiers are handled above and always forward
+        // both edges.
         if value != 1 {
-            self.passthrough(code, value);
+            if self.forwarded_press.contains(&code) {
+                self.passthrough(code, value);
+                if value == 0 {
+                    self.forwarded_press.remove(&code);
+                }
+            }
             return;
         }
 
@@ -384,7 +417,7 @@ impl EvdevAdapter {
         if self.shortcut_mods_held() {
             handler.full_reset_window();
             handler.clear_last_input_char();
-            self.passthrough(code, value);
+            self.forward_press_raw(code, value);
             return;
         }
 
@@ -394,7 +427,7 @@ impl EvdevAdapter {
         let Some(ch) = self.xkb.key_to_char(code) else {
             handler.full_reset_window();
             handler.clear_last_input_char();
-            self.passthrough(code, value);
+            self.forward_press_raw(code, value);
             return;
         };
 
@@ -403,7 +436,7 @@ impl EvdevAdapter {
         if code == KEY_BACKSPACE {
             match handler.handle_backspace() {
                 KeyDecision::Consumed => {}
-                KeyDecision::ForwardRaw => self.passthrough(code, value),
+                KeyDecision::ForwardRaw => self.forward_press_raw(code, value),
                 KeyDecision::Apply { backspaces, .. } => self.emit_backspaces(backspaces),
             }
             return;
@@ -411,7 +444,7 @@ impl EvdevAdapter {
 
         match handler.handle_char(code, ch) {
             KeyDecision::Consumed => {}
-            KeyDecision::ForwardRaw => self.passthrough(code, value),
+            KeyDecision::ForwardRaw => self.forward_press_raw(code, value),
             KeyDecision::Apply {
                 backspaces, commit, ..
             } => {
@@ -482,9 +515,137 @@ impl EvdevAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn own_uinput_device_name_is_daklak() {
         assert_eq!(DAKLAK_NAME, "daklak");
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingEmitter {
+        events: Arc<Mutex<Vec<(u32, u32)>>>,
+    }
+
+    impl KeyEmitter for CapturingEmitter {
+        fn emit_key(&mut self, _time: u32, keycode: u32, value: u32) {
+            self.events.lock().unwrap().push((keycode, value));
+        }
+        fn emit_modifiers(&mut self, _d: u32, _l: u32, _lo: u32, _g: u32) {}
+    }
+
+    #[derive(Default)]
+    struct MockHandler {
+        char_decisions: Vec<KeyDecision>,
+    }
+
+    impl EvdevHandler for MockHandler {
+        fn handle_char(&mut self, _code: u32, _ch: char) -> KeyDecision {
+            if self.char_decisions.is_empty() {
+                KeyDecision::Consumed
+            } else {
+                self.char_decisions.remove(0)
+            }
+        }
+        fn handle_backspace(&mut self) -> KeyDecision {
+            KeyDecision::ForwardRaw
+        }
+        fn clear_session(&mut self) {}
+        fn clear_last_input_char(&mut self) {}
+        fn full_reset_window(&mut self) {}
+        fn check_idle_reset_window(&mut self) {}
+    }
+
+    fn test_adapter(emitter: CapturingEmitter) -> EvdevAdapter {
+        EvdevAdapter {
+            streams: SelectAll::new(),
+            output: Box::new(emitter),
+            xkb: build_us_xkb().expect("us keymap"),
+            mod_mask: 0,
+            emitted_mods: 0,
+            held_physical: HashSet::new(),
+            forwarded_press: HashSet::new(),
+            escape_taps: Vec::new(),
+            should_exit: false,
+        }
+    }
+
+    fn key(code: u16, value: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, code, value)
+    }
+
+    const KEY_S: u16 = 31;
+
+    /// A press the engine consumed must not forward its release. Otherwise the
+    /// client receives a press-less release (dangling through the live IBus
+    /// passthrough path), which strands it in an auto-repeat until the next key.
+    #[test]
+    fn consumed_press_drops_its_release() {
+        let emitter = CapturingEmitter::default();
+        let events = emitter.events.clone();
+        let mut adapter = test_adapter(emitter);
+        let mut handler = MockHandler {
+            char_decisions: vec![KeyDecision::Consumed],
+        };
+
+        adapter.process_event(&mut handler, &key(KEY_S, 1)); // press → consumed
+        adapter.process_event(&mut handler, &key(KEY_S, 0)); // release
+
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "consumed press must emit nothing on press or release"
+        );
+        assert!(!adapter.forwarded_press.contains(&(KEY_S as u32)));
+    }
+
+    /// A press the engine forwarded raw must forward its release too, so the
+    /// press/release pair stays balanced at the client.
+    #[test]
+    fn forwarded_press_forwards_its_release() {
+        let emitter = CapturingEmitter::default();
+        let events = emitter.events.clone();
+        let mut adapter = test_adapter(emitter);
+        let mut handler = MockHandler {
+            char_decisions: vec![KeyDecision::ForwardRaw],
+        };
+
+        adapter.process_event(&mut handler, &key(KEY_S, 1)); // press → forward raw
+        adapter.process_event(&mut handler, &key(KEY_S, 0)); // release
+
+        let s = KEY_S as u32;
+        assert_eq!(&*events.lock().unwrap(), &[(s, 1), (s, 0)]);
+        assert!(
+            !adapter.forwarded_press.contains(&s),
+            "release must clear the forwarded-press mark"
+        );
+    }
+
+    /// Autorepeats follow the same rule: forwarded for a forwarded press,
+    /// dropped for a consumed one.
+    #[test]
+    fn autorepeat_follows_press_disposition() {
+        let s = KEY_S as u32;
+
+        // Consumed press: autorepeat dropped.
+        let emitter = CapturingEmitter::default();
+        let events = emitter.events.clone();
+        let mut adapter = test_adapter(emitter);
+        let mut handler = MockHandler {
+            char_decisions: vec![KeyDecision::Consumed],
+        };
+        adapter.process_event(&mut handler, &key(KEY_S, 1));
+        adapter.process_event(&mut handler, &key(KEY_S, 2)); // autorepeat
+        assert!(events.lock().unwrap().is_empty());
+
+        // Forwarded press: autorepeat forwarded.
+        let emitter = CapturingEmitter::default();
+        let events = emitter.events.clone();
+        let mut adapter = test_adapter(emitter);
+        let mut handler = MockHandler {
+            char_decisions: vec![KeyDecision::ForwardRaw],
+        };
+        adapter.process_event(&mut handler, &key(KEY_S, 1));
+        adapter.process_event(&mut handler, &key(KEY_S, 2));
+        assert_eq!(&*events.lock().unwrap(), &[(s, 1), (s, 2)]);
     }
 }

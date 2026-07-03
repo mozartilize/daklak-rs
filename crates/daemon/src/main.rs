@@ -17,8 +17,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use viet_ime_wayland_adapter::connect;
-
 fn print_help() {
     println!("Usage: daklak [SUBCOMMAND]");
     println!();
@@ -310,10 +308,10 @@ fn main() -> Result<()> {
         let enabled = Arc::new(AtomicBool::new(true));
         let (cmd_tx, cmd_rx) = control::channel();
         let (state_tx, state_rx) = tokio::sync::watch::channel(true);
+        let (backend_tx, _backend_rx) =
+            tokio::sync::watch::channel(backend::InputBackend::Auto);
         let (config_change_tx, config_change_rx) =
             tokio::sync::watch::channel(control::ConfigChange::default());
-
-        control::spawn(cmd_rx, enabled.clone(), state_tx);
 
         if let Some(server) = ipc::IpcServer::bind().await {
             let tx = cmd_tx.clone();
@@ -340,48 +338,15 @@ fn main() -> Result<()> {
             &config,
         );
 
-        // --- mode-specific run loop ---
-
-        #[cfg(feature = "ibus")]
-        if config.enable_ibus {
-            let daemon = handler::Daemon::new(
-                config,
-                enabled.clone(),
-                config_change_rx.clone(),
-            );
-            return viet_ime_ibus_adapter::IbusAdapter::run(daemon, enabled).await;
-        }
-
-        if config.enable_wayland {
-            let daemon = handler::Daemon::new(
-                config,
-                enabled.clone(),
-                config_change_rx.clone(),
-            );
-            let mut wayland = connect(daemon)?;
-            return crate::main_loop::core_loop_with_wayland(&mut wayland).await;
-        }
-
-        #[cfg(feature = "evdev_grab")]
-        if config.enable_evdev_grab {
-            let mut daemon = handler::Daemon::new(
-                config,
-                enabled.clone(),
-                config_change_rx.clone(),
-            );
-            daemon.activate_evdev();
-            let mut evdev = viet_ime_evdev_adapter::EvdevAdapter::open()?;
-            return evdev.run(&mut daemon).await;
-        }
-
-        #[cfg(not(feature = "evdev_grab"))]
-        if config.enable_evdev_grab {
-            return Err(anyhow::anyhow!(
-                "evdev_grab mode requested, but the daemon was built without the evdev_grab feature"
-            ));
-        }
-
-        anyhow::bail!("no input backend enabled; set enable_wayland=true or enable_evdev_grab=true")
+        // --- supervisor owns transport lifecycle and command dispatch ---
+        let supervisor = transport::supervisor::Supervisor::new(
+            config,
+            enabled.clone(),
+            state_tx,
+            backend_tx,
+            config_change_rx,
+        );
+        supervisor.run(cmd_rx).await
     })
 }
 
