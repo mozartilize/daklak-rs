@@ -85,6 +85,7 @@ pub struct Daemon {
     /// the still-connected IBus engine while evdev owns the keyboard, preventing
     /// double-processing. Distinct from `enabled` which is the user's on/off
     /// gate. Never reset by the control task. Write from the supervisor only.
+    #[cfg_attr(not(feature = "ibus"), allow(dead_code))]
     pub suspended: Arc<AtomicBool>,
 
     /// Receiver for config changes sent by the tray / IPC menu actions.
@@ -126,6 +127,7 @@ impl Daemon {
         }
     }
 
+    #[cfg(feature = "ibus")]
     pub fn suspend_flag(&self) -> Arc<AtomicBool> {
         self.suspended.clone()
     }
@@ -145,6 +147,10 @@ impl Daemon {
     /// ibus transports: both must forward keys raw while disabled instead of
     /// continuing to compose. (The wayland path inlines the same logic with an
     /// extra key-repeat guard.)
+    #[cfg_attr(
+        not(any(feature = "ibus", feature = "evdev_grab")),
+        allow(dead_code)
+    )]
     pub(crate) fn sync_enabled_edge(&mut self) -> bool {
         let now_enabled = self.enabled.load(Ordering::Acquire);
         if self.router.last_enabled && !now_enabled {

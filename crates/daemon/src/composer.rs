@@ -142,26 +142,6 @@ impl EditModel {
 /// produces even one (its surrounding always reflects at least our commits).
 const SURROUNDING_DEAD_STRIKE_LIMIT: u32 = 2;
 
-/// Consecutive SurroundingText corrections (delete + commit, `backspaces > 0`)
-/// whose `delete_surrounding_text` drew NO `SetSurroundingText` echo back,
-/// before the SurroundingText→ForwardKey downgrade fires.
-///
-/// A functional surrounding client round-trips every edit: after our
-/// delete+commit it sends a SetSurroundingText reflecting the new buffer
-/// (gedit echoes `kh`→`khô` etc.). A client that advertises surrounding but
-/// silently no-ops the delete (Google Docs under IBus) emits the commit and
-/// sends nothing back, so the word doubles (`Tiếng` → `Tieêngếng`). Capability
-/// bits are NOT a reliable discriminator — Docs flaps caps=9 and caps=41 in one
-/// focus sequence — but the echo (or its absence) is observable and decisive.
-///
-/// One: the first correction may double once before we have a prior correction
-/// to judge; the second echo-less correction downgrades. A functional client
-/// always echoes within the inter-keystroke gap (its echo is synchronous), so
-/// it never accrues a strike. Complements [`SURROUNDING_DEAD_STRIKE_LIMIT`],
-/// which handles clients that echo *dead* (`text="" cursor=0`) frames.
-#[cfg(feature = "ibus")]
-const SURROUNDING_NO_ECHO_LIMIT: u32 = 1;
-
 pub struct Composer {
     pub engine: EngineState,
     edit: EditModel,
@@ -363,7 +343,7 @@ impl Composer {
     /// Call once per SurroundingText correction that issues a delete
     /// (`backspaces > 0`), *before* applying it. If no frame arrived since the
     /// previous correction, that previous correction went unechoed → count a
-    /// strike; on the [`SURROUNDING_NO_ECHO_LIMIT`]-th strike return `true` so
+    /// strike; on the first such echo-less strike return `true` so
     /// the caller downgrades to ForwardKey (whose real Backspaces these clients
     /// do honor). Any echo resets the count. The first correction never strikes
     /// (no predecessor to judge); it then arms the window for the next one.

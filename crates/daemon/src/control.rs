@@ -1,6 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering::Acquire, Ordering::Release};
-use std::sync::Arc;
-
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::backend::InputBackend;
@@ -22,13 +19,6 @@ impl ControlReply {
             Self::Backend(backend) => format!("{backend}"),
             Self::Ok(msg) => format!("ok {msg}"),
             Self::Error(msg) => format!("err {msg}"),
-        }
-    }
-
-    pub fn enabled_value(&self) -> Option<bool> {
-        match self {
-            Self::Enabled(v) => Some(*v),
-            _ => None,
         }
     }
 }
@@ -77,47 +67,6 @@ pub type StateRx = watch::Receiver<bool>;
 
 pub fn channel() -> (CmdTx, mpsc::Receiver<Command>) {
     mpsc::channel(32)
-}
-
-/// Single writer of `enabled` + state broadcaster. Spawned once, works in every mode.
-pub fn spawn(
-    mut rx: mpsc::Receiver<Command>,
-    enabled: Arc<AtomicBool>,
-    state_tx: watch::Sender<bool>,
-) {
-    tokio::spawn(async move {
-        while let Some(cmd) = rx.recv().await {
-            let reply = match cmd.kind {
-                CmdKind::Toggle => {
-                    let v = !enabled.load(Acquire);
-                    enabled.store(v, Release);
-                    let _ = state_tx.send(v);
-                    ControlReply::Enabled(v)
-                }
-                CmdKind::Enable => {
-                    enabled.store(true, Release);
-                    let _ = state_tx.send(true);
-                    ControlReply::Enabled(true)
-                }
-                CmdKind::Disable => {
-                    enabled.store(false, Release);
-                    let _ = state_tx.send(false);
-                    ControlReply::Enabled(false)
-                }
-                CmdKind::Status => ControlReply::Enabled(enabled.load(Acquire)),
-                CmdKind::Quit => {
-                    let cur = enabled.load(Acquire);
-                    let _ = cmd.resp.send(ControlReply::Enabled(cur));
-                    tracing::info!("quit requested via control");
-                    std::process::exit(0);
-                }
-                CmdKind::BackendStatus | CmdKind::SetBackend(_) => {
-                    ControlReply::Error("backend switching unavailable before supervisor starts".to_owned())
-                }
-            };
-            let _ = cmd.resp.send(reply);
-        }
-    });
 }
 
 #[cfg(test)]

@@ -88,10 +88,3 @@ pub async fn core_loop_with_wayland_shutdown(
 
     Ok(())
 }
-
-pub async fn core_loop_with_wayland(
-    wayland: &mut WaylandHandle<Daemon>,
-) -> Result<()> {
-    let (_tx, rx) = tokio::sync::watch::channel(false);
-    core_loop_with_wayland_shutdown(wayland, rx).await
-}
