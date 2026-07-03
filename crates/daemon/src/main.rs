@@ -334,6 +334,7 @@ fn main() -> Result<()> {
         tray::spawn_tray(
             cmd_tx.clone(),
             state_rx,
+            _backend_rx,
             config_change_tx.clone(),
             &config,
         );
