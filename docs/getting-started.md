@@ -128,16 +128,21 @@ A few subcommands are handled before the daemon loop starts:
 | `daklak disable` | Disable composition (pass-through). |
 | `daklak status` | Print the running daemon's enabled state. |
 | `daklak gen-keymap` | Print the daklak synthetic xkb keymap to stdout. |
+| `daklak backend` | Print the running daemon's active backend (wayland/ibus/evdev). |
+| `daklak backend native` | Switch the running daemon to the native desktop backend. |
+| `daklak backend evdev` | Switch the running daemon to the evdev grab backend. |
 | `daklak help` | Show usage. |
 
-The control commands (`toggle`/`enable`/`disable`/`status`) talk to an
+The control commands (`toggle`/`enable`/`disable`/`status`/`backend`) talk to an
 already-running daemon over a Unix socket and work regardless of which transport
 mode that daemon is in.
 
 ## Tray indicator
 
 When running, daklak exposes a StatusNotifierItem (SNI) tray icon that reflects
-and toggles the enabled state. This works in every transport mode.
+and toggles the enabled state. When built with `evdev_grab`, the tray also
+shows an "Enable evdev" / "Disable evdev" checkbox to switch between native
+and evdev backends at runtime.
 
 ## Configuration
 

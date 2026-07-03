@@ -25,6 +25,54 @@ At startup the daemon picks the first applicable mode:
 The control plane (enable/disable, IPC, tray) starts before the mode loop and is
 identical across all three.
 
+### Runtime switching
+
+You can switch between the **native desktop backend** (IBus or Wayland,
+whichever was chosen at startup) and the **evdev grab backend** at runtime
+without restarting the daemon:
+
+```
+daklak backend            # query: prints current backend
+daklak backend native     # switch to native desktop backend (IBus/Wayland)
+daklak backend evdev      # switch to evdev grab backend
+```
+
+The tray icon also exposes an "Enable evdev" / "Disable evdev" checkbox when
+evdev-grab support is compiled in.
+
+**Switching is limited to native desktop ↔ evdev grab.** Switching between
+IBus and Wayland at runtime is not supported; the initial native choice is
+fixed for the daemon's lifetime.
+
+#### What happens on switch
+
+| Direction | Action |
+|---|---|
+| Native → evdev | Setup hooks run, keyboards are grabbed, engine starts using evdev |
+| Evdev → native | Input grabs are released, cleanup hooks run, engine uses native transport |
+
+#### Keep-connection passthrough (IBus)
+
+When switching from IBus to evdev, the **IBus D-Bus connection is kept alive**.
+The engine's `suspended` flag is set so IBus forwards keys raw without
+processing them. On switch-back the flag is cleared and IBus resumes composing
+— no connection renegotiation, no input-context binding loss.
+
+While the evdev grab is layered on top, daklak's own synthetic keystrokes
+(emitted through its uinput device) still travel back through the live IBus
+engine — the grab only starves the *physical* keyboard, not daklak's own
+output. The engine therefore serves those key events strictly in the order it
+receives them (its D-Bus interface is dispatched serially rather than one task
+per call). Without in-order dispatch, a key release can overtake its own press
+on the way back to the application, stranding a pressed key that auto-repeats
+until the next keystroke.
+
+#### What happens if the target backend is unavailable
+
+If the requested backend was not compiled in or cannot be initialized (e.g.
+evdev keyboards cannot be grabbed), the current backend continues running
+unaffected.
+
 ## Wayland
 
 Crate: [`wayland-adapter`](../crates/wayland-adapter/). This mode targets two
