@@ -466,43 +466,62 @@ fn extract_ibus_text_string(v: &Value<'_>) -> Option<String> {
     }
 }
 
+/// Runtime handle for an active IBus connection.
+/// Holds the zbus connection so the engine stays registered and its
+/// input-context binding stays live. Dropping the connection would not
+/// trigger a SIGTERM, but the engine would lose its input-context binding
+/// and keys would stop routing. Therefore the connection is held for the
+/// whole process lifetime and only dropped on process exit.
+pub struct IbusRuntime<D: IbusHandler + Send + 'static> {
+    conn: zbus::Connection,
+    _state: Arc<tokio::sync::Mutex<EngineState<D>>>,
+}
+
+impl<D: IbusHandler + Send + 'static> IbusRuntime<D> {
+    pub async fn connect(daemon: D, enabled: Arc<AtomicBool>) -> Result<Self> {
+        let addr = crate::bus::resolve_ibus_address()?;
+        tracing::info!(%addr, "connecting to ibus-daemon");
+        let conn = zbus::conn::Builder::address(addr.as_str())?
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("connecting to ibus-daemon: {e}"))?;
+
+        let state = Arc::new(tokio::sync::Mutex::new(EngineState::new(daemon, enabled)));
+        conn.object_server()
+            .at("/org/freedesktop/IBus/Factory", Factory::new(state.clone()))
+            .await?;
+        conn.request_name("org.freedesktop.IBus.Daklak")
+            .await
+            .map_err(|e| anyhow::anyhow!("request_name org.freedesktop.IBus.Daklak: {e}"))?;
+        tracing::info!("registered as org.freedesktop.IBus.Daklak — awaiting CreateEngine");
+        Ok(Self { conn, _state: state })
+    }
+
+    pub async fn run_until_shutdown(
+        self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        let _conn = self.conn;
+        tokio::select! {
+            _ = std::future::pending::<()>() => {}
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    tracing::info!("ibus: supervisor shutdown requested");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Run the ibus adapter: connect to ibus-daemon, register factory + engine,
-/// and drive the async message loop until disconnected.
+/// and park forever holding the connection (legacy convenience wrapper).
 pub async fn run<D: IbusHandler + Send + 'static>(
     daemon: D,
     enabled: Arc<AtomicBool>,
 ) -> Result<()> {
-    let addr = crate::bus::resolve_ibus_address()?;
-    tracing::info!(%addr, "connecting to ibus-daemon");
-
-    let conn = zbus::conn::Builder::address(addr.as_str())?
-        .build()
-        .await
-        .map_err(|e| anyhow::anyhow!("connecting to ibus-daemon: {e}"))?;
-
-    let state = Arc::new(tokio::sync::Mutex::new(EngineState::new(daemon, enabled)));
-
-    conn.object_server()
-        .at("/org/freedesktop/IBus/Factory", Factory::new(state))
-        .await?;
-
-    conn.request_name("org.freedesktop.IBus.Daklak")
-        .await
-        .map_err(|e| anyhow::anyhow!("request_name org.freedesktop.IBus.Daklak: {e}"))?;
-
-    tracing::info!("registered as org.freedesktop.IBus.Daklak — awaiting CreateEngine");
-
-    // Keep the connection alive and the object server dispatching. zbus's tokio
-    // integration services incoming method calls (CreateEngine, ProcessKeyEvent,
-    // …) on background tasks for as long as `conn` is held and this future is
-    // pending. `monitor_activity()` returns an EventListener that fires on the
-    // *first* activity event — awaiting it once returns immediately after
-    // register, dropping `conn` before any CreateEngine arrives. ibus owns the
-    // engine lifecycle and SIGTERMs the process on disable/shutdown, so park
-    // here forever while holding `conn`.
-    let _conn = conn;
-    std::future::pending::<()>().await;
-    Ok(())
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    IbusRuntime::connect(daemon, enabled).await?.run_until_shutdown(rx).await
 }
 
 #[cfg(test)]

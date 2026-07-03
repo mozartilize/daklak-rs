@@ -146,7 +146,24 @@ fn mod_bit(code: u32) -> Option<u32> {
 }
 
 impl EvdevAdapter {
-    pub fn open() -> Result<Self> {
+    pub fn prepare() -> Result<Self> {
+        let output: Box<dyn KeyEmitter + Send> = Box::new(
+            UinputEmitter::open().context("output: uinput backend open failed")?,
+        );
+        let xkb = build_us_xkb().context("xkb: failed to build us keymap")?;
+        Ok(Self {
+            streams: SelectAll::new(),
+            output,
+            xkb,
+            mod_mask: 0,
+            emitted_mods: 0,
+            held_physical: HashSet::new(),
+            escape_taps: Vec::new(),
+            should_exit: false,
+        })
+    }
+
+    pub fn grab_keyboards(&mut self) -> Result<()> {
         let keyboards = scan_keyboards();
         let mut streams = SelectAll::new();
 
@@ -179,21 +196,14 @@ impl EvdevAdapter {
             bail!("evdev: no keyboards grabbed — evdev-only mode cannot run");
         }
 
-        let output: Box<dyn KeyEmitter + Send> = Box::new(
-            UinputEmitter::open().context("output: uinput backend open failed")?,
-        );
-        let xkb = build_us_xkb().context("xkb: failed to build us keymap")?;
+        self.streams = streams;
+        Ok(())
+    }
 
-        Ok(Self {
-            streams,
-            output,
-            xkb,
-            mod_mask: 0,
-            emitted_mods: 0,
-            held_physical: HashSet::new(),
-            escape_taps: Vec::new(),
-            should_exit: false,
-        })
+    pub fn open() -> Result<Self> {
+        let mut adapter = Self::prepare()?;
+        adapter.grab_keyboards()?;
+        Ok(adapter)
     }
 
     fn shortcut_mods_held(&self) -> bool {
@@ -413,10 +423,21 @@ impl EvdevAdapter {
         }
     }
 
-    pub async fn run<H: EvdevHandler>(&mut self, handler: &mut H) -> Result<()> {
+    pub async fn run_until_shutdown<H: EvdevHandler>(
+        &mut self,
+        handler: &mut H,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         loop {
             tokio::select! {
                 biased;
+
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() && *shutdown_rx.borrow() {
+                        tracing::info!("evdev: supervisor shutdown requested");
+                        break;
+                    }
+                }
 
                 _ = signal::ctrl_c() => {
                     tracing::info!("evdev: ctrl_c — exiting");
@@ -450,6 +471,11 @@ impl EvdevAdapter {
         tracing::info!("evdev: grabs released");
 
         Ok(())
+    }
+
+    pub async fn run<H: EvdevHandler>(&mut self, handler: &mut H) -> Result<()> {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        self.run_until_shutdown(handler, rx).await
     }
 }
 

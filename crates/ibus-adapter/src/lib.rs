@@ -15,7 +15,7 @@ pub mod ibus_text;
 pub mod keyval;
 pub mod sink;
 
-pub use engine::{run as run_ibus, IbusHandler};
+pub use engine::{run as run_ibus, IbusHandler, IbusRuntime};
 
 use std::sync::{atomic::AtomicBool, Arc};
 
@@ -29,5 +29,12 @@ impl IbusAdapter {
         enabled: Arc<AtomicBool>,
     ) -> Result<()> {
         engine::run(daemon, enabled).await
+    }
+
+    pub async fn connect<D: IbusHandler + Send + 'static>(
+        daemon: D,
+        enabled: Arc<AtomicBool>,
+    ) -> Result<IbusRuntime<D>> {
+        engine::IbusRuntime::connect(daemon, enabled).await
     }
 }

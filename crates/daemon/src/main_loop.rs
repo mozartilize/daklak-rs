@@ -6,8 +6,9 @@ use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler};
 
 use crate::handler::Daemon;
 
-pub async fn core_loop_with_wayland(
+pub async fn core_loop_with_wayland_shutdown(
     wayland: &mut WaylandHandle<Daemon>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut fb = wayland.focus_backend.take();
 
@@ -17,6 +18,14 @@ pub async fn core_loop_with_wayland(
 
         tokio::select! {
             biased;
+
+            changed = shutdown_rx.changed() => {
+                drop(read_guard);
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    tracing::info!("wayland: supervisor shutdown requested");
+                    break;
+                }
+            }
 
             _ = signal::ctrl_c() => {
                 tracing::info!("shutdown signal received");
@@ -80,4 +89,9 @@ pub async fn core_loop_with_wayland(
     Ok(())
 }
 
-
+pub async fn core_loop_with_wayland(
+    wayland: &mut WaylandHandle<Daemon>,
+) -> Result<()> {
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    core_loop_with_wayland_shutdown(wayland, rx).await
+}
