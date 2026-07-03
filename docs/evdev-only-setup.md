@@ -51,11 +51,18 @@ Daklak generates the same synthetic keymap the Wayland ForwardKey
 virtual-keyboard channel uploads to `zwp_virtual_keyboard_v1` — 17 `EIGHT_LEVEL`
 custom slots over evdev keycodes ≤ 255 so XWayland clients receive them too:
 
-- **IME zone** (kc 85,86,89-95 with 92 reserved): `<ZEHA>`, `<LSGT>`, `<AB11>`,
-  `<KATA>`, `<HIRA>`, `<HKTG>`, `<MUHE>`, `<JPCM>` — 8 slots.
+- **IME zone** (kc 85,86,89-94 with 92 reserved): `<ZEHA>`, `<LSGT>`, `<AB11>`,
+  `<KATA>`, `<HIRA>`, `<HKTG>`, `<MUHE>`, `<AE13>` (KEY_YEN) — 8 slots.
 - **F13-F19** (kc 183-189): `<FK13>..<FK19>` — 7 slots.
 - **Korean IME** (kc 122, 123): `<HNGL>` (KEY_HANGEUL), `<HJCV>` (KEY_HANJA) —
   2 slots.
+
+`<AE13>` (KEY_YEN, kc 124) carries slot 7 instead of `<JPCM>` (KEY_KPJPCOMMA,
+kc 95): Chromium/Electron clients (e.g. VSCode) have no DomCode for evdev 95,
+so keysyms bound there never turn into text in those apps — the i-family (ì í ỉ
+ĩ) would silently vanish while every other composition rendered. KEY_YEN maps
+to Chromium's live `IntlYen` DomCode, so it works in Chromium and native clients
+alike.
 
 F20/F21 (kc 190/191) are deliberately skipped — they were observed silently
 filtered on at least one xfce4 X11 session (the event reached the uinput cap and
@@ -138,7 +145,7 @@ flows):
 
 Real failures look different: parse errors, `Maximum code (X) must be >= …`, or
 "not found" warnings naming `<FK13..21>`, `<ZEHA>`, `<HKTG>`, `<LSGT>`,
-`<KATA>`, `<HIRA>`, `<MUHE>`, `<JPCM>`, `<AB11>`, or `<HENK>` — those are
+`<KATA>`, `<HIRA>`, `<MUHE>`, `<AE13>`, `<AB11>`, or `<HENK>` — those are
 daklak's own slot names. If you see those, the keycode naming in
 [`crates/keymap/src/lib.rs`](../crates/keymap/src/lib.rs) (`SAFE_KEYCODE_NAMES`)
 has drifted from the system's evdev keycodes file.
