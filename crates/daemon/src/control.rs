@@ -27,10 +27,15 @@ impl ControlReply {
 pub struct ConfigChange {
     pub method: MethodConfig,
     pub modern_style: bool,
+    pub enable_evdev_grab: bool,
 }
 
 impl ConfigChange {
     /// True when nothing has changed from the given baseline.
+    ///
+    /// Only compares fields that `Daemon::sync_config()` acts on
+    /// (method, modern_style). `enable_evdev_grab` is persisted by the
+    /// tray but not applied by the handler.
     pub fn no_change_from(&self, other: &Self) -> bool {
         self.method == other.method && self.modern_style == other.modern_style
     }
@@ -41,6 +46,7 @@ impl Default for ConfigChange {
         Self {
             method: MethodConfig::Telex,
             modern_style: true,
+            enable_evdev_grab: false,
         }
     }
 }
@@ -78,8 +84,14 @@ mod tests {
     fn control_reply_formats_ipc_lines() {
         assert_eq!(ControlReply::Enabled(true).as_ipc_line(), "on");
         assert_eq!(ControlReply::Enabled(false).as_ipc_line(), "off");
-        assert_eq!(ControlReply::Backend(InputBackend::Wayland).as_ipc_line(), "wayland");
-        assert_eq!(ControlReply::Ok("backend evdev".into()).as_ipc_line(), "ok backend evdev");
+        assert_eq!(
+            ControlReply::Backend(InputBackend::Wayland).as_ipc_line(),
+            "wayland"
+        );
+        assert_eq!(
+            ControlReply::Ok("backend evdev".into()).as_ipc_line(),
+            "ok backend evdev"
+        );
         assert_eq!(
             ControlReply::Error("backend ibus unavailable".into()).as_ipc_line(),
             "err backend ibus unavailable"

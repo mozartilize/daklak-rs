@@ -65,12 +65,11 @@ pub struct Config {
     #[serde(default)]
     pub bracket_shortcuts: bool,
 
-    /// Enable GNOME / IBus engine mode. Connects to ibus-daemon and registers
-    /// as `org.freedesktop.IBus.Daklak`. Requires the `ibus` Cargo feature.
-    /// Set automatically when daklak is launched via `--ibus` or by ibus-daemon.
-    /// Env override `DAKLAK_ENABLE_IBUS` (truthy heuristic).
-    #[serde(default)]
-    pub enable_ibus: bool,
+    /// True when daklak was launched with `--ibus`. Only set at startup via
+    /// the CLI flag — not persisted to the config file and not overridable
+    /// via env var. ibus-daemon spawns daklak with this flag.
+    #[serde(skip)]
+    pub ibus_requested: bool,
 
     /// Modern-style tone placement on `oa`/`oe`/`uy` diphthongs.
     /// `true` (default) → `oà`, `false` → `òa` (legacy).
@@ -78,15 +77,18 @@ pub struct Config {
     #[serde(default = "default_modern_style")]
     pub modern_style: bool,
 
-    /// Ordered evdev keymap hook names. Each name resolves to
-    /// `$XDG_CONFIG_HOME/daklak/hooks/<name>-set` and `<name>-unset`.
-    /// Hooks may self-filter by desktop/session and exit 10 when not applicable.
+    /// Ordered evdev keymap hook names. Each name resolves to a
+    /// `<name>-set` / `<name>-unset` script pair, searched at runtime in:
+    /// `$XDG_CONFIG_HOME/daklak/hooks` (user overrides), then
+    /// `~/.local/libexec/daklak/hooks`, then `/usr/libexec/daklak/hooks`.
+    /// A hook whose scripts aren't installed is skipped (not fatal). Hooks may
+    /// also self-filter by desktop/session and exit 10 when not applicable.
     #[serde(default)]
     pub evdev_grab_hooks: Vec<String>,
 
-    /// Path where this config was loaded from. `None` when using defaults.
-    /// Populated by `Config::load()` / `Config::load_from()`. Used by the
-    /// tray menu to write method/modern_style changes back to the file.
+    /// Path where this config was loaded from or should be saved. Populated by
+    /// `Config::load()` / `Config::load_from()` when a default or explicit path
+    /// is known. Used by the tray menu to persist runtime changes.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
 }
@@ -109,7 +111,7 @@ impl Default for Config {
             log_modules: Vec::new(),
             enable_evdev_grab: false,
             bracket_shortcuts: false,
-            enable_ibus: false,
+            ibus_requested: false,
             evdev_grab_hooks: Vec::new(),
             modern_style: default_modern_style(),
             config_path: None,
@@ -131,7 +133,8 @@ impl Config {
     pub fn load_from(path: Option<PathBuf>) -> Result<Self> {
         let mut cfg = match path {
             Some(ref p) => Self::load_file(p)?,
-            None => Self::load_default_file().unwrap_or_default(),
+            None => Self::load_default_file()
+                .unwrap_or_else(|| Self::default_with_config_path(Self::default_config_path())),
         };
 
         // Populate config_path now so that tray / save() know where to write.
@@ -190,17 +193,18 @@ impl Config {
             );
         }
 
-        if let Ok(v) = std::env::var("DAKLAK_ENABLE_IBUS") {
-            cfg.enable_ibus = matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
-        }
-
         Ok(cfg)
     }
 
     fn load_default_file() -> Option<Self> {
+        let path = Self::default_config_path()?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let mut cfg: Self = toml::from_str(&text).ok()?;
+        cfg.config_path = Some(path);
+        Some(cfg)
+    }
+
+    fn default_config_path() -> Option<PathBuf> {
         let config_dir = std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(std::path::PathBuf::from)
@@ -209,12 +213,13 @@ impl Config {
                     .ok()
                     .map(|h| std::path::PathBuf::from(h).join(".config"))
             })?;
+        Some(config_dir.join("daklak").join("config.toml"))
+    }
 
-        let path = config_dir.join("daklak").join("config.toml");
-        let text = std::fs::read_to_string(&path).ok()?;
-        let mut cfg: Self = toml::from_str(&text).ok()?;
-        cfg.config_path = Some(path);
-        Some(cfg)
+    fn default_with_config_path(config_path: Option<PathBuf>) -> Self {
+        let mut cfg = Self::default();
+        cfg.config_path = config_path;
+        cfg
     }
 
     fn load_file(path: &Path) -> Result<Self> {
@@ -284,11 +289,25 @@ log_path = "/tmp/daklak.log"
 
     #[test]
     fn parses_evdev_grab_hooks_array() {
-        let cfg: Config = toml::from_str(r#"
+        let cfg: Config = toml::from_str(
+            r#"
             enable_evdev_grab = true
             evdev_grab_hooks = ["sway", "kde", "x11"]
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(cfg.evdev_grab_hooks, vec!["sway", "kde", "x11"]);
+    }
+
+    #[test]
+    fn default_config_remembers_save_path() {
+        let path = PathBuf::from("/tmp/daklak-config.toml");
+
+        let cfg = Config::default_with_config_path(Some(path.clone()));
+
+        assert_eq!(cfg.config_path, Some(path));
+        assert_eq!(cfg.method, MethodConfig::Telex);
+        assert!(cfg.modern_style);
     }
 
     #[test]

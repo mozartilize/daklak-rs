@@ -432,12 +432,15 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
 
     /// IM grab delivered a key REPEAT (wl_keyboard state=2). KWin generates
     /// server-side repeat as state=2 key events; rate-0 clients (Chromium /
-    /// Electron on KWin) rely on those instead of self-repeating. The press
-    /// path collapses these into `value=1`, so the client never sees a repeat
-    /// and continuous-key actions (Ctrl+Arrow, hold-arrow) die. Here we set
-    /// `forwarding_repeat` so the forward helpers emit `value=2`, re-run the
-    /// daemon's forward decision WITHOUT mutating the compose engine (it reads
-    /// `ctx.is_repeat()` to skip re-composition), and never re-Apply a commit.
+    /// Electron / ghostty on KWin) rely on those instead of self-repeating.
+    ///
+    /// A repeat is processed like a real press (matching evdev, where every
+    /// kernel repeat is a real keystroke): the daemon runs its full decision.
+    /// `forwarding_repeat` makes nav / modifier-shortcut / raw forwards emit
+    /// `value=2` so the client repeats. When the held key composes, the daemon
+    /// returns `Apply` and we apply the delete+commit edit so `a` → `â` → raw
+    /// `aaa` plays out on hold. The edit's own key events must use normal
+    /// press/release values, so `forwarding_repeat` is cleared around the apply.
     pub(crate) fn dispatch_key_repeat(&mut self, time: u32, key: u32) {
         tracing::trace!(key, "dispatch_key_repeat: IM grab delivered repeat");
         let ch = self.state.xkb.as_ref().and_then(|x| x.key_to_char(key));
@@ -452,19 +455,38 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
 
         match decision {
             // Consumed: nav / modifier-shortcut already forwarded with value=2
-            // via the ctx helpers. Compose-key repeats are swallowed by the
-            // daemon (returns Consumed) so we never re-type a held letter.
+            // via the ctx helpers.
             KeyDecision::Consumed => {}
-            // Forward-only keys (no active window / no xkb char): emit the
-            // repeat directly. Don't stamp last_forwarded_key — a repeat is
-            // not a fresh press for the tail-char-drop window.
+            // Forward-only keys (Enter, digits, punctuation, no active window /
+            // no xkb char): emit the repeat directly as value=2. Don't stamp
+            // last_forwarded_key — a repeat is not a fresh press for the
+            // tail-char-drop window.
             KeyDecision::ForwardRaw => {
                 self.state.emit_forward_key(time, key, 2);
             }
-            // A repeat must never drive a fresh delete+commit. The daemon
-            // shouldn't return Apply on repeat, but guard regardless.
-            KeyDecision::Apply { .. } => {
-                tracing::debug!(key, "repeat resolved to Apply — ignored");
+            // A held compose key recomposes: apply the delete+commit edit the
+            // same way dispatch_key_press does. The edit's internal key events
+            // (backspaces / forwarded commit) must be normal press/release, not
+            // value=2, so clear forwarding_repeat for the apply.
+            KeyDecision::Apply {
+                method: _,
+                backspaces,
+                commit,
+            } => {
+                self.state.forwarding_repeat = false;
+                let held_user_kc = self.state.held_user_kc();
+                let raw_mods = self.state.raw_mods;
+                let mut ctx = AdapterCtx {
+                    state: &mut self.state,
+                };
+                self.handler.apply_pending(
+                    &mut ctx,
+                    time,
+                    backspaces,
+                    &commit,
+                    raw_mods,
+                    held_user_kc,
+                );
             }
         }
         self.state.forwarding_repeat = false;

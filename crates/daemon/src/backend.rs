@@ -39,7 +39,7 @@ impl InputBackend {
 
     pub fn native_from_config(config: &Config) -> Self {
         #[cfg(feature = "ibus")]
-        if config.enable_ibus {
+        if config.ibus_requested {
             return Self::Ibus;
         }
 
@@ -51,10 +51,23 @@ impl InputBackend {
     }
 
     pub fn startup_from_config(config: &Config) -> Self {
+        // IBus is special: when requested, start the IBus connection first so
+        // evdev can layer on top while IBus remains connected in passthrough.
+        #[cfg(feature = "ibus")]
+        if config.ibus_requested {
+            return Self::Ibus;
+        }
+
+        // Otherwise, honor the persisted evdev startup switch directly.
         if config.enable_evdev_grab {
             return Self::Evdev;
         }
-        Self::native_from_config(config)
+
+        if config.enable_wayland {
+            return Self::Wayland;
+        }
+
+        Self::Auto
     }
 }
 
@@ -75,6 +88,7 @@ impl fmt::Display for BackendTarget {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::field_reassign_with_default, clippy::uninlined_format_args)]
     use super::*;
     use crate::config::Config;
 
@@ -82,17 +96,27 @@ mod tests {
     fn parses_backend_targets_and_rejects_direct_native_backend_names() {
         assert_eq!(BackendTarget::parse("native"), Some(BackendTarget::Native));
         assert_eq!(BackendTarget::parse("auto"), Some(BackendTarget::Native));
-        assert_eq!(BackendTarget::parse("evdev-grab"), Some(BackendTarget::Evdev));
+        assert_eq!(
+            BackendTarget::parse("evdev-grab"),
+            Some(BackendTarget::Evdev)
+        );
         assert_eq!(BackendTarget::parse("ibus"), None);
         assert_eq!(BackendTarget::parse("wayland"), None);
     }
 
     #[test]
-    fn startup_config_honors_explicit_evdev_before_native() {
+    fn startup_honors_evdev_enabled_over_wayland() {
         let mut cfg = Config::default();
         cfg.enable_wayland = true;
         cfg.enable_evdev_grab = true;
-        cfg.enable_ibus = true;
+        assert_eq!(InputBackend::startup_from_config(&cfg), InputBackend::Evdev);
+    }
+
+    #[test]
+    fn startup_falls_back_to_evdev_when_no_native() {
+        let mut cfg = Config::default();
+        cfg.enable_wayland = false;
+        cfg.enable_evdev_grab = true;
         assert_eq!(InputBackend::startup_from_config(&cfg), InputBackend::Evdev);
     }
 
@@ -100,8 +124,106 @@ mod tests {
     fn native_config_prefers_ibus_over_wayland() {
         let mut cfg = Config::default();
         cfg.enable_wayland = true;
-        cfg.enable_ibus = true;
+        cfg.ibus_requested = true;
         #[cfg(feature = "ibus")]
         assert_eq!(InputBackend::native_from_config(&cfg), InputBackend::Ibus);
+        #[cfg(not(feature = "ibus"))]
+        assert_eq!(
+            InputBackend::native_from_config(&cfg),
+            InputBackend::Wayland
+        );
+    }
+
+    // ── startup priority matrix tests ──────────────────────────────────
+
+    #[test]
+    fn matrix_ibus_x_wayland_x_evdev_x() {
+        // --ibus, wayland, evdev → ibus (native) then evdev layered
+        let mut cfg = Config::default();
+        cfg.ibus_requested = true;
+        cfg.enable_wayland = true;
+        cfg.enable_evdev_grab = true;
+        #[cfg(feature = "ibus")]
+        assert_eq!(
+            InputBackend::startup_from_config(&cfg),
+            InputBackend::Ibus,
+            "with --ibus, ibus is the startup backend"
+        );
+        #[cfg(not(feature = "ibus"))]
+        assert_eq!(
+            InputBackend::startup_from_config(&cfg),
+            InputBackend::Evdev,
+            "without ibus feature, enable_evdev_grab makes evdev active"
+        );
+    }
+
+    #[test]
+    fn matrix_ibus_dash_wayland_dash_evdev_x() {
+        // no --ibus, no wayland, evdev → evdev-only
+        let mut cfg = Config::default();
+        cfg.enable_wayland = false;
+        cfg.enable_evdev_grab = true;
+        assert_eq!(InputBackend::startup_from_config(&cfg), InputBackend::Evdev);
+    }
+
+    #[test]
+    fn matrix_ibus_x_wayland_dash_evdev_dash() {
+        // --ibus, no wayland, no evdev → ibus only
+        let mut cfg = Config::default();
+        cfg.enable_wayland = false;
+        cfg.ibus_requested = true;
+        cfg.enable_evdev_grab = false;
+        #[cfg(feature = "ibus")]
+        assert_eq!(InputBackend::startup_from_config(&cfg), InputBackend::Ibus);
+        #[cfg(not(feature = "ibus"))]
+        assert_eq!(
+            InputBackend::startup_from_config(&cfg),
+            InputBackend::Auto,
+            "no ibus feature + no wayland + no evdev → Auto (error)"
+        );
+    }
+
+    #[test]
+    fn matrix_ibus_x_wayland_dash_evdev_x() {
+        // --ibus, no wayland, evdev → ibus (native) then evdev layered
+        let mut cfg = Config::default();
+        cfg.enable_wayland = false;
+        cfg.ibus_requested = true;
+        cfg.enable_evdev_grab = true;
+        #[cfg(feature = "ibus")]
+        assert_eq!(InputBackend::startup_from_config(&cfg), InputBackend::Ibus);
+        #[cfg(not(feature = "ibus"))]
+        assert_eq!(
+            InputBackend::startup_from_config(&cfg),
+            InputBackend::Evdev,
+            "no ibus feature: falls back to evdev-only"
+        );
+    }
+
+    #[test]
+    fn matrix_ibus_dash_wayland_x_evdev_dash() {
+        // no --ibus, wayland, no evdev → wayland only
+        let mut cfg = Config::default();
+        cfg.ibus_requested = false;
+        cfg.enable_wayland = true;
+        cfg.enable_evdev_grab = false;
+        assert_eq!(
+            InputBackend::startup_from_config(&cfg),
+            InputBackend::Wayland
+        );
+    }
+
+    #[test]
+    fn matrix_ibus_dash_wayland_x_evdev_x() {
+        // no --ibus, wayland, evdev → evdev active on startup
+        let mut cfg = Config::default();
+        cfg.ibus_requested = false;
+        cfg.enable_wayland = true;
+        cfg.enable_evdev_grab = true;
+        assert_eq!(
+            InputBackend::startup_from_config(&cfg),
+            InputBackend::Evdev,
+            "config enable_evdev_grab=true makes evdev active on startup"
+        );
     }
 }

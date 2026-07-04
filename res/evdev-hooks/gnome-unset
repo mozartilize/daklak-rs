@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+
+case "${XDG_CURRENT_DESKTOP:-}" in
+    *GNOME*|*gnome*) ;;
+    *) [ -n "${GNOME_DESKTOP_SESSION_ID:-}" ] || exit 10 ;;
+esac
+command -v gsettings >/dev/null 2>&1 || exit 10
+
+runtime=${XDG_RUNTIME_DIR:-/tmp}
+state=$runtime/daklak-evdev-hooks/gnome-options
+[ -f "$state" ] || exit 10
+config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+symbols_file=$config_home/xkb/symbols/daklak_vn
+rules_file=$config_home/xkb/rules/evdev
+
+old_options=$(sed -n '1p' "$state")
+
+# Guard against restoring daklak's own option: if the saved value is exactly
+# the daklak-only list (set ran while it was already the only option), restoring
+# it would re-enable daklak on unset. Clear it to the empty list instead.
+if [ "$old_options" = "['daklak:vn']" ]; then
+    old_options="@as []"
+fi
+
+gsettings set org.gnome.desktop.input-sources xkb-options "$old_options"
+
+if [ -f "$runtime/daklak-evdev-hooks/gnome-symbols.prev" ]; then
+    cp "$runtime/daklak-evdev-hooks/gnome-symbols.prev" "$symbols_file"
+else
+    rm -f "$symbols_file"
+fi
+if [ -f "$runtime/daklak-evdev-hooks/gnome-rules.prev" ]; then
+    cp "$runtime/daklak-evdev-hooks/gnome-rules.prev" "$rules_file"
+else
+    rm -f "$rules_file"
+fi
+rm -f \
+    "$runtime/daklak-evdev-hooks/gnome-symbols.prev" \
+    "$runtime/daklak-evdev-hooks/gnome-symbols.missing" \
+    "$runtime/daklak-evdev-hooks/gnome-rules.prev" \
+    "$runtime/daklak-evdev-hooks/gnome-rules.missing"
+rm -f "$state"

@@ -179,6 +179,15 @@ impl AdapterHandler for Daemon {
             return KeyDecision::ForwardRaw;
         }
 
+        // When the supervisor has layered evdev on top (suspended=true),
+        // pass all keys through raw — the evdev grab owns the keyboard.
+        if self.suspended.load(Ordering::Acquire) {
+            if let Some(w) = self.router.composer.as_mut() {
+                w.full_reset();
+            }
+            return KeyDecision::ForwardRaw;
+        }
+
         let shortcut_mods = ModifierState::CTRL | ModifierState::ALT | ModifierState::SUPER;
         if self.router.modifiers.intersects(shortcut_mods) {
             tracing::debug!(key, mods = ?self.router.modifiers,
@@ -219,14 +228,12 @@ impl AdapterHandler for Daemon {
             return KeyDecision::ForwardRaw;
         }
 
-        // Past here keys feed the compose engine. A repeat must not: swallow it
-        // so a held letter / backspace doesn't re-type or re-delete through the
-        // engine. (Cursor-nav repeats already returned above via the forward
-        // paths; this only drops compose-key auto-repeat, which Vietnamese
-        // typing never relies on.)
-        if repeat {
-            return KeyDecision::Consumed;
-        }
+        // A key REPEAT past here is processed like a real press: compose keys
+        // feed the engine (hold `a` → `a` → `â` → raw `aaa`), held Backspace
+        // deletes, and non-composing keys forward. The adapter's
+        // dispatch_key_repeat applies the resulting edit / forwards raw as
+        // state=2 so rate-0 clients (Chromium / ghostty on KWin) repeat too.
+        // This matches evdev, where every kernel repeat is a real keystroke.
 
         if key == KEY_BACKSPACE {
             // Don't mark an action: BS deletes, doesn't compose. The killer
@@ -330,9 +337,8 @@ impl AdapterHandler for Daemon {
         let vk_available = ctx.profile().has_vk_keyboard;
         let matched = app_id.is_some() && vk_available;
 
-        let synthetic_target_changed = self.router.synthetic_active
-            && matched
-            && self.router.focused_app_id != app_id;
+        let synthetic_target_changed =
+            self.router.synthetic_active && matched && self.router.focused_app_id != app_id;
 
         if matched && (!self.router.current_active || synthetic_target_changed) {
             let id = app_id.clone().unwrap_or_default();

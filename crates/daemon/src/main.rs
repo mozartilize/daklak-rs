@@ -47,7 +47,12 @@ fn print_help() {
     println!("  -c, --config <path>       Use an alternate config file.");
     println!("  DAKLAK_CONFIG=<path>      Same as --config (env override).");
     println!("                            Default: $XDG_CONFIG_HOME/daklak/config.toml");
-    println!();
+    if cfg!(feature = "ibus") {
+        println!();
+        println!("IBus integration:");
+        println!("  --ibus                       Run as an IBus engine (spawned by ibus-daemon).");
+        println!();
+    }
     println!("Logging flags:");
     println!("  --log-level <error|info|debug>  Set the base log level (trace aliases debug).");
     println!("  --log-path <path>               Write logs to this path (default /dev/stdout).");
@@ -109,9 +114,12 @@ where
                 if let Some(next) = args.peek() {
                     if !next.starts_with('-') {
                         let raw = args.next().unwrap();
-                        cli.backend_arg = Some(backend::BackendTarget::parse(&raw).ok_or_else(|| {
-                            anyhow::anyhow!("daklak: unknown backend {raw:?}; use native, auto, or evdev")
-                        })?);
+                        cli.backend_arg =
+                            Some(backend::BackendTarget::parse(&raw).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "daklak: unknown backend {raw:?}; use native, auto, or evdev"
+                                )
+                            })?);
                     }
                 }
             }
@@ -121,7 +129,8 @@ where
                 cli.overrides.config_path = Some(PathBuf::from(next_value(&mut args, "--config")?));
             }
             _ if arg.starts_with("--config=") || arg.starts_with("-c=") => {
-                cli.overrides.config_path = Some(PathBuf::from(value_after_equals(&arg, "--config")?));
+                cli.overrides.config_path =
+                    Some(PathBuf::from(value_after_equals(&arg, "--config")?));
             }
             "--log-level" => cli.overrides.log_level = Some(next_value(&mut args, "--log-level")?),
             _ if arg.starts_with("--log-level=") => {
@@ -131,9 +140,14 @@ where
             _ if arg.starts_with("--log-path=") => {
                 cli.overrides.log_path = Some(value_after_equals(&arg, "--log-path")?);
             }
-            "--log-module" => cli.overrides.log_modules.push(next_value(&mut args, "--log-module")?),
+            "--log-module" => cli
+                .overrides
+                .log_modules
+                .push(next_value(&mut args, "--log-module")?),
             _ if arg.starts_with("--log-module=") => {
-                cli.overrides.log_modules.push(value_after_equals(&arg, "--log-module")?);
+                cli.overrides
+                    .log_modules
+                    .push(value_after_equals(&arg, "--log-module")?);
             }
             "--log-modules" => cli
                 .overrides
@@ -154,10 +168,14 @@ where
     }
 
     if cli.gen_keymap_symbols && !matches!(cli.command, Some(Command::GenKeymap)) {
-        return Err(anyhow::anyhow!("daklak: --symbols is only valid with gen-keymap"));
+        return Err(anyhow::anyhow!(
+            "daklak: --symbols is only valid with gen-keymap"
+        ));
     }
     if cli.gen_keymap_rules && !matches!(cli.command, Some(Command::GenKeymap)) {
-        return Err(anyhow::anyhow!("daklak: --rules is only valid with gen-keymap"));
+        return Err(anyhow::anyhow!(
+            "daklak: --rules is only valid with gen-keymap"
+        ));
     }
     if cli.gen_keymap_symbols && cli.gen_keymap_rules {
         return Err(anyhow::anyhow!(
@@ -183,8 +201,12 @@ fn set_command(slot: &mut Option<Command>, command: Command, arg: &str) -> Resul
     Ok(())
 }
 
-fn next_value(args: &mut std::iter::Peekable<impl Iterator<Item = String>>, flag: &str) -> Result<String> {
-    args.next().ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
+fn next_value(
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+    flag: &str,
+) -> Result<String> {
+    args.next()
+        .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
 }
 
 fn value_after_equals(arg: &str, flag: &str) -> Result<String> {
@@ -213,7 +235,11 @@ fn apply_overrides(config: &mut config::Config, overrides: CliOverrides) {
         config.log_modules = overrides.log_modules;
     }
     if overrides.ibus {
-        config.enable_ibus = true;
+        if cfg!(feature = "ibus") {
+            config.ibus_requested = true;
+        } else {
+            tracing::warn!("--ibus was passed but this build lacks the `ibus` feature; ignoring");
+        }
     }
 }
 
@@ -309,8 +335,7 @@ fn main() -> Result<()> {
         let enabled = Arc::new(AtomicBool::new(true));
         let (cmd_tx, cmd_rx) = control::channel();
         let (state_tx, state_rx) = tokio::sync::watch::channel(true);
-        let (backend_tx, _backend_rx) =
-            tokio::sync::watch::channel(backend::InputBackend::Auto);
+        let (backend_tx, _backend_rx) = tokio::sync::watch::channel(backend::InputBackend::Auto);
         let (config_change_tx, config_change_rx) =
             tokio::sync::watch::channel(control::ConfigChange::default());
 

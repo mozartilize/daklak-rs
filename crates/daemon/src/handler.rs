@@ -80,12 +80,15 @@ pub struct Daemon {
     /// Shared on/off flag — written by the control task, read each keystroke.
     pub enabled: Arc<AtomicBool>,
 
-    /// Passthrough flag used by IBus transport. When true, the engine forwards
-    /// keys without composing (no output). The evdev grab backend sets this on
-    /// the still-connected IBus engine while evdev owns the keyboard, preventing
-    /// double-processing. Distinct from `enabled` which is the user's on/off
-    /// gate. Never reset by the control task. Write from the supervisor only.
-    #[cfg_attr(not(feature = "ibus"), allow(dead_code))]
+    /// Passthrough flag: when true, the transport passes all keys through raw
+    /// (passthrough, no composition). Used by the ibus transport (true
+    /// layering — ibus connection stays alive while evdev owns the keyboard)
+    /// and the wayland transport (hand-off — evdev replaces wayland, and
+    /// wayland reconnects when the system switches back to native). Prevents
+    /// double-processing of keys by both backends. Distinct from `enabled`
+    /// which is the user's on/off gate. Never reset by the control task.
+    /// Written by the supervisor only.
+    #[cfg_attr(not(any(feature = "ibus", feature = "evdev_grab")), allow(dead_code))]
     pub suspended: Arc<AtomicBool>,
 
     /// Receiver for config changes sent by the tray / IPC menu actions.
@@ -113,6 +116,7 @@ impl Daemon {
     ) -> Self {
         let initial_method = config.method;
         let initial_modern_style = config.modern_style;
+        let initial_evdev_grab = config.enable_evdev_grab;
 
         Self {
             config,
@@ -123,11 +127,14 @@ impl Daemon {
             last_config: control::ConfigChange {
                 method: initial_method,
                 modern_style: initial_modern_style,
+                enable_evdev_grab: initial_evdev_grab,
             },
         }
     }
 
-    #[cfg(feature = "ibus")]
+    /// Clone the suspended flag so the supervisor can pause/resume this
+    /// transport while a layered evdev grab owns the keyboard.
+    #[cfg(any(feature = "ibus", feature = "evdev_grab"))]
     pub fn suspend_flag(&self) -> Arc<AtomicBool> {
         self.suspended.clone()
     }
@@ -147,10 +154,7 @@ impl Daemon {
     /// ibus transports: both must forward keys raw while disabled instead of
     /// continuing to compose. (The wayland path inlines the same logic with an
     /// extra key-repeat guard.)
-    #[cfg_attr(
-        not(any(feature = "ibus", feature = "evdev_grab")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(any(feature = "ibus", feature = "evdev_grab")), allow(dead_code))]
     pub(crate) fn sync_enabled_edge(&mut self) -> bool {
         let now_enabled = self.enabled.load(Ordering::Acquire);
         if self.router.last_enabled && !now_enabled {
@@ -445,9 +449,7 @@ mod tests {
         use crate::config::Config;
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
-        use viet_ime_edit_strategy::{
-            BackspaceMethod, KeyDecision, KeyState, OutputSink,
-        };
+        use viet_ime_edit_strategy::{BackspaceMethod, KeyDecision, KeyState, OutputSink};
         use viet_ime_engine::InputMethod;
         use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, AdapterState, FrameSnapshot};
 
@@ -571,11 +573,7 @@ mod tests {
             let mut state = AdapterState::new();
             let mut ctx = AdapterCtx { state: &mut state };
 
-            daemon.on_focus_changed(
-                &mut ctx,
-                Some("com.mitchellh.ghostty".to_owned()),
-                false,
-            );
+            daemon.on_focus_changed(&mut ctx, Some("com.mitchellh.ghostty".to_owned()), false);
 
             assert!(daemon.router.current_active);
             assert!(daemon.router.synthetic_active);
@@ -602,11 +600,7 @@ mod tests {
             state.profile.has_vk_keyboard = false;
             let mut ctx = AdapterCtx { state: &mut state };
 
-            daemon.on_focus_changed(
-                &mut ctx,
-                Some("com.mitchellh.ghostty".to_owned()),
-                false,
-            );
+            daemon.on_focus_changed(&mut ctx, Some("com.mitchellh.ghostty".to_owned()), false);
 
             assert!(!daemon.router.current_active);
             assert!(!daemon.router.synthetic_active);
@@ -625,7 +619,11 @@ mod tests {
             // to avoid the Chromium race condition where the key release
             // arrives via the fast wl_keyboard path and changes Chrome's
             // selection state before our text edit arrives.
-            let mut daemon = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
+            let mut daemon = Daemon::new(
+                Config::default(),
+                Arc::new(AtomicBool::new(true)),
+                super::super::noop_config_rx(),
+            );
             daemon.router.current_active = true;
             daemon.router.composer = Some(Composer::new(
                 InputMethod::Telex,
@@ -676,7 +674,11 @@ mod tests {
         use viet_ime_engine::InputMethod;
 
         fn daemon() -> Daemon {
-            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
+            let mut d = Daemon::new(
+                Config::default(),
+                Arc::new(AtomicBool::new(true)),
+                super::super::noop_config_rx(),
+            );
             d.router.current_active = true;
             d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
@@ -694,13 +696,25 @@ mod tests {
             assert!(d.sync_enabled_edge());
             // Build in-flight composition state.
             let _ = d.handle_char('h');
-            assert!(d.router.composer.as_ref().unwrap().last_input_char.is_some());
+            assert!(d
+                .router
+                .composer
+                .as_ref()
+                .unwrap()
+                .last_input_char
+                .is_some());
             // Toggle off: the on→off edge closes the gate and clears the word
             // so a later enable starts clean (mirrors what the evdev/ibus
             // transports rely on to stop composing while daklak is "off").
             d.enabled.store(false, Ordering::Release);
             assert!(!d.sync_enabled_edge());
-            assert!(d.router.composer.as_ref().unwrap().last_input_char.is_none());
+            assert!(d
+                .router
+                .composer
+                .as_ref()
+                .unwrap()
+                .last_input_char
+                .is_none());
         }
 
         #[test]
@@ -782,7 +796,11 @@ mod tests {
         const KEY_LEFT: u32 = 105;
 
         fn v1_daemon() -> Daemon {
-            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
+            let mut d = Daemon::new(
+                Config::default(),
+                Arc::new(AtomicBool::new(true)),
+                super::super::noop_config_rx(),
+            );
             d.router.current_active = true;
             d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
@@ -801,15 +819,44 @@ mod tests {
         }
 
         #[test]
-        fn compose_key_repeat_is_swallowed() {
+        fn compose_key_repeat_composes() {
             let mut d = v1_daemon();
             key(&mut d, KEY_A, Some('a'), false);
-            // Holding the letter must NOT re-type it: the repeat is swallowed
-            // (Consumed) so the engine is untouched and 'a' isn't duplicated.
+            // Holding the letter composes like a real press: the second 'a'
+            // transforms "aa" → "â", so the repeat returns Apply (delete 1 +
+            // commit "â"), matching evdev behaviour.
             let decision = key(&mut d, KEY_A, Some('a'), true);
             assert!(
-                matches!(decision, KeyDecision::Consumed),
-                "compose-key repeat is swallowed"
+                matches!(decision, KeyDecision::Apply { .. }),
+                "compose-key repeat feeds the engine"
+            );
+        }
+
+        #[test]
+        fn raw_forward_key_repeat_is_forwarded_raw() {
+            const KEY_5: u32 = 6;
+            let mut d = v1_daemon();
+            // A digit isn't a Telex compose key: on repeat it forwards raw
+            // (the adapter emits it as state=2 for rate-0 clients), never
+            // swallowed.
+            let decision = key(&mut d, KEY_5, Some('5'), true);
+            assert!(
+                matches!(decision, KeyDecision::ForwardRaw),
+                "raw-forward repeat forwards raw"
+            );
+        }
+
+        #[test]
+        fn backspace_repeat_is_processed_not_swallowed() {
+            const KEY_BS: u32 = 14;
+            let mut d = v1_daemon();
+            // Held Backspace deletes on repeat like a real press. With an empty
+            // composer the engine doesn't consume it, so it forwards raw (the
+            // app performs the delete) — the point is it is NOT swallowed.
+            let decision = key(&mut d, KEY_BS, None, true);
+            assert!(
+                matches!(decision, KeyDecision::ForwardRaw),
+                "held backspace is processed"
             );
         }
 
@@ -865,7 +912,11 @@ mod tests {
         const KEY_L: u32 = 38;
 
         fn daemon() -> Daemon {
-            let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), super::super::noop_config_rx());
+            let mut d = Daemon::new(
+                Config::default(),
+                Arc::new(AtomicBool::new(true)),
+                super::super::noop_config_rx(),
+            );
             d.router.current_active = true;
             d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
@@ -960,8 +1011,8 @@ mod tests {
 
         #[test]
         fn full_state_struct_applies_method_and_modern_style_together() {
-            // The tray always sends a complete `ConfigChange{method,modern_style}`.
-            // `sync_config()` must apply both fields from a single update.
+            // The tray always sends a complete `ConfigChange{method,modern_style,enable_evdev_grab}`.
+            // `sync_config()` must apply the runtime fields (method, modern_style) from a single update.
             let (tx, rx) = watch::channel(ConfigChange::default());
             let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), rx);
             assert_eq!(d.config.method, MethodConfig::Telex);
@@ -971,6 +1022,7 @@ mod tests {
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Vni,
                 modern_style: false,
+                enable_evdev_grab: false,
             });
             d.sync_config();
 
@@ -1001,7 +1053,12 @@ mod tests {
             // Build an in-flight composition state.
             let _ = d.handle_char('h');
             assert!(
-                d.router.composer.as_ref().unwrap().last_input_char.is_some(),
+                d.router
+                    .composer
+                    .as_ref()
+                    .unwrap()
+                    .last_input_char
+                    .is_some(),
                 "engine must have state after handle_char"
             );
 
@@ -1009,12 +1066,18 @@ mod tests {
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Telex,
                 modern_style: true,
+                enable_evdev_grab: false,
             });
             d.sync_config();
 
             // The in-flight state must survive (no silent reset).
             assert!(
-                d.router.composer.as_ref().unwrap().last_input_char.is_some(),
+                d.router
+                    .composer
+                    .as_ref()
+                    .unwrap()
+                    .last_input_char
+                    .is_some(),
                 "no-op sync_config() must not reset the engine"
             );
         }
@@ -1031,10 +1094,12 @@ mod tests {
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Vni,
                 modern_style: true,
+                enable_evdev_grab: false,
             });
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Telex,
                 modern_style: false,
+                enable_evdev_grab: false,
             });
 
             d.sync_config();
@@ -1052,22 +1117,21 @@ mod tests {
             let (tx, rx) = watch::channel(ConfigChange {
                 method: MethodConfig::Telex,
                 modern_style: false,
+                enable_evdev_grab: false,
             });
             let mut cfg = Config::default();
             cfg.modern_style = false;
             let mut d = Daemon::new(cfg, Arc::new(AtomicBool::new(true)), rx);
             d.router.current_active = true;
-            let mut composer = Composer::new(
-                InputMethod::Telex,
-                BackspaceMethod::SurroundingText,
-                false,
-            );
+            let mut composer =
+                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
             composer.set_modern_style(false);
             d.router.composer = Some(composer);
 
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Vni,
                 modern_style: false,
+                enable_evdev_grab: false,
             });
             d.sync_config();
             assert_eq!(d.config.method, MethodConfig::Vni);
@@ -1106,18 +1170,30 @@ mod tests {
 
             // Build in-flight state.
             let _ = d.handle_char('h');
-            assert!(d.router.composer.as_ref().unwrap().last_input_char.is_some());
+            assert!(d
+                .router
+                .composer
+                .as_ref()
+                .unwrap()
+                .last_input_char
+                .is_some());
 
             // Method changes: Telex → Vni.
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Vni,
                 modern_style: true,
+                enable_evdev_grab: false,
             });
             d.sync_config();
 
             // Engine must have been reset by set_input_method.
             assert!(
-                d.router.composer.as_ref().unwrap().last_input_char.is_none(),
+                d.router
+                    .composer
+                    .as_ref()
+                    .unwrap()
+                    .last_input_char
+                    .is_none(),
                 "engine must reset on method change"
             );
             // Config field persisted.

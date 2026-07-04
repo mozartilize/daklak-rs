@@ -112,15 +112,17 @@ daklak gen-keymap --symbols > ~/.config/xkb/symbols/daklak_vn     # option path 
 daklak gen-keymap --rules   > ~/.config/xkb/rules/evdev           # option path (Wayland)
 ```
 
-For the **blob** paths (sway/X11) nothing is installed — the blob is loaded
-directly. For the **option** paths (KDE/GNOME Wayland) the two files go under
+For manual setup, the **blob** paths (sway/X11) load the generated blob directly.
+The **option** paths (KDE/GNOME Wayland) put the two files under
 `~/.config/xkb/` (user-local, no root, no system-file edits); libxkbcommon
 searches `~/.config/xkb` first, so they shadow the stock ruleset cleanly.
 
-Meson installs the symbols file system-wide (`/usr/share/X11/xkb/symbols/
-daklak_vn`) when configured with `-Devdev_grab=true` and `sudo meson install` —
-that covers the `setxkbmap daklak_vn` *layout* path only; the Wayland *option*
-path wants the user-local copies above.
+Meson installs all three generated artifacts when configured with
+`-Devdev_grab=true` and `sudo meson install`: `daklak.xkb`, `daklak_vn`, and
+`evdev` under `${datadir}/daklak/xkb` (typically `/usr/share/daklak/xkb`). It
+also installs `daklak_vn` system-wide under `/usr/share/X11/xkb/symbols/` for
+the `setxkbmap daklak_vn` *layout* path. The built-in hooks consume these
+installed files instead of running `daklak gen-keymap` at runtime.
 
 Verify it parses cleanly (optional — the slot/name table is checked at compile
 time via a `const` assertion, so this is just for hand-editing or CI):
@@ -219,30 +221,37 @@ daklak gen-keymap --rules   > ~/.config/xkb/rules/evdev
 
 ### KDE / KWin
 
-Set the `daklak:vn` option in `kxkbrc`, then tell KWin to reload:
+Set the `daklak:vn` option in `kxkbrc`, using `--notify` so KWin reloads it live:
 
 ```
-kwriteconfig6 --file kxkbrc --group Layout --key Options daklak:vn
-kwriteconfig6 --file kxkbrc --group Layout --key ResetOldOptions true
-qdbus6 org.kde.KWin /KWin reconfigure
+kwriteconfig6 --notify --file kxkbrc --group Layout --key Options daklak:vn
+kwriteconfig6 --notify --file kxkbrc --group Layout --key ResetOldOptions true
 ```
 
-**`ResetOldOptions=true` is mandatory.** Without it KWin silently ignores the
-`Options` key at runtime — the keymap won't change even though `reconfigure`
-recompiles. With it, a plain `reconfigure` applies the option immediately (no
-layout-list toggling needed).
+**The `--notify` flag is mandatory for a live reload.** KWin recompiles the
+seat keymap only when its keyboard `KConfigWatcher` receives the
+`org.kde.kconfig.notify` D-Bus signal. A plain `kwriteconfig6` write does **not**
+emit that signal, so the edit sits on disk unread until the next login. `--notify`
+emits it, and KWin recompiles the keymap immediately (no layout-list toggling, no
+logout). Note that `qdbus6 org.kde.KWin /KWin reconfigure` does **not** apply the
+keymap — it reloads `kwinrc`/compositor state, not the xkb layout, so it is not
+part of this recipe.
+
+**`ResetOldOptions=true` is also mandatory.** Without it KWin ignores the
+`Options` key entirely (it reads `Options` only when `ResetOldOptions` is true,
+otherwise falling back to the `XKB_DEFAULT_OPTIONS` environment default) — so the
+keymap won't pick up `daklak:vn` no matter how the reload is triggered.
 
 `ResetOldOptions=true` makes KWin **replace** the entire xkb option set with
 exactly what's in `Options` on each apply. If you rely on other options (e.g.
 `compose:ralt`, a `grp:` layout-switch key), list them all, comma-separated:
 `Options=daklak:vn,compose:ralt`.
 
-Revert:
+Revert (again `--notify` for the live reload):
 
 ```
-kwriteconfig6 --file kxkbrc --group Layout --key Options ""
-kwriteconfig6 --file kxkbrc --group Layout --key ResetOldOptions true
-qdbus6 org.kde.KWin /KWin reconfigure
+kwriteconfig6 --notify --file kxkbrc --group Layout --key Options ""
+kwriteconfig6 --notify --file kxkbrc --group Layout --key ResetOldOptions true
 ```
 
 ### GNOME / Mutter
@@ -390,26 +399,62 @@ environment (e.g. apply the xkb keymap, toggle `xkbcomp`, or configure an
 xkb option). On switch-back to the native backend daklak runs corresponding
 **cleanup hooks**.
 
-Hooks are configured in the config file:
+Packaged installs built with `-Devdev_grab=true` include built-in hooks named
+`sway`, `kde`, `gnome`, and `x11`. Each hook name resolves at runtime to a
+`<name>-set` / `<name>-unset` script pair, searched in order:
+
+1. `$XDG_CONFIG_HOME/daklak/hooks` (or `~/.config/daklak/hooks`) — user overrides
+2. `~/.local/libexec/daklak/hooks` — per-user install
+3. `/usr/libexec/daklak/hooks` — system install
+
+First directory with a complete pair wins, so a user override shadows the
+packaged copy. Runtime discovery means a directly-built (cargo) binary finds
+installed hooks without a compile-time path. `/var/lib` is never used — these
+are static helper programs, not mutable state.
+
+The keymap files the hooks consume — `daklak.xkb`, `daklak_vn`, `evdev` — are
+found the same way, in the first existing of `$XDG_CONFIG_HOME/daklak/xkb`,
+`~/.local/share/daklak/xkb`, then `/usr/share/daklak/xkb` (Meson installs them
+to `${datadir}/daklak/xkb`). Daklak exports that directory to hooks as
+`DAKLAK_XKB_DIR`; the hooks read or copy the files and never call
+`daklak gen-keymap` while running.
+
+Hooks are configured by name in the config file:
 
 ```toml
 evdev_grab_hooks = [
-    # Setup: keymap on, ibus off, …
-    "xkbcomp /tmp/daklak.xkb $DISPLAY",
-    # Cleanup: keymap off, ibus on, …
-    "setxkbmap us",
+    # Built-in hooks self-skip with exit 10 when their desktop is not active.
+    "sway",
+    "kde",
+    "gnome",
+    "x11",
 ]
 ```
 
 Hook names must contain only ASCII alphanumeric characters, underscores, and
 hyphens — no whitespace, path separators, or shell syntax. The hooks are
-executed in order via `std::process::Command` (never through a shell).
+resolved to `<name>-set` / `<name>-unset` executable pairs and run in order via
+`std::process::Command` (never through a shell).
+
+A configured hook whose `<name>-set` / `<name>-unset` scripts are not installed
+(in `$XDG_CONFIG_HOME/daklak/hooks` or the packaged libexec dir) is **skipped
+with a warning**, not treated as an error. This lets a single
+`evdev_grab_hooks = ["sway", "kde", "gnome", "x11"]` list work across machines
+where only one desktop's scripts exist. A missing script never aborts evdev
+activation — important because on KDE daklak may run as KWin's managed
+virtual-keyboard input method, where a non-zero exit would make KWin terminate
+the daklak process.
+
+Daklak runs setup hooks after its uinput device exists **and after physical
+keyboards are grabbed**. This ordering matters for X11: the daklak uinput slave
+must already exist before the hook loads the XKB keymap, otherwise the slave can
+inherit the previous keymap and Vietnamese slot keysyms will not resolve.
 
 | Exit code | Meaning |
 |---|---|
 | `0` | Applied successfully |
 | `10` | Skipped (not applicable — no error) |
-| other | Failure — logged but does not block evdev activation |
+| other | Failure — already-applied hooks are rolled back and evdev activation stops |
 
 ### Rollback recovery
 

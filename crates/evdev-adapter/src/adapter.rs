@@ -236,9 +236,17 @@ impl EvdevAdapter {
     /// Forward a raw key *press* and record the keycode so its later
     /// autorepeat/release is forwarded too. Presses the engine consumes are
     /// never recorded, so their continuation events are dropped as dangling.
+    ///
+    /// A held key that composed first (its press consumed) then transitions to
+    /// raw-forward mid-hold arrives here on an autorepeat (`value=2`). The
+    /// client only honours a repeat after it has seen a press for that key, so
+    /// the first raw forward of a key is emitted as a press (`value=1`) even if
+    /// the triggering event was an autorepeat — otherwise the client drops the
+    /// dangling repeat and the key appears to stop repeating.
     fn forward_press_raw(&mut self, code: u32, value: i32) {
-        self.forwarded_press.insert(code);
-        self.passthrough(code, value);
+        let newly_forwarded = self.forwarded_press.insert(code);
+        let emit_value = if newly_forwarded && value == 2 { 1 } else { value };
+        self.passthrough(code, emit_value);
     }
 
     /// Adjust uinput-emitted Shift / AltGr (Level3) / HENK (Level5) state
@@ -391,24 +399,26 @@ impl EvdevAdapter {
             }
         }
 
-        // Releases and autorepeats are continuation events: only meaningful
-        // for a key whose press was forwarded raw. If the engine consumed the
-        // press (Consumed / Apply), the client never saw a matching press, so
-        // forwarding the release/autorepeat would emit a dangling event —
-        // which, through the live IBus passthrough path, can strand the client
-        // in an auto-repeat. Modifiers are handled above and always forward
-        // both edges.
-        if value != 1 {
+        // A RELEASE (value=0) is a continuation event: only meaningful for a key
+        // whose press was forwarded raw. If the engine consumed the press
+        // (Consumed / Apply), the client never saw a matching press, so
+        // forwarding the release would emit a dangling event — which, through
+        // the live IBus passthrough path, can strand the client in an
+        // auto-repeat. Modifiers are handled above and always forward both edges.
+        //
+        // AUTOREPEAT (value=2) falls through to the press pipeline below so held
+        // keys repeat like a fresh press — matching the wayland and ibus paths:
+        // a forwarded key re-forwards (value=2), a compose key re-feeds the
+        // engine (hold `a` → `a` → `â` → raw `aaa`).
+        if value == 0 {
             if self.forwarded_press.contains(&code) {
                 self.passthrough(code, value);
-                if value == 0 {
-                    self.forwarded_press.remove(&code);
-                }
+                self.forwarded_press.remove(&code);
             }
             return;
         }
 
-        // From here: press events (value == 1).
+        // From here: press or autorepeat (value == 1 or 2).
 
         // Ctrl/Alt/Super shortcuts bypass engine. Reset composition
         // state — the shortcut may have edited the display behind our
@@ -620,32 +630,79 @@ mod tests {
         );
     }
 
-    /// Autorepeats follow the same rule: forwarded for a forwarded press,
-    /// dropped for a consumed one.
+    /// Autorepeat (value=2) is processed like a fresh press so held keys repeat
+    /// consistently with the wayland / ibus paths: a forwarded key re-forwards
+    /// its repeat (value=2), and a compose key re-feeds the engine.
     #[test]
-    fn autorepeat_follows_press_disposition() {
+    fn autorepeat_of_forwarded_key_reforwards() {
         let s = KEY_S as u32;
-
-        // Consumed press: autorepeat dropped.
         let emitter = CapturingEmitter::default();
         let events = emitter.events.clone();
         let mut adapter = test_adapter(emitter);
         let mut handler = MockHandler {
-            char_decisions: vec![KeyDecision::Consumed],
+            char_decisions: vec![KeyDecision::ForwardRaw, KeyDecision::ForwardRaw],
         };
-        adapter.process_event(&mut handler, &key(KEY_S, 1));
-        adapter.process_event(&mut handler, &key(KEY_S, 2)); // autorepeat
-        assert!(events.lock().unwrap().is_empty());
-
-        // Forwarded press: autorepeat forwarded.
-        let emitter = CapturingEmitter::default();
-        let events = emitter.events.clone();
-        let mut adapter = test_adapter(emitter);
-        let mut handler = MockHandler {
-            char_decisions: vec![KeyDecision::ForwardRaw],
-        };
-        adapter.process_event(&mut handler, &key(KEY_S, 1));
-        adapter.process_event(&mut handler, &key(KEY_S, 2));
+        adapter.process_event(&mut handler, &key(KEY_S, 1)); // press → forward raw
+        adapter.process_event(&mut handler, &key(KEY_S, 2)); // autorepeat → re-forward
         assert_eq!(&*events.lock().unwrap(), &[(s, 1), (s, 2)]);
+        assert!(
+            handler.char_decisions.is_empty(),
+            "autorepeat re-invokes handle_char (processed like a press)"
+        );
+    }
+
+    #[test]
+    fn autorepeat_of_compose_key_recomposes() {
+        let emitter = CapturingEmitter::default();
+        let events = emitter.events.clone();
+        let mut adapter = test_adapter(emitter);
+        let mut handler = MockHandler {
+            char_decisions: vec![
+                KeyDecision::Consumed,
+                KeyDecision::Apply {
+                    method: viet_ime_edit_strategy::BackspaceMethod::ForwardKey,
+                    backspaces: 1,
+                    commit: "a".into(),
+                },
+            ],
+        };
+        adapter.process_event(&mut handler, &key(KEY_S, 1)); // press → consumed
+        adapter.process_event(&mut handler, &key(KEY_S, 2)); // autorepeat → Apply recompose
+        assert!(
+            handler.char_decisions.is_empty(),
+            "autorepeat feeds the compose engine again"
+        );
+        assert!(
+            !events.lock().unwrap().is_empty(),
+            "recompose on repeat emits the delete + commit"
+        );
+    }
+
+    /// A held key that composed first (press consumed) then transitions to
+    /// raw-forward mid-hold arrives here on an autorepeat (value=2). The client
+    /// never saw a press for it, so the first raw forward must be a PRESS
+    /// (value=1) — otherwise the client drops the dangling repeat and the key
+    /// appears to stop repeating until pressed afresh.
+    #[test]
+    fn first_raw_forward_of_held_key_emits_press_not_dangling_repeat() {
+        let s = KEY_S as u32;
+        let emitter = CapturingEmitter::default();
+        let events = emitter.events.clone();
+        let mut adapter = test_adapter(emitter);
+        let mut handler = MockHandler {
+            char_decisions: vec![
+                KeyDecision::Consumed,   // press: composed (nothing forwarded)
+                KeyDecision::ForwardRaw, // autorepeat: engine now forwards raw
+                KeyDecision::ForwardRaw, // autorepeat: keeps forwarding
+            ],
+        };
+        adapter.process_event(&mut handler, &key(KEY_S, 1)); // press → consumed
+        adapter.process_event(&mut handler, &key(KEY_S, 2)); // autorepeat → first raw forward
+        adapter.process_event(&mut handler, &key(KEY_S, 2)); // autorepeat → subsequent
+        assert_eq!(
+            &*events.lock().unwrap(),
+            &[(s, 1), (s, 2)],
+            "first raw forward is a press, then a repeat"
+        );
     }
 }

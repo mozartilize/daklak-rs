@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+[ -n "${DISPLAY:-}" ] || exit 10
+command -v xkbcomp >/dev/null 2>&1 || exit 10
+
+config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+runtime=${XDG_RUNTIME_DIR:-/tmp}
+state_dir=$runtime/daklak-evdev-hooks
+previous=$state_dir/x11-previous.xkb
+mkdir -p "$state_dir"
+
+# Locate the daklak.xkb blob. Order mirrors the daemon's builtin_xkb_dir():
+# 1. DAKLAK_XKB_DIR (daemon-set env var)
+# 2. $XDG_CONFIG_HOME/daklak/xkb
+# 3. ~/.local/share/daklak/xkb
+# 4. /usr/share/daklak/xkb
+keymap=
+if [ -n "${DAKLAK_XKB_DIR:-}" ] && [ -f "$DAKLAK_XKB_DIR/daklak.xkb" ]; then
+    keymap=$DAKLAK_XKB_DIR/daklak.xkb
+else
+    for cand in \
+        "$config_home/daklak/xkb" \
+        "$HOME/.local/share/daklak/xkb" \
+        /usr/share/daklak/xkb; do
+        if [ -f "$cand/daklak.xkb" ]; then
+            keymap=$cand/daklak.xkb
+            break
+        fi
+    done
+fi
+if [ -z "$keymap" ]; then
+    echo "daklak: xkb blob (daklak.xkb) not found" >&2
+    exit 1
+fi
+
+xkbcomp "$DISPLAY" "$previous" >/dev/null 2>&1
+xkbcomp "$keymap" "$DISPLAY"

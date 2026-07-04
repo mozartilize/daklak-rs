@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+case ":${XDG_CURRENT_DESKTOP:-}:${KDE_FULL_SESSION:-}:" in
+    *KDE*|*kde*|*:true:*) ;;
+    *) exit 10 ;;
+esac
+command -v kwriteconfig6 >/dev/null 2>&1 || exit 10
+
+runtime=${XDG_RUNTIME_DIR:-/tmp}
+state=$runtime/daklak-evdev-hooks/kde.env
+[ -f "$state" ] || exit 10
+config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+symbols_file=$config_home/xkb/symbols/daklak_vn
+rules_file=$config_home/xkb/rules/evdev
+
+old_options=$(sed -n '1p' "$state")
+old_reset=$(sed -n '2p' "$state")
+
+# Guard against restoring daklak's own option: if the saved value is exactly
+# "daklak:vn" (set ran while it was already the only option), restoring it would
+# re-enable daklak on unset. Clear it instead.
+if [ "$old_options" = "daklak:vn" ]; then
+    old_options=""
+fi
+
+# --notify triggers KWin's live keymap recompile (see kde-set for why the old
+# `qdbus6 … reconfigure` call did nothing). The --notify write carries the
+# restored options + ResetOldOptions=true, so the reload honours "$old_options".
+kwriteconfig6 --file kxkbrc --group Layout --key Options "$old_options"
+kwriteconfig6 --notify --file kxkbrc --group Layout --key ResetOldOptions true
+# Restore the user's original ResetOldOptions without --notify: it only needs to
+# take effect at the next login, and re-notifying here would recompile again
+# with the old (possibly false) value and drop "$old_options" from the keymap.
+kwriteconfig6 --file kxkbrc --group Layout --key ResetOldOptions "${old_reset:-false}"
+
+if [ -f "$runtime/daklak-evdev-hooks/kde-symbols.prev" ]; then
+    cp "$runtime/daklak-evdev-hooks/kde-symbols.prev" "$symbols_file"
+else
+    rm -f "$symbols_file"
+fi
+if [ -f "$runtime/daklak-evdev-hooks/kde-rules.prev" ]; then
+    cp "$runtime/daklak-evdev-hooks/kde-rules.prev" "$rules_file"
+else
+    rm -f "$rules_file"
+fi
+rm -f \
+    "$runtime/daklak-evdev-hooks/kde-symbols.prev" \
+    "$runtime/daklak-evdev-hooks/kde-symbols.missing" \
+    "$runtime/daklak-evdev-hooks/kde-rules.prev" \
+    "$runtime/daklak-evdev-hooks/kde-rules.missing"
+rm -f "$state"

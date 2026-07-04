@@ -1,0 +1,65 @@
+#!/bin/sh
+set -eu
+
+case "${XDG_CURRENT_DESKTOP:-}" in
+    *GNOME*|*gnome*) ;;
+    *) [ -n "${GNOME_DESKTOP_SESSION_ID:-}" ] || exit 10 ;;
+esac
+command -v gsettings >/dev/null 2>&1 || exit 10
+
+config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+runtime=${XDG_RUNTIME_DIR:-/tmp}
+state_dir=$runtime/daklak-evdev-hooks
+state=$state_dir/gnome-options
+symbols_file=$config_home/xkb/symbols/daklak_vn
+rules_file=$config_home/xkb/rules/evdev
+mkdir -p "$config_home/xkb/symbols" "$config_home/xkb/rules" "$state_dir"
+
+# Locate xkb artifacts. Order mirrors the daemon's builtin_xkb_dir() search:
+# 1. DAKLAK_XKB_DIR (daemon-set env var)
+# 2. $XDG_CONFIG_HOME/daklak/xkb
+# 3. ~/.local/share/daklak/xkb
+# 4. /usr/share/daklak/xkb
+xkb_dir=
+if [ -n "${DAKLAK_XKB_DIR:-}" ] && [ -f "$DAKLAK_XKB_DIR/daklak_vn" ] && [ -f "$DAKLAK_XKB_DIR/evdev" ]; then
+    xkb_dir=$DAKLAK_XKB_DIR
+else
+    for cand in \
+        "$config_home/daklak/xkb" \
+        "$HOME/.local/share/daklak/xkb" \
+        /usr/share/daklak/xkb; do
+        if [ -f "$cand/daklak_vn" ] && [ -f "$cand/evdev" ]; then
+            xkb_dir=$cand
+            break
+        fi
+    done
+fi
+if [ -z "$xkb_dir" ]; then
+    echo "daklak: xkb artifacts (daklak_vn, evdev) not found" >&2
+    exit 1
+fi
+
+if [ -f "$symbols_file" ]; then
+    cp "$symbols_file" "$state_dir/gnome-symbols.prev"
+else
+    : > "$state_dir/gnome-symbols.missing"
+fi
+if [ -f "$rules_file" ]; then
+    cp "$rules_file" "$state_dir/gnome-rules.prev"
+else
+    : > "$state_dir/gnome-rules.missing"
+fi
+
+cp "$xkb_dir/daklak_vn" "$symbols_file"
+cp "$xkb_dir/evdev" "$rules_file"
+
+old_options=$(gsettings get org.gnome.desktop.input-sources xkb-options)
+printf '%s\n' "$old_options" > "$state"
+
+case "$old_options" in
+    *"'daklak:vn'"*) new_options=$old_options ;;
+    "@as []"|"[]") new_options="['daklak:vn']" ;;
+    *) new_options=$(printf '%s\n' "$old_options" | sed "s/]$/, 'daklak:vn']/") ;;
+esac
+
+gsettings set org.gnome.desktop.input-sources xkb-options "$new_options"
