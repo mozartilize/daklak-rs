@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Ephemeral ibus component descriptor for the daklak lifecycle probe.
+  NOT for production. Placeholders are substituted by ibus-lifecycle-probe.sh:
+    @PROBE_EXEC@   absolute path to target/debug/ibus_lifecycle_probe (+ any args)
+    @BUS_NAME@     well-known D-Bus name (must match the probe's --name)
+    @ENGINE_NAME@  ibus engine id used with `ibus engine <name>`
+    @LONGNAME@     human label shown in ibus-setup / GNOME Settings
+
+  Default profile uses distinct names (DaklakProbe / daklak-probe) so it never
+  clashes with a real daklak install. The --impersonate profile substitutes the
+  real daklak names to reproduce the exact production component identity; only
+  use it when daklak itself is NOT installed. Either way the ibus-daemon
+  spawn/lifecycle code path exercised is identical.
+-->
+<component>
+    <name>@BUS_NAME@</name>
+    <description>daklak ibus lifecycle probe (ephemeral, not for production)</description>
+    <exec>@PROBE_EXEC@</exec>
+    <version>0.0.0</version>
+    <author>daklak probe</author>
+    <license>GPL-3.0-or-later</license>
+    <homepage>https://github.com/mozartilize/daklak-rs</homepage>
+    <textdomain>daklak-probe</textdomain>
+    <engines>
+        <engine>
+            <name>@ENGINE_NAME@</name>
+            <language>vi</language>
+            <license>GPL-3.0-or-later</license>
+            <author>daklak probe</author>
+            <layout>us</layout>
+            <longname>@LONGNAME@</longname>
+            <description>Ephemeral ibus lifecycle probe engine</description>
+            <icon>ibus-keyboard</icon>
+            <rank>0</rank>
+            <symbol>dp</symbol>
+        </engine>
+    </engines>
+</component>
