@@ -12,7 +12,6 @@ members = [
     "crates/wayland-adapter",
     "crates/evdev-adapter",
     "crates/ibus-adapter",
-    "tools/probe",
 ]
 
 [workspace.package]

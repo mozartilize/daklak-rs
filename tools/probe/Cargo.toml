@@ -1,8 +1,11 @@
+[workspace]
+
 [package]
 name = "probe"
 version = "0.1.0"
 edition = "2021"
 description = "Wayland protocol probe for viet-ime development"
+autobins = false
 
 [[bin]]
 name = "probe"
@@ -24,16 +27,30 @@ path = "src/bin/im_v1_probe.rs"
 name = "ibus_probe"
 path = "src/bin/ibus_probe.rs"
 
+[[bin]]
+name = "ibus_lifecycle_probe"
+path = "src/bin/ibus_lifecycle_probe.rs"
+
+[features]
+default = []
+
 [dependencies]
-wayland-backend = { workspace = true }
-wayland-client = { workspace = true }
-wayland-protocols = { workspace = true }
-wayland-protocols-wlr = { workspace = true }
+wayland-backend = "0.3"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-scanner = "0.31"
 libc = "0.2"
 
 # ibus_probe (Phase 0): IBus engine over D-Bus.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 zvariant = "5"
-tokio = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+
+# ibus_lifecycle_probe: reuse daklak's real ibus registration path so
+# ibus-daemon exercises the identical spawn/lifecycle code path.
+viet-ime-ibus-adapter = { path = "../../crates/ibus-adapter" }
+viet-ime-edit-strategy = { path = "../../crates/edit-strategy" }
