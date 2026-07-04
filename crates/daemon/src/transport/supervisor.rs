@@ -31,10 +31,7 @@ pub struct Supervisor {
     /// is consumed by `IbusRuntime`. Kept alive across evdev switches so the
     /// supervisor can gate IBus passthrough without dropping the IBus
     /// connection (which would lose input-context binding).
-    #[cfg_attr(
-        not(all(feature = "ibus", feature = "evdev_grab")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(all(feature = "ibus", feature = "evdev_grab")), allow(dead_code))]
     ibus_suspend: Option<Arc<AtomicBool>>,
     /// Set by handle_cmd when the transport needs to stop and switch.
     pending_action: Option<PendingAction>,
@@ -43,12 +40,16 @@ pub struct Supervisor {
 fn backend_supported_at_build(backend: InputBackend) -> Result<()> {
     match backend {
         InputBackend::Ibus => {
-            #[cfg(feature = "ibus")] return Ok(());
-            #[cfg(not(feature = "ibus"))] return Err(anyhow!("ibus support was not compiled in"));
+            #[cfg(feature = "ibus")]
+            return Ok(());
+            #[cfg(not(feature = "ibus"))]
+            return Err(anyhow!("ibus support was not compiled in"));
         }
         InputBackend::Evdev => {
-            #[cfg(feature = "evdev_grab")] return Ok(());
-            #[cfg(not(feature = "evdev_grab"))] return Err(anyhow!("evdev_grab support was not compiled in"));
+            #[cfg(feature = "evdev_grab")]
+            return Ok(());
+            #[cfg(not(feature = "evdev_grab"))]
+            return Err(anyhow!("evdev_grab support was not compiled in"));
         }
         InputBackend::Wayland | InputBackend::Auto => Ok(()),
     }
@@ -90,6 +91,14 @@ impl Supervisor {
             return Err(anyhow!(
                 "no input backend enabled; set enable_wayland=true or enable_evdev_grab=true"
             ));
+        }
+
+        // If a native backend starts and evdev is enabled, switch to evdev.
+        // For ibus, evdev layers on top (ibus connection stays alive).
+        // For wayland, evdev replaces wayland (wayland reconnects on switch
+        // back to native).
+        if self.config.enable_evdev_grab && current != InputBackend::Evdev {
+            self.pending_action = Some(PendingAction::SwitchTo(InputBackend::Evdev));
         }
 
         loop {
@@ -136,7 +145,8 @@ impl Supervisor {
         match backend {
             InputBackend::Wayland => self.run_wayland_loop(rx).await,
             InputBackend::Ibus => {
-                #[cfg(feature = "ibus")] {
+                #[cfg(feature = "ibus")]
+                {
                     return self.run_ibus_loop(rx).await;
                 }
                 #[cfg(not(feature = "ibus"))]
@@ -147,10 +157,7 @@ impl Supervisor {
         }
     }
 
-    async fn run_wayland_loop(
-        &mut self,
-        rx: &mut mpsc::Receiver<Command>,
-    ) -> Result<()> {
+    async fn run_wayland_loop(&mut self, rx: &mut mpsc::Receiver<Command>) -> Result<()> {
         let daemon = Daemon::new(
             self.config.clone(),
             self.enabled.clone(),
@@ -161,6 +168,10 @@ impl Supervisor {
         let transport =
             crate::main_loop::core_loop_with_wayland_shutdown(&mut wayland, shutdown_rx);
         tokio::pin!(transport);
+        // Publish the active backend so `daklak backend` and the tray reflect
+        // the switch. Without this, a prior evdev announcement stays latched and
+        // the reported backend is wrong after switching back to native.
+        let _ = self.backend_tx.send(InputBackend::Wayland);
 
         loop {
             if self.pending_action.is_some() {
@@ -183,10 +194,7 @@ impl Supervisor {
     }
 
     #[cfg(feature = "ibus")]
-    async fn run_ibus_loop(
-        &mut self,
-        rx: &mut mpsc::Receiver<Command>,
-    ) -> Result<()> {
+    async fn run_ibus_loop(&mut self, rx: &mut mpsc::Receiver<Command>) -> Result<()> {
         let daemon = Daemon::new(
             self.config.clone(),
             self.enabled.clone(),
@@ -262,9 +270,24 @@ impl Supervisor {
                 return;
             }
         };
+        let mut adapter = match viet_ime_evdev_adapter::EvdevAdapter::prepare() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(%e, "evdev adapter prepare failed");
+                return;
+            }
+        };
+
+        if let Err(e) = adapter.grab_keyboards() {
+            tracing::warn!(%e, "evdev grab failed");
+            return;
+        }
+
         let (applied, outcomes) = match tokio::task::spawn_blocking(move || {
             evdev_hooks::run_setup_hooks(&hooks, &ProcessHookRunner)
-        }).await {
+        })
+        .await
+        {
             Ok(Ok((a, o))) => (a, o),
             Ok(Err(e)) => {
                 tracing::warn!(%e, "evdev hooks setup failed");
@@ -277,22 +300,6 @@ impl Supervisor {
         };
         tracing::info!(?outcomes, "evdev keymap hooks processed");
         let _ = evdev_hooks::write_rollback_marker(&applied);
-
-        let mut adapter = match viet_ime_evdev_adapter::EvdevAdapter::prepare() {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(%e, "evdev adapter prepare failed");
-                let _ = evdev_hooks::run_cleanup_hooks(&applied, &ProcessHookRunner);
-                evdev_hooks::clear_rollback_marker();
-                return;
-            }
-        };
-        if let Err(e) = adapter.grab_keyboards() {
-            tracing::warn!(%e, "evdev grab failed");
-            let _ = evdev_hooks::run_cleanup_hooks(&applied, &ProcessHookRunner);
-            evdev_hooks::clear_rollback_marker();
-            return;
-        }
 
         // Flip IBus to passthrough: the still-connected engine forwards keys
         // raw (no compose, no output) while the evdev grab owns the keyboard,
@@ -313,8 +320,7 @@ impl Supervisor {
         let applied_for_cleanup = applied;
         let transport = async {
             let result = adapter.run_until_shutdown(&mut daemon, shutdown_rx).await;
-            let cleanup =
-                evdev_hooks::run_cleanup_hooks(&applied_for_cleanup, &ProcessHookRunner);
+            let cleanup = evdev_hooks::run_cleanup_hooks(&applied_for_cleanup, &ProcessHookRunner);
             if cleanup.is_ok() {
                 evdev_hooks::clear_rollback_marker();
             }
@@ -355,25 +361,19 @@ impl Supervisor {
     }
 
     #[cfg(feature = "evdev_grab")]
-    async fn run_evdev_loop(
-        &mut self,
-        rx: &mut mpsc::Receiver<Command>,
-    ) -> Result<()> {
+    async fn run_evdev_loop(&mut self, rx: &mut mpsc::Receiver<Command>) -> Result<()> {
         use crate::evdev_hooks::{self, ProcessHookRunner};
 
+        let mut adapter = viet_ime_evdev_adapter::EvdevAdapter::prepare()?;
         let hooks = evdev_hooks::resolve_hooks(&self.config)?;
+        adapter.grab_keyboards()?;
+
         let (applied, outcomes) = tokio::task::spawn_blocking(move || {
             evdev_hooks::run_setup_hooks(&hooks, &ProcessHookRunner)
         })
         .await??;
         tracing::info!(?outcomes, "evdev keymap hooks processed");
         evdev_hooks::write_rollback_marker(&applied)?;
-
-        let mut adapter = viet_ime_evdev_adapter::EvdevAdapter::prepare()?;
-        adapter.grab_keyboards().inspect_err(|_| {
-            let _ = evdev_hooks::run_cleanup_hooks(&applied, &ProcessHookRunner);
-            evdev_hooks::clear_rollback_marker();
-        })?;
 
         let mut daemon = Daemon::new(
             self.config.clone(),
@@ -386,8 +386,7 @@ impl Supervisor {
         let applied_for_cleanup = applied;
         let transport = async {
             let result = adapter.run_until_shutdown(&mut daemon, shutdown_rx).await;
-            let cleanup =
-                evdev_hooks::run_cleanup_hooks(&applied_for_cleanup, &ProcessHookRunner);
+            let cleanup = evdev_hooks::run_cleanup_hooks(&applied_for_cleanup, &ProcessHookRunner);
             if cleanup.is_ok() {
                 evdev_hooks::clear_rollback_marker();
             }
@@ -417,10 +416,7 @@ impl Supervisor {
     }
 
     #[cfg(not(feature = "evdev_grab"))]
-    async fn run_evdev_loop(
-        &mut self,
-        _rx: &mut mpsc::Receiver<Command>,
-    ) -> Result<()> {
+    async fn run_evdev_loop(&mut self, _rx: &mut mpsc::Receiver<Command>) -> Result<()> {
         Err(anyhow!(
             "evdev_grab mode requested, but the daemon was built without the evdev_grab feature"
         ))
@@ -451,7 +447,9 @@ impl Supervisor {
             CmdKind::SetBackend(target) => {
                 let target = match self.resolve_target(target) {
                     Ok(t) => t,
-                    Err(e) => return ControlReply::Error(format!("backend {target} unavailable: {e}")),
+                    Err(e) => {
+                        return ControlReply::Error(format!("backend {target} unavailable: {e}"))
+                    }
                 };
                 if self.current_backend() == target {
                     return ControlReply::Ok(format!("backend {target}"));

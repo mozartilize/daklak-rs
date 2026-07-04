@@ -1,0 +1,72 @@
+#!/bin/sh
+set -eu
+
+case ":${XDG_CURRENT_DESKTOP:-}:${KDE_FULL_SESSION:-}:" in
+    *KDE*|*kde*|*:true:*) ;;
+    *) exit 10 ;;
+esac
+command -v kwriteconfig6 >/dev/null 2>&1 || exit 10
+command -v kreadconfig6 >/dev/null 2>&1 || exit 10
+
+config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+runtime=${XDG_RUNTIME_DIR:-/tmp}
+state_dir=$runtime/daklak-evdev-hooks
+state=$state_dir/kde.env
+symbols_file=$config_home/xkb/symbols/daklak_vn
+rules_file=$config_home/xkb/rules/evdev
+mkdir -p "$config_home/xkb/symbols" "$config_home/xkb/rules" "$state_dir"
+
+# Locate xkb artifacts. Order mirrors the daemon's builtin_xkb_dir() search:
+# 1. DAKLAK_XKB_DIR (daemon-set env var)
+# 2. $XDG_CONFIG_HOME/daklak/xkb
+# 3. ~/.local/share/daklak/xkb
+# 4. /usr/share/daklak/xkb
+xkb_dir=
+if [ -n "${DAKLAK_XKB_DIR:-}" ] && [ -f "$DAKLAK_XKB_DIR/daklak_vn" ] && [ -f "$DAKLAK_XKB_DIR/evdev" ]; then
+    xkb_dir=$DAKLAK_XKB_DIR
+else
+    for cand in \
+        "$config_home/daklak/xkb" \
+        "$HOME/.local/share/daklak/xkb" \
+        /usr/share/daklak/xkb; do
+        if [ -f "$cand/daklak_vn" ] && [ -f "$cand/evdev" ]; then
+            xkb_dir=$cand
+            break
+        fi
+    done
+fi
+if [ -z "$xkb_dir" ]; then
+    echo "daklak: xkb artifacts (daklak_vn, evdev) not found" >&2
+    exit 1
+fi
+
+if [ -f "$symbols_file" ]; then
+    cp "$symbols_file" "$state_dir/kde-symbols.prev"
+else
+    : > "$state_dir/kde-symbols.missing"
+fi
+if [ -f "$rules_file" ]; then
+    cp "$rules_file" "$state_dir/kde-rules.prev"
+else
+    : > "$state_dir/kde-rules.missing"
+fi
+
+cp "$xkb_dir/daklak_vn" "$symbols_file"
+cp "$xkb_dir/evdev" "$rules_file"
+
+old_options=$(kreadconfig6 --file kxkbrc --group Layout --key Options || true)
+old_reset=$(kreadconfig6 --file kxkbrc --group Layout --key ResetOldOptions || true)
+printf '%s\n%s\n' "$old_options" "$old_reset" > "$state"
+
+case ",$old_options," in
+    *,daklak:vn,*) new_options=$old_options ;;
+    ,) new_options=daklak:vn ;;
+    *) new_options=$old_options,daklak:vn ;;
+esac
+
+# --notify makes KWin's keyboard KConfigWatcher recompile the seat keymap live.
+# A plain kwriteconfig6 write emits no notification, and
+# `qdbus6 org.kde.KWin /KWin reconfigure` does not touch the xkb keymap, so
+# without --notify the option would not apply until the next login.
+kwriteconfig6 --file kxkbrc --group Layout --key Options "$new_options"
+kwriteconfig6 --notify --file kxkbrc --group Layout --key ResetOldOptions true

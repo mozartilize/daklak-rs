@@ -27,8 +27,17 @@ force_vk_only_apps = []
 auto_vk_only_for_xwayland = true
 
 # Open and grab /dev/input/event* keyboards at startup.
+# When true, evdev runs alongside the native backend (ibus/wayland).
+# The tray "Enable evdev" toggle persists changes here.
 # default: false
 enable_evdev_grab = false
+
+# Evdev setup hooks to run when evdev grab is activated. Packaged installs ship
+# sway, kde, gnome, and x11 hooks; user scripts in $XDG_CONFIG_HOME/daklak/hooks
+# with matching <name>-set and <name>-unset filenames override packaged hooks.
+# The tray "Evdev hooks" submenu toggles entries here.
+# default: []
+evdev_grab_hooks = []
 
 # Telex-only: allow []{} shortcuts for o-horn/u-horn.
 # default: false
