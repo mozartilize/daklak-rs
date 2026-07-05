@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -17,6 +21,11 @@ impl IpcServer {
         let _ = std::fs::remove_file(&path);
         match UnixListener::bind(&path) {
             Ok(listener) => {
+                if let Err(e) = restrict_socket_permissions(&path) {
+                    tracing::warn!(path = %path.display(), error = %e, "IPC socket chmod failed");
+                    let _ = std::fs::remove_file(&path);
+                    return None;
+                }
                 tracing::info!("IPC socket bound at {}", path.display());
                 Some(Self { listener, path })
             }
@@ -29,6 +38,11 @@ impl IpcServer {
 
     pub async fn accept(&self) -> std::io::Result<UnixStream> {
         let (stream, _addr) = self.listener.accept().await?;
+        #[cfg(target_os = "linux")]
+        {
+            let peer = peer_uid(&stream)?;
+            validate_peer_uid(peer, current_euid())?;
+        }
         Ok(stream)
     }
 }
@@ -36,6 +50,47 @@ impl IpcServer {
 impl Drop for IpcServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { cred.assume_init() }.uid)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_peer_uid(peer: u32, expected: u32) -> std::io::Result<()> {
+    if peer == expected {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("IPC peer uid {peer} does not match daemon uid {expected}"),
+        ))
     }
 }
 
@@ -160,5 +215,43 @@ mod tests {
             parse_ipc_command("backend evdev extra"),
             Err("backend takes at most one argument".to_owned())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_restricts_socket_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "daklak-ipc-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let server = IpcServer::bind().await.expect("bind IPC server");
+        let mode = std::fs::metadata(&server.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "IPC socket must not be group/world accessible");
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_peer_uid_rejects_other_users() {
+        let current = current_euid();
+        let other = if current == 0 { 1 } else { 0 };
+        let err = validate_peer_uid(other, current).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn validate_peer_uid_accepts_current_user() {
+        let current = current_euid();
+        validate_peer_uid(current, current).unwrap();
     }
 }
