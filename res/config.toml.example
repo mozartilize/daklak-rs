@@ -32,9 +32,13 @@ auto_vk_only_for_xwayland = true
 # default: false
 enable_evdev_grab = false
 
-# Evdev setup hooks to run when evdev grab is activated. Packaged installs ship
-# sway, kde, gnome, and x11 hooks; user scripts in $XDG_CONFIG_HOME/daklak/hooks
-# with matching <name>-set and <name>-unset filenames override packaged hooks.
+# Evdev setup hooks to run when evdev grab is activated.
+# SECURITY: hooks are executable programs. A file such as
+# $XDG_CONFIG_HOME/daklak/hooks/sway-set runs as your user with Daklak's
+# environment. Treat that directory as sensitive as ~/.bashrc or
+# ~/.config/autostart.
+# Packaged installs ship sway, kde, gnome, and x11 hooks; user scripts with
+# matching <name>-set and <name>-unset filenames override packaged hooks.
 # The tray "Evdev hooks" submenu toggles entries here.
 # default: []
 evdev_grab_hooks = []

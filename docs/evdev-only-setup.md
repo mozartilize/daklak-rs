@@ -39,6 +39,30 @@ Compared to Wayland mode, no `zwp_input_method_v2` is involved — it works on a
 compositor (sway, scroll, KWin, Mutter, X11) as long as keyboard-class
 `/dev/input/event*` is readable by the daklak user (`input` group membership).
 
+## Security model
+
+Evdev mode is a high-trust fallback. While active, Daklak reads keyboard events
+from `/dev/input/event*`, holds exclusive grabs on the physical keyboards, and
+injects replacement/pass-through events through `/dev/uinput`. That is the same
+class of privilege as a local key remapper: it can observe keystroke metadata and
+can inject keystrokes into the active session.
+
+Use evdev mode only for sessions where you trust the Daklak process and its
+configuration. Prefer the native Wayland/IBus backend when it works for your
+applications.
+
+`daklak disable` turns Vietnamese composition off but does not release the evdev
+grab; keys are forwarded raw through Daklak. To release the physical keyboard
+grab, switch back to the native backend:
+
+```sh
+daklak backend native
+```
+
+Avoid leaving `RUST_LOG=trace` or equivalent trace-level module logging enabled
+while typing sensitive input. Trace logs can include keycodes and input-state
+metadata useful for reconstructing keystrokes.
+
 ## Why a synthetic keymap is needed
 
 The engine commits precomposed characters (`ấ`, `ầ`, …) that don't exist in the
@@ -398,6 +422,12 @@ runtime, daklak can run **setup hooks** — shell commands that prepare the
 environment (e.g. apply the xkb keymap, toggle `xkbcomp`, or configure an
 xkb option). On switch-back to the native backend daklak runs corresponding
 **cleanup hooks**.
+
+Security note: hooks are executable programs, not passive config. A user override
+such as `$XDG_CONFIG_HOME/daklak/hooks/sway-set` runs as your user with Daklak's
+environment when evdev mode activates. Treat the hooks directory like
+`~/.bashrc`, `~/.config/autostart`, or a user systemd unit: do not make it
+writable by other users or untrusted tools.
 
 Packaged installs built with `-Devdev_grab=true` include built-in hooks named
 `sway`, `kde`, `gnome`, and `x11`. Each hook name resolves at runtime to a
