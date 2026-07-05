@@ -4,7 +4,7 @@
 //!
 //! - `zwp_virtual_keyboard_v1` (wlroots / IM v2 path).
 //! - `zwp_input_method_context_v1.key()` (KWin / IM v1 path).
-//! - `/dev/uinput` (evdev-only mode).
+//! - `/dev/uinput` (evdev mode).
 //!
 //! They all reduce to `key(time, keycode, value)` + optional
 //! `modifiers(dep, lat, lock, group)`. This crate is the single trait

@@ -5,7 +5,7 @@
 //!
 //! - `viet-ime-wayland-adapter` Tier 4 (uploads `keymap_text()` to
 //!   `zwp_virtual_keyboard_v1.keymap()` via memfd).
-//! - `viet-ime-daemon` evdev-only mode (writes `keymap_text()` to a
+//! - `viet-ime-daemon` evdev mode (writes `keymap_text()` to a
 //!   `.xkb` file, points sway/scroll at it via `swaymsg input … xkb_file`).
 //!
 //! Vietnamese precomposed chars live in custom slots packed across 17
@@ -80,7 +80,7 @@ pub const BASE_EVDEV: u32 = SAFE_KEYCODES[0] as u32;
 /// device, the
 /// real-kb's keymap decodes it (their pc+us+inet etc., NOT daklak's
 /// per-device keymap). Daklak's emit windows are guarded by EVIOCGRAB
-/// (evdev-only mode) or the wayland keyboard grab (wayland-mode), so
+/// (evdev mode) or the wayland keyboard grab (wayland mode), so
 /// no race during commit.
 pub const SAFE_KEYCODES: &[u16] = &[
     // IME zone (kc 85,86,89-94 with 92=HENKAN reserved for L5 mod binding).
@@ -121,7 +121,7 @@ const _: () = assert!(SAFE_KEYCODES.len() == SAFE_KEYCODE_NAMES.len());
 
 /// Evdev keycode bound to `ISO_Level5_Shift` in our keymap via
 /// `modifier_map Mod3 { <HENK> }`. Daklak never physically presses this
-/// — wayland-mode addresses Mod3 via `vk.modifiers(0x20, …)`, evdev-only
+/// — wayland mode addresses Mod3 via `vk.modifiers(0x20, …)`, evdev
 /// mode emits a synthetic press of this kc through uinput before the
 /// slot keycode. Reserved to avoid SAFE_KEYCODES collision.
 pub const LEVEL5_SHIFT_EVDEV: u16 = 92; // KEY_HENKAN
@@ -318,7 +318,7 @@ pub fn vn_pairs() -> usize {
 
 /// Build the daklak synthetic xkb keymap text. Used both for the
 /// wayland-mode `zwp_virtual_keyboard_v1` keymap upload (memfd) and for
-/// the evdev-only mode `swaymsg input … xkb_file <path>` activation.
+/// the evdev mode `swaymsg input … xkb_file <path>` activation.
 pub fn keymap_text() -> String {
     let mut s = String::with_capacity(16 * 1024);
     s.push_str("xkb_keymap {\n");
@@ -390,7 +390,7 @@ fn append_symbols_section(s: &mut String, indent: &str, section: &str, include_b
     if include_base {
         s.push_str(&format!("{indent}  include \"pc+us+inet(evdev)\"\n"));
     }
-    // Group name override — lets evdev-only mode probe whether scroll/sway
+    // Group name override — lets evdev mode probe whether scroll/sway
     // actually loaded our keymap (vs falling back to its default "English
     // (US)" for daklak's uinput device).
     s.push_str(&format!("{indent}  name[Group1] = \"Daklak Vietnamese\";\n"));
@@ -406,7 +406,7 @@ fn append_symbols_section(s: &mut String, indent: &str, section: &str, include_b
     // ISO_Level5_Shift and routed to Mod3. Daklak addresses levels 5-8
     // via Mod3 (= 0x20 in vk.modifiers depressed mask), or by pressing
     // <HENK> through uinput before pressing the slot keycode in
-    // evdev-only mode. Real users with Japanese keyboards may hit
+    // evdev mode. Real users with Japanese keyboards may hit
     // KEY_HENKAN physically — that fires through their real-kb keymap,
     // which doesn't have this binding.
     s.push_str(&format!("{indent}  replace key <HENK> {{ type[Group1] = \"ONE_LEVEL\", [ ISO_Level5_Shift ] }};\n"));
@@ -450,7 +450,7 @@ fn append_symbol_rows(s: &mut String, indent: &str) {
 }
 
 /// Plan the modifier dance for one `emit_char` invocation. Public so both
-/// `AdapterSink::vk_commit_char` and the evdev-only sink reuse the same
+/// `AdapterSink::vk_commit_char` and the evdev sink reuse the same
 /// helper.
 ///
 /// - `dep` is the user's currently-depressed modifier mask.

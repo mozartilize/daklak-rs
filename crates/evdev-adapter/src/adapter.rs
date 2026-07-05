@@ -1,12 +1,12 @@
-//! Evdev-only input adapter.
+//! Evdev input adapter.
 //!
 //! Grabs every classified-as-keyboard `/dev/input/event*`, drives the
 //! engine from raw keycodes (decoded against a daemon-owned "us" xkb
 //! state), and emits via daklak's own uinput device. Pure pass-through
 //! when the engine does not consume a key.
 //!
-//! Active when `enable_wayland = false && enable_evdev_grab = true`.
-//! See `docs/evdev-only-setup.md` for the matching `daklak_vn` xkb
+//! Active when evdev grab is selected at startup or runtime.
+//! See `docs/evdev-setup.md` for the matching `daklak_vn` xkb
 //! layout that makes Vietnamese precomposed chars emittable.
 
 use std::collections::HashSet;
@@ -207,7 +207,7 @@ impl EvdevAdapter {
         }
 
         if streams.is_empty() {
-            bail!("evdev: no keyboards grabbed — evdev-only mode cannot run");
+            bail!("evdev: no keyboards grabbed — evdev mode cannot run");
         }
 
         self.streams = streams;

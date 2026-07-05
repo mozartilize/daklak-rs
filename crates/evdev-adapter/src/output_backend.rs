@@ -1,4 +1,4 @@
-//! Output backend abstraction for evdev-only mode.
+//! Output backend abstraction for evdev mode.
 //!
 //! The evdev adapter receives raw keystrokes (grabbed from
 //! `/dev/input/event*`), runs them through the daklak engine, then

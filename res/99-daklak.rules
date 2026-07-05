@@ -1,15 +1,16 @@
 # udev rule for daklak: grant access to /dev/uinput without requiring root.
 #
 # Install:
+#   getent group uinput || sudo groupadd --system uinput
 #   sudo cp res/99-daklak.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules
 #   sudo udevadm trigger --name-match=uinput
-#   sudo usermod -aG input $USER   # then log out + back in
+#   sudo usermod -aG input,uinput $USER   # then log out + back in
 #
-# Verify: ls -l /dev/uinput  →  crw-rw---- root input
+# Verify: ls -l /dev/uinput  →  crw-rw---- root uinput
 #
-# SECURITY: /dev/uinput permits synthetic keyboard injection. The input group
-# is high-trust on Linux desktops; only add users/processes you trust with input
-# observation/injection. TAG+="uaccess" grants the active local session user via
-# systemd-logind on systems that support it.
-KERNEL=="uinput", GROUP="input", MODE="0660", TAG+="uaccess"
+# SECURITY: /dev/input/event* access via the input group permits physical
+# keyboard observation/grabs. /dev/uinput access via the uinput group permits
+# synthetic keyboard injection. Keep both groups limited to users/processes you
+# trust with session-wide input control.
+KERNEL=="uinput", GROUP="uinput", MODE="0660", OPTIONS+="static_node=uinput"

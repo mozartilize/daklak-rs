@@ -94,7 +94,7 @@ impl UinputDevice {
             KeyCode::KEY_KPENTER, KeyCode::KEY_RIGHTCTRL, KeyCode::KEY_KPSLASH,
             KeyCode::KEY_SYSRQ, KeyCode::KEY_RIGHTALT,
             // KEY_HENKAN — daklak's ISO_Level5_Shift carrier for the
-            // EIGHT_LEVEL custom slots. Pressed via uinput in evdev-only
+            // EIGHT_LEVEL custom slots. Pressed via uinput in evdev
             // mode before a slot keycode to address L5..L8.
             KeyCode::KEY_HENKAN,
             KeyCode::KEY_HOME, KeyCode::KEY_UP, KeyCode::KEY_PAGEUP,

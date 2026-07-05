@@ -1,4 +1,4 @@
-# Evdev-only mode setup
+# Evdev setup
 
 [← Back to index](../README.md)
 
@@ -8,7 +8,7 @@ platform-specific steps to install it.
 
 ## Contents
 
-- [What evdev-only mode is](#what-evdev-only-mode-is)
+- [What evdev mode is](#what-evdev-mode-is)
 - [Why a synthetic keymap is needed](#why-a-synthetic-keymap-is-needed)
 - [Generating the keymap](#generating-the-keymap)
 - [sway / scroll (per-device)](#sway--scroll-per-device)
@@ -16,7 +16,7 @@ platform-specific steps to install it.
 - [SIGKILL recovery](#sigkill-recovery)
 - [Troubleshooting](#troubleshooting)
 
-## What evdev-only mode is
+## What evdev mode is
 
 Daklak's evdev mode (`enable_evdev_grab = true`) grabs every keyboard via
 `/dev/input/event*`, runs the engine on raw keycodes, and emits both
@@ -37,7 +37,8 @@ is compiled in.
 
 Compared to Wayland mode, no `zwp_input_method_v2` is involved — it works on any
 compositor (sway, scroll, KWin, Mutter, X11) as long as keyboard-class
-`/dev/input/event*` is readable by the daklak user (`input` group membership).
+`/dev/input/event*` is readable by the daklak user (`input` group membership)
+and `/dev/uinput` is writable (`uinput` group membership).
 
 ## Security model
 
@@ -45,7 +46,9 @@ Evdev mode is a high-trust fallback. While active, Daklak reads keyboard events
 from `/dev/input/event*`, holds exclusive grabs on the physical keyboards, and
 injects replacement/pass-through events through `/dev/uinput`. That is the same
 class of privilege as a local key remapper: it can observe keystroke metadata and
-can inject keystrokes into the active session.
+can inject keystrokes into the active session. Daklak separates those permissions
+where possible: the `input` group gates physical keyboard access, while the
+`uinput` group gates synthetic input injection.
 
 Use evdev mode only for sessions where you trust the Daklak process and its
 configuration. Prefer the native Wayland/IBus backend when it works for your
@@ -62,6 +65,29 @@ daklak backend native
 Avoid leaving `RUST_LOG=trace` or equivalent trace-level module logging enabled
 while typing sensitive input. Trace logs can include keycodes and input-state
 metadata useful for reconstructing keystrokes.
+
+## Device permissions
+
+Evdev mode needs two Linux input permissions:
+
+- `input` group access for `/dev/input/event*` so Daklak can read and grab
+  physical keyboards.
+- `uinput` group access for `/dev/uinput` so Daklak can create its synthetic
+  keyboard.
+
+Set up the dedicated `uinput` group and install the udev rule:
+
+```sh
+getent group uinput || sudo groupadd --system uinput
+sudo cp res/99-daklak.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --name-match=uinput
+sudo usermod -aG input,uinput $USER
+sudo modprobe uinput
+```
+
+Log out and back in after changing group membership. Verify `/dev/uinput` is
+owned by `root:uinput` with mode `crw-rw----`.
 
 ## Why a synthetic keymap is needed
 
@@ -400,7 +426,7 @@ in the GNOME/KDE keyboard switcher list — you have to install daklak's
    ```
 
 This is significantly more work than `xkbcomp` and gains you nothing extra in the
-evdev-only daklak flow (daklak isn't a layout the user manually selects — it's
+evdev daklak flow (daklak isn't a layout the user manually selects — it's
 tied to the uinput device). The `xkbcomp` one-shot above is the documented path.
 
 ## SIGKILL recovery
@@ -494,6 +520,21 @@ the stale marker and runs the cleanup hooks automatically.
 
 **Daklak exits with "no keyboards grabbed".** Check `input` group membership:
 `groups | grep input`. If absent: `sudo usermod -aG input $USER` and re-login.
+
+**Daklak cannot open `/dev/uinput`.** Check that the `uinput` group exists and
+that `/dev/uinput` is owned by it:
+
+```sh
+getent group uinput || sudo groupadd --system uinput
+sudo cp res/99-daklak.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --name-match=uinput
+sudo usermod -aG uinput $USER
+sudo modprobe uinput
+ls -l /dev/uinput   # expected: root uinput, mode crw-rw----
+```
+
+Log out and back in after changing group membership.
 
 **Vietnamese commits appear as F13/F14… or Japanese IME glyphs.** Keymap not
 applied — slots fell through to their default evdev keysym. Check `swaymsg -t

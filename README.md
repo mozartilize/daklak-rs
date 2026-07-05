@@ -21,7 +21,7 @@ self-contained but builds on the previous one:
 | 3 | [Architecture](docs/architecture.md) | Crate map, data flow, the transport-neutral "brain". |
 | 4 | [Backspace tiers](docs/backspace-tiers.md) | The core mechanism: how retroactive edits reach the app. |
 | 5 | [Transports](docs/transports.md) | Wayland (IM v1/v2), IBus/GNOME, evdev — wire details per mode. |
-| 6 | [Evdev-only setup](docs/evdev-only-setup.md) | Deep dive: the synthetic keymap and per-platform install for evdev mode. |
+| 6 | [Evdev setup](docs/evdev-setup.md) | Deep dive: the synthetic keymap and per-platform install for evdev mode. |
 | 7 | [Capability model](docs/capability-model.md) | `TransportProfile`, `ImProtocol`, `FocusSource` — capability over identity. |
 | 8 | [Key emit & focus](docs/key-emit-and-focus.md) | The `KeyEmitter` backends and focus tracking. |
 | 9 | [Compositor quirks](docs/compositor-quirks.md) | Known upstream behaviors and their settled resolutions. |

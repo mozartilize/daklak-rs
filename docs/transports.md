@@ -168,7 +168,7 @@ platform-appropriate path (e.g. `swaymsg input … xkb_file` per-device on Sway,
 or `xkbcomp … $DISPLAY` session-wide on X11). Setup is manual.
 
 This mode is the most portable (works anywhere with `/dev/input` + `/dev/uinput`)
-but the most invasive to install. See [Evdev-only setup](evdev-only-setup.md)
+but the most invasive to install. See [Evdev setup](evdev-setup.md)
 for the synthetic keymap, per-platform install steps, and troubleshooting.
 
 ## Next

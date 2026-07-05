@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn matrix_ibus_dash_wayland_dash_evdev_x() {
-        // no --ibus, no wayland, evdev → evdev-only
+        // no --ibus, no wayland, evdev → evdev startup backend
         let mut cfg = Config::default();
         cfg.enable_wayland = false;
         cfg.enable_evdev_grab = true;
@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(
             InputBackend::startup_from_config(&cfg),
             InputBackend::Evdev,
-            "no ibus feature: falls back to evdev-only"
+            "no ibus feature: falls back to evdev"
         );
     }
 

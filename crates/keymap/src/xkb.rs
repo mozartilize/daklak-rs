@@ -61,7 +61,7 @@ impl XkbState {
             .update_mask(mods_depressed, mods_latched, mods_locked, group, 0, 0);
     }
 
-    /// Build from an already-compiled keymap. Used by the evdev-only path
+    /// Build from an already-compiled keymap. Used by the evdev path
     /// where there's no compositor to send a keymap fd.
     pub fn from_keymap(keymap: xkbcommon::xkb::Keymap) -> Self {
         let state = xkbcommon::xkb::State::new(&keymap);
@@ -143,7 +143,7 @@ impl XkbState {
     }
 
     /// Reverse lookup: find an evdev keycode that produces the given character
-    /// under the current modifier state. Used by the evdev-only path to emit
+    /// under the current modifier state. Used by the evdev path to emit
     /// composed strings via uinput.
     pub fn char_to_keycode(&self, ch: char) -> Option<u32> {
         let target_sym = xkbcommon::xkb::utf32_to_keysym(ch as u32);

@@ -5,8 +5,8 @@
 # default: "telex"
 method = "telex"
 
-# Enable Wayland input-method path. Set false to use evdev-only mode
-# together with enable_evdev_grab = true.
+# Enable Wayland input-method path. Evdev grab can run alongside
+# the native backend when enable_evdev_grab = true.
 # default: true
 enable_wayland = true
 

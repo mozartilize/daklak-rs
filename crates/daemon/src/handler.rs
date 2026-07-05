@@ -359,7 +359,7 @@ impl Daemon {
 
     // ── focus / session lifecycle ──────────────────────────────────────────
 
-    /// Bootstrap a synthetic session for evdev-only mode. Sets up a composer
+    /// Bootstrap a synthetic session for evdev mode. Sets up a composer
     /// so `handle_char` / `handle_backspace` work without a Wayland
     /// compositor. The evdev adapter emits backspaces + the replacement string
     /// directly via uinput and ignores `BackspaceMethod`, so the tier here is
