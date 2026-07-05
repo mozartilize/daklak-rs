@@ -45,21 +45,43 @@ fn evdev_toggle_label(evdev_enabled: bool) -> &'static str {
     }
 }
 
+/// Tray icon name for the current on/off state and active backend.
+///
+/// While off, keep the neutral symbolic keyboard icon. While on, show the
+/// Daklak badge coloured by backend: green (`daklak-native`) for the native
+/// Wayland/IBus/auto backend, red (`daklak-evdev`) for the evdev grab backend.
+fn icon_name_for(enabled: bool, backend: InputBackend) -> &'static str {
+    if !enabled {
+        return "input-keyboard-symbolic";
+    }
+    match backend {
+        InputBackend::Evdev => "daklak-evdev",
+        _ => "daklak-native",
+    }
+}
+
 impl ksni::Tray for DaklakTray {
     fn id(&self) -> String {
         "daklak".into()
     }
 
     fn icon_name(&self) -> String {
-        if self.enabled {
-            "input-keyboard".into()
-        } else {
-            "input-keyboard-symbolic".into()
-        }
+        icon_name_for(self.enabled, self.backend).into()
     }
 
     fn title(&self) -> String {
         format!("daklak — {}", if self.enabled { "on" } else { "off" })
+    }
+
+    /// Left-click on the tray icon toggles daklak on/off, mirroring the
+    /// menu's On/Off item.
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let target = if self.enabled {
+            CmdKind::Disable
+        } else {
+            CmdKind::Enable
+        };
+        fire(&self.cmd_tx, target);
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -622,6 +644,31 @@ mod tests {
     fn evdev_toggle_label_mentions_grab_backend() {
         assert_eq!(evdev_toggle_label(false), "Enable evdev grab backend");
         assert_eq!(evdev_toggle_label(true), "Evdev grab backend active");
+    }
+
+    #[test]
+    fn icon_name_keeps_symbolic_when_off() {
+        // Off keeps the neutral icon regardless of backend.
+        assert_eq!(
+            icon_name_for(false, InputBackend::Wayland),
+            "input-keyboard-symbolic"
+        );
+        assert_eq!(
+            icon_name_for(false, InputBackend::Evdev),
+            "input-keyboard-symbolic"
+        );
+    }
+
+    #[test]
+    fn icon_name_badges_backend_when_on() {
+        assert_eq!(icon_name_for(true, InputBackend::Evdev), "daklak-evdev");
+        for native in [
+            InputBackend::Auto,
+            InputBackend::Ibus,
+            InputBackend::Wayland,
+        ] {
+            assert_eq!(icon_name_for(true, native), "daklak-native");
+        }
     }
 
     #[test]

@@ -140,9 +140,13 @@ mode that daemon is in.
 ## Tray indicator
 
 When running, daklak exposes a StatusNotifierItem (SNI) tray icon that reflects
-and toggles the enabled state. When built with `evdev_grab`, the tray also
-shows an "Enable evdev" / "Disable evdev" checkbox to switch between native
-and evdev backends at runtime.
+and toggles the enabled state. **Left-clicking the icon toggles daklak on/off.**
+While off, the icon is the neutral symbolic
+keyboard glyph. While on, it shows the Daklak "Đk" badge coloured by the active
+backend: **green** for the native (Wayland/IBus) backend and **red** for the
+evdev grab backend. When built with `evdev_grab`, the tray also shows an
+"Enable evdev" / "Disable evdev" checkbox to switch between native and evdev
+backends at runtime.
 
 ## Configuration
 

@@ -77,6 +77,14 @@ install_data('res/config.toml.example',
   install_dir: get_option('datadir') / 'daklak',
 )
 
+# Tray badge icons (green = native backend, red = evdev grab backend).
+# Installed into the hicolor theme so the SNI host resolves them by name
+# (see DaklakTray::icon_name). Independent of the `kde` feature gate since
+# the tray runs regardless of which frontend is enabled.
+install_data('res/daklak-native.svg', 'res/daklak-evdev.svg',
+  install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'apps',
+)
+
 if get_option('kde')
   desktop_conf = configuration_data()
   desktop_conf.set(
