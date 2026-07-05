@@ -1,8 +1,9 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -380,7 +381,38 @@ fn hook_pair_is_partial(pair: &(PathBuf, PathBuf)) -> bool {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RollbackMarker {
-    applied_hooks: Vec<String>,
+    version: u8,
+    applied_hooks: Vec<RollbackHookRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RollbackHookRecord {
+    name: String,
+    set_path: PathBuf,
+    unset_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RollbackMarkerFile {
+    V2(RollbackMarker),
+    Legacy { applied_hooks: Vec<String> },
+}
+
+fn rollback_marker_json(applied: &AppliedHooks) -> Result<String> {
+    let marker = RollbackMarker {
+        version: 2,
+        applied_hooks: applied
+            .hooks
+            .iter()
+            .map(|hook| RollbackHookRecord {
+                name: hook.name.clone(),
+                set_path: hook.set_path.clone(),
+                unset_path: hook.unset_path.clone(),
+            })
+            .collect(),
+    };
+    serde_json::to_string_pretty(&marker).map_err(Into::into)
 }
 
 pub fn rollback_marker_path() -> Result<PathBuf> {
@@ -393,13 +425,28 @@ pub fn write_rollback_marker(applied: &AppliedHooks) -> Result<()> {
     if applied.is_empty() {
         return Ok(());
     }
-    let marker = RollbackMarker {
-        applied_hooks: applied.names(),
-    };
     let path = rollback_marker_path()?;
-    let text = serde_json::to_string_pretty(&marker)?;
-    std::fs::write(&path, text)
-        .map_err(|e| anyhow!("write evdev rollback marker {}: {e}", path.display()))
+    let text = rollback_marker_json(applied)?;
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&tmp)
+        .map_err(|e| anyhow!("create evdev rollback marker {}: {e}", tmp.display()))?;
+    file.write_all(text.as_bytes())
+        .map_err(|e| anyhow!("write evdev rollback marker {}: {e}", tmp.display()))?;
+    file.sync_all()
+        .map_err(|e| anyhow!("sync evdev rollback marker {}: {e}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| anyhow!("rename evdev rollback marker {} -> {}: {e}", tmp.display(), path.display()))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| anyhow!("chmod evdev rollback marker {}: {e}", path.display()))?;
+    Ok(())
 }
 
 pub fn clear_rollback_marker() {
@@ -419,18 +466,32 @@ pub fn recover_stale_rollback(config: &Config, runner: &dyn HookCommandRunner) -
 
     let text = std::fs::read_to_string(&path)
         .map_err(|e| anyhow!("read evdev rollback marker {}: {e}", path.display()))?;
-    let marker: RollbackMarker = serde_json::from_str(&text)
+    let marker: RollbackMarkerFile = serde_json::from_str(&text)
         .map_err(|e| anyhow!("parse evdev rollback marker {}: {e}", path.display()))?;
 
-    let all_hooks = resolve_hooks(config)?;
-    let mut applied = Vec::new();
-    for name in marker.applied_hooks {
-        if let Some(hook) = all_hooks.iter().find(|h| h.name == name) {
-            applied.push(hook.clone());
-        } else {
-            tracing::warn!(hook = %name, "evdev stale rollback hook no longer configured; skipping");
+    let applied = match marker {
+        RollbackMarkerFile::V2(marker) => marker
+            .applied_hooks
+            .into_iter()
+            .map(|record| HookSpec {
+                name: record.name,
+                set_path: record.set_path,
+                unset_path: record.unset_path,
+            })
+            .collect(),
+        RollbackMarkerFile::Legacy { applied_hooks } => {
+            let all_hooks = resolve_hooks(config)?;
+            let mut applied = Vec::new();
+            for name in applied_hooks {
+                if let Some(hook) = all_hooks.iter().find(|h| h.name == name) {
+                    applied.push(hook.clone());
+                } else {
+                    tracing::warn!(hook = %name, "evdev stale rollback hook no longer configured; skipping");
+                }
+            }
+            applied
         }
-    }
+    };
 
     let result = run_cleanup_hooks(&AppliedHooks { hooks: applied }, runner);
     if result.is_ok() {
@@ -767,5 +828,39 @@ mod runner_tests {
             *runner.calls.lock().unwrap(),
             vec![("gnome".into(), "unset".into())]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_marker_is_owner_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "daklak-marker-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let applied = AppliedHooks { hooks: vec![hook("sway")] };
+        write_rollback_marker(&applied).unwrap();
+        let path = rollback_marker_path().unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_marker_records_paths_not_only_names() {
+        let applied = AppliedHooks { hooks: vec![hook("sway")] };
+        let text = rollback_marker_json(&applied).unwrap();
+        assert!(text.contains("\"version\": 2"));
+        assert!(text.contains("\"unset_path\""));
+        assert!(text.contains("/tmp/sway-unset"));
     }
 }
