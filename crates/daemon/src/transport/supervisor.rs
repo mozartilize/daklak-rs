@@ -308,6 +308,7 @@ impl Supervisor {
             suspend.store(true, Ordering::Release);
         }
         let _ = self.backend_tx.send(InputBackend::Evdev);
+        tracing::info!("evdev grab backend active; use `daklak backend native` to release grabs");
 
         let mut daemon = Daemon::new(
             self.config.clone(),
@@ -395,6 +396,7 @@ impl Supervisor {
         tokio::pin!(transport);
 
         let _ = self.backend_tx.send(InputBackend::Evdev);
+        tracing::info!("evdev grab backend active; use `daklak backend native` to release grabs");
 
         loop {
             if self.pending_action.is_some() {
@@ -454,6 +456,7 @@ impl Supervisor {
                 if self.current_backend() == target {
                     return ControlReply::Ok(format!("backend {target}"));
                 }
+                tracing::info!(from = %self.current_backend(), to = %target, "IPC requested backend switch");
                 self.pending_action = Some(PendingAction::SwitchTo(target));
                 ControlReply::Ok(format!("backend {target}"))
             }

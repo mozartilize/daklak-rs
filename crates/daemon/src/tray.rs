@@ -37,6 +37,14 @@ pub struct DaklakTray {
     pub evdev_grab_hooks: Vec<String>,
 }
 
+fn evdev_toggle_label(evdev_enabled: bool) -> &'static str {
+    if evdev_enabled {
+        "Evdev grab backend active"
+    } else {
+        "Enable evdev grab backend"
+    }
+}
+
 impl ksni::Tray for DaklakTray {
     fn id(&self) -> String {
         "daklak".into()
@@ -131,14 +139,9 @@ impl ksni::Tray for DaklakTray {
             .into(),
         ];
         if cfg!(feature = "evdev_grab") {
-            let label = if self.evdev_enabled {
-                "Disable evdev"
-            } else {
-                "Enable evdev"
-            };
             items.push(
                 CheckmarkItem {
-                    label: label.into(),
+                    label: evdev_toggle_label(self.evdev_enabled).into(),
                     checked: self.evdev_enabled,
                     activate: Box::new(|t: &mut Self| {
                         let new_evdev = !t.evdev_enabled;
@@ -614,6 +617,12 @@ pub fn spawn_tray(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evdev_toggle_label_mentions_grab_backend() {
+        assert_eq!(evdev_toggle_label(false), "Enable evdev grab backend");
+        assert_eq!(evdev_toggle_label(true), "Evdev grab backend active");
+    }
 
     #[test]
     fn save_config_creates_missing_config_file() {
