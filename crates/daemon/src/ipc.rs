@@ -4,11 +4,13 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::backend::BackendTarget;
 use crate::control::{CmdKind, CmdTx, Command};
+
+pub(crate) const MAX_IPC_LINE_BYTES: usize = 4096;
 
 pub struct IpcServer {
     listener: UnixListener,
@@ -127,14 +129,47 @@ pub(crate) fn parse_ipc_command(line: &str) -> Result<CmdKind, String> {
     }
 }
 
+async fn read_ipc_line(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+) -> Result<String, String> {
+    let mut buf = Vec::with_capacity(128);
+    let mut byte = [0_u8; 1];
+
+    loop {
+        let n = reader
+            .read(&mut byte)
+            .await
+            .map_err(|e| format!("read command: {e}"))?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Err("empty command".to_owned());
+            }
+            return Err("command missing newline".to_owned());
+        }
+
+        buf.push(byte[0]);
+        if buf.len() > MAX_IPC_LINE_BYTES {
+            return Err(format!("command too long (max {MAX_IPC_LINE_BYTES} bytes)"));
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+
+    String::from_utf8(buf).map_err(|_| "command must be UTF-8".to_owned())
+}
+
 pub async fn handle_connection(stream: UnixStream, cmd_tx: CmdTx) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
 
-    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
-        return;
-    }
+    let line = match read_ipc_line(&mut reader).await {
+        Ok(line) => line,
+        Err(e) => {
+            let _ = writer.write_all(format!("err {e}\n").as_bytes()).await;
+            return;
+        }
+    };
 
     let kind = match parse_ipc_command(&line) {
         Ok(kind) => kind,
@@ -253,5 +288,43 @@ mod tests {
     fn validate_peer_uid_accepts_current_user() {
         let current = current_euid();
         validate_peer_uid(current, current).unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlong_ipc_command_returns_error_without_dispatch() {
+        let (cmd_tx, mut cmd_rx) = crate::control::channel();
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let task = tokio::spawn(handle_connection(server, cmd_tx));
+        let long_command = format!("{}\n", "status".repeat(MAX_IPC_LINE_BYTES));
+        let mut client = client;
+        client.write_all(long_command.as_bytes()).await.unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut reply = String::new();
+        reader.read_line(&mut reply).await.unwrap();
+
+        assert!(reply.starts_with("err command too long"), "reply was {reply:?}");
+        assert!(cmd_rx.try_recv().is_err(), "overlong command must not dispatch");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_ipc_command_still_dispatches() {
+        let (cmd_tx, mut cmd_rx) = crate::control::channel();
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let task = tokio::spawn(handle_connection(server, cmd_tx));
+        client.write_all(b"status\n").await.unwrap();
+
+        let cmd = cmd_rx.recv().await.expect("command dispatched");
+        assert!(matches!(cmd.kind, CmdKind::Status));
+        let _ = cmd.resp.send(crate::control::ControlReply::Enabled(true));
+
+        let mut reader = BufReader::new(client);
+        let mut reply = String::new();
+        reader.read_line(&mut reply).await.unwrap();
+        assert_eq!(reply, "on\n");
+        task.await.unwrap();
     }
 }
