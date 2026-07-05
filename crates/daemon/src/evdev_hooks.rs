@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +45,12 @@ pub struct ProcessHookRunner;
 
 impl HookCommandRunner for ProcessHookRunner {
     fn run(&self, path: &Path, phase: &str, name: &str) -> Result<i32> {
-        let mut command = Command::new(path);
+        #[cfg(unix)]
+        let exec_path = validate_hook_script_path(path)?;
+        #[cfg(not(unix))]
+        let exec_path = path.to_path_buf();
+
+        let mut command = Command::new(&exec_path);
         command
             .env("DAKLAK_HOOK_NAME", name)
             .env("DAKLAK_HOOK_PHASE", phase)
@@ -58,7 +66,7 @@ impl HookCommandRunner for ProcessHookRunner {
         }
         let status = command
             .status()
-            .map_err(|e| anyhow!("running hook {} for {phase}: {e}", path.display()))?;
+            .map_err(|e| anyhow!("running hook {} for {phase}: {e}", exec_path.display()))?;
         Ok(exit_code(status))
     }
 }
@@ -171,6 +179,41 @@ pub fn validate_hook_name(name: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(unix)]
+pub(crate) fn validate_hook_script_path(path: &Path) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| anyhow!("canonicalize hook {}: {e}", path.display()))?;
+    let meta = std::fs::metadata(&canonical)
+        .map_err(|e| anyhow!("stat hook {}: {e}", canonical.display()))?;
+    if !meta.is_file() {
+        return Err(anyhow!("hook {} is not a regular file", canonical.display()));
+    }
+    let mode = meta.mode();
+    if mode & 0o022 != 0 {
+        return Err(anyhow!(
+            "hook {} is group/other writable; refusing to execute",
+            canonical.display()
+        ));
+    }
+    let owner = meta.uid();
+    let euid = current_euid();
+    if owner != euid && owner != 0 {
+        return Err(anyhow!(
+            "hook {} owner uid {} is neither daemon uid {} nor root",
+            canonical.display(),
+            owner,
+            euid
+        ));
+    }
+    Ok(canonical)
 }
 
 pub fn hook_dir() -> Result<PathBuf> {
@@ -440,6 +483,54 @@ mod tests {
         assert!(validate_hook_name("foo/bar").is_err());
         assert!(validate_hook_name("foo;rm").is_err());
         assert!(validate_hook_name("foo bar").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_file_policy_rejects_group_or_other_writable_scripts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "daklak-hook-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("sway-set");
+        std::fs::write(&path, "#!/bin/sh\nexit 10\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let err = validate_hook_script_path(&path).unwrap_err();
+        assert!(err.to_string().contains("group/other writable"), "{err}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_file_policy_accepts_owner_private_script() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "daklak-hook-policy-ok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("sway-set");
+        std::fs::write(&path, "#!/bin/sh\nexit 10\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let canonical = validate_hook_script_path(&path).unwrap();
+        assert!(canonical.is_absolute());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
