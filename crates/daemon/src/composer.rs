@@ -140,6 +140,24 @@ impl EditModel {
 /// shadow holds committed content) that trip the SurroundingText→ForwardKey
 /// runtime downgrade. Two absorbs a one-off race; a functional client never
 /// produces even one (its surrounding always reflects at least our commits).
+///
+/// ACCEPTED COST: on an always-dead client (Google Docs, Firefox
+/// contenteditable) the first correction of a focus session fires before
+/// strike 2, so its delete is silently dropped and the word doubles once
+/// (`Tiếng` → `Tieêngếng`) before the tier downgrades. Alternatives
+/// considered and rejected:
+///
+/// - Threshold 1: a single transient empty frame (the one-off race the
+///   current limit absorbs) would permanently downgrade a healthy widget to
+///   ForwardKey.
+/// - Activate-time no-op probe (`delete_surrounding_text(0,0)` + watch for
+///   the echo): adds a round-trip on every focus for every healthy client,
+///   and text-input-v3 gives no reply to a no-op delete — absence of an echo
+///   is indistinguishable from a slow client, so the probe cannot conclude
+///   anything before the user starts typing anyway.
+/// - Per-app-id threshold 1 (e.g. known-broken Google Docs): app_id
+///   identifies the browser, not the widget — it would misfire on every
+///   healthy `<input>`/`<textarea>` in the same browser session.
 const SURROUNDING_DEAD_STRIKE_LIMIT: u32 = 2;
 
 pub struct Composer {
@@ -167,7 +185,14 @@ pub struct Composer {
     /// on v2/sway) or `ctx.keysym` (v1/KWin) instead of `commit_string`. There
     /// is no connect-time probe for this — text-input-v3 has no per-feature
     /// capability bit and the breakage is per-widget, so the ST-liveness symptom
-    /// is the only observable signal. See plan91 / [[project_v2_first_word_delete_echo]].
+    /// is the only observable signal.
+    ///
+    /// One-way ratchet BY DESIGN: nothing (not even `full_reset`) flips it
+    /// back to `true`. Recovery happens because every activate creates a
+    /// fresh `Composer` (wayland activate / synthetic activate /
+    /// `activate_ibus` / `activate_evdev` all construct one), so the flag's
+    /// lifetime is a single focus session. If Composer reuse across
+    /// activations is ever introduced, this field needs a restore path.
     pub commit_string_functional: bool,
 
     /// Timestamp of the last user-keystroke action — used to distinguish
@@ -387,14 +412,22 @@ impl Composer {
         self.ibus.reset();
     }
 
+    /// Re-seed the engine after a retroactive edit was applied. Must mirror
+    /// the initial word-boundary seed in `feed_key`: feed only the CURRENT
+    /// word before the cursor, never the whole shadow. The render gate in
+    /// `feed_context_gated` round-trips the seed, and a whole shadow
+    /// containing an English word fails it (Telex misreads "wor" as "wỏ"),
+    /// which would silently drop retroactive context after the first tone
+    /// toggle in mixed text like "wor ở".
     fn refresh_retroactive_context_after_apply(&mut self, backspaces: usize) {
         if backspaces == 0 || !self.retroactive_context {
             return;
         }
 
-        let word = self.edit.shadow_text().to_owned();
+        let shadow_text = self.edit.shadow_text().to_owned();
+        let word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
         self.engine.reset();
-        self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(&word);
+        self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(word);
     }
 
     /// Check 2-second idle heuristic. Returns true (and resets engine) if
@@ -688,11 +721,21 @@ impl Composer {
             if !deletion_already_applied {
                 self.engine.reset();
                 self.retroactive_context = false;
+                // The engine now reflects the app, not the keyboard. A stale
+                // last_input_char (e.g. the ' ' that ended the previous word)
+                // would keep prev_was_separator true and block the
+                // word-boundary seed for the word the cursor now touches
+                // (external delete of "la "→"la", then 'f' must compose "là",
+                // not forward raw).
+                self.last_input_char = None;
             }
         } else if decision.reseed {
             let word = current_word_before_insertion_point(text, cursor, anchor);
             self.engine.reset();
             self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(word);
+            // Same invalidation as the deletion arm: after a genuine cursor
+            // jump the last typed key describes the previous locale.
+            self.last_input_char = None;
             if self.retroactive_context {
                 tracing::debug!(word, "re-seed engine (activate or cursor jump)");
             }
@@ -818,6 +861,14 @@ fn text_before_cursor(text: &str, cursor: u32) -> &str {
     &text[..cursor]
 }
 
+/// Expected "delete-phase echo": the shadow with `backspaces` chars removed
+/// from the END. This is deliberately the ONLY intermediate echo shape the
+/// Firefox quirk recognizes — our corrections are always delete-tail +
+/// commit, so a compliant client passing through the intermediate state can
+/// only show an end-deletion. Firefox's stale cache (Bug 1905481) can report
+/// other shapes (pre-edit text, truncations); those deliberately do NOT get
+/// their own patterns. See `FirefoxContenteditableQuirk::observe_surrounding`
+/// for why unrecognized shapes degrade to ForwardKey instead.
 fn prefix_after_char_delete(text: &str, backspaces: usize) -> String {
     let keep = text.chars().count().saturating_sub(backspaces);
     text.chars().take(keep).collect()
@@ -1020,7 +1071,7 @@ mod tests {
         }
 
         #[test]
-        fn stale_echo_char_delete_resets_at_word_boundary() {
+        fn space_after_stale_echo_forwards_raw_and_sticky_mode_persists() {
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
             let mut sink = DeleteCaptureSink::default();
 
@@ -1029,7 +1080,12 @@ mod tests {
             c.apply_to_sink(1, "ư", 1, 0, &mut sink);
             c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
 
-            // Crossing a word boundary (space) resets back to byte deletes.
+            // Space is forwarded raw. It clears the one-shot char-delete state
+            // (`firefox.clear()`), but `forward_sticky` deliberately survives
+            // word boundaries: a widget that produced one stale echo is assumed
+            // stale for its whole lifetime, so later corrections keep using
+            // ForwardKey. Sticky mode only resets with the Composer (recreated
+            // on activate) via `full_reset`.
             assert!(matches!(c.feed_key(' '), KeyDecision::ForwardRaw));
         }
 
@@ -1200,6 +1256,39 @@ mod tests {
 
             assert!(c.firefox.use_forward_delete());
             assert!(!c.commit_string_functional);
+        }
+
+        #[test]
+        fn full_reset_preserves_commit_string_ratchet_for_composer_lifetime() {
+            // `commit_string_functional` is a ONE-WAY ratchet: once a widget
+            // proves it ignores the text-input-v3 server-event contract, no
+            // in-session event may flip it back — the breakage is per-widget
+            // and permanent, and one flapped correction doubles a word.
+            // Recovery is scoped to Composer recreation on activate. This pin
+            // fails if someone "fixes" full_reset to restore the flag; that
+            // change must instead be paired with removing the
+            // Composer-per-activate invariant documented on the field.
+            let mut c =
+                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            c.observe_surrounding_bytes("la", ByteCursor(2), ByteCursor(2), true);
+            c.mark_action();
+            c.apply_to_sink(1, "ả", 1, 0, &mut sink);
+            c.observe_surrounding_bytes(
+                "lạ l",
+                ByteCursor("lạ l".len() as u32),
+                ByteCursor("lạ l".len() as u32),
+                false,
+            );
+            assert!(!c.commit_string_functional);
+
+            c.full_reset();
+
+            assert!(
+                !c.commit_string_functional,
+                "ratchet must survive full_reset; recovery is Composer recreation only"
+            );
         }
 
         #[test]
@@ -1702,6 +1791,142 @@ mod tests {
             }
         }
 
+        #[test]
+        fn external_deletion_clears_stale_separator_so_next_tone_key_seeds() {
+            // User types "la " (trailing space → last_input_char = ' '), the
+            // client echoes it, then the user externally deletes the space
+            // (mouse select + cut — no Backspace through the IME). The
+            // deletion frame resets the engine; the keyboard history must be
+            // invalidated with it. If a stale separator survives, the
+            // word-boundary seed in feed_key is skipped and the next tone key
+            // forwards raw ("laf") instead of composing against the word the
+            // cursor now touches ("là").
+            let mut c =
+                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+            c.observe_surrounding_bytes("", ByteCursor(0), ByteCursor(0), true);
+            for ch in ['l', 'a', ' '] {
+                assert!(matches!(c.feed_key(ch), KeyDecision::ForwardRaw));
+            }
+            assert_eq!(c.shadow_text(), "la ");
+
+            // Client echoes the typed text (outside the recent-action window;
+            // no mark_action in this test). Shadow-confirmed → trusted, no
+            // engine change.
+            c.observe_surrounding_bytes("la ", ByteCursor(3), ByteCursor(3), false);
+
+            // External deletion of the trailing space: text shrank → engine
+            // reset — and the stale ' ' in last_input_char must go with it.
+            c.observe_surrounding_bytes("la", ByteCursor(2), ByteCursor(2), false);
+
+            match c.feed_key('f') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "à");
+                }
+                _ => panic!("expected tone edit on 'la'; stale separator blocked the seed"),
+            }
+        }
+
+        #[test]
+        fn forwarded_ascii_backspace_on_seeded_word_stays_consistent() {
+            // Cursor placed after "la" in "la world"; the engine is seeded
+            // retroactively from "la". A forwarded ASCII backspace (deleting
+            // 'a') keeps engine history by design — vnkey's process_backspace
+            // decrements its internal buffer in the same pass, so the engine
+            // now holds "l", matching the popped shadow. The next 'f' has no
+            // vowel to tone and must forward raw (visible text "lf world"),
+            // NOT compose against a stale "la" seed (which would emit a bogus
+            // delete+"à" edit).
+            let mut c =
+                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+
+            c.observe_surrounding_bytes("la world", ByteCursor(2), ByteCursor(2), true);
+            assert!(c.retroactive_context);
+
+            c.mark_action();
+            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+            assert_eq!(c.shadow_text(), "l");
+
+            c.mark_action();
+            assert!(
+                matches!(c.feed_key('f'), KeyDecision::ForwardRaw),
+                "'f' after deleting 'a' must forward raw, not tone a stale seed"
+            );
+        }
+
+        #[test]
+        fn refresh_after_apply_seeds_current_word_not_whole_shadow() {
+            // User clicks after "ơ" in existing text "wor ơ x" (an English word
+            // precedes the Vietnamese one) and toggles tones on "ơ". After the
+            // first toggle the refresh reseed must feed ONLY the current word
+            // ("ở") like the initial seed does — feeding the whole shadow
+            // ("wor ở") fails the render gate ("wor" telex-misreads as "wỏ"),
+            // wrongly dropping retroactive_context. The Firefox quirk then
+            // misclassifies the next stale echo (cursor drifted onto the space)
+            // as in-word staleness and routes the next correction through
+            // ForwardKey backspaces instead of a byte-count
+            // delete_surrounding_text.
+            let mut c =
+                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+            let text = "wor ơ x";
+            let cursor = "wor ơ".len() as u32;
+
+            c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), true);
+
+            c.mark_action();
+            match c.feed_key('r') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ở");
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                _ => panic!("expected retroactive tone edit"),
+            }
+            assert_eq!(c.shadow_text(), "wor ở");
+            assert!(
+                c.retroactive_context,
+                "retroactive context must survive the refresh reseed"
+            );
+
+            // Firefox stale echo: old text, cursor shifted past the edit onto
+            // the following space. With retroactive_context intact this keeps
+            // byte deletes; if the refresh wrongly dropped it, the quirk arms
+            // char-count delete + ForwardKey here.
+            c.observe_surrounding_bytes(
+                text,
+                ByteCursor("wor ơ ".len() as u32),
+                ByteCursor("wor ơ ".len() as u32),
+                false,
+            );
+
+            c.mark_action();
+            match c.feed_key('j') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ợ");
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                _ => panic!("expected second retroactive tone edit"),
+            }
+
+            // Both corrections must go through delete_surrounding_text. The
+            // second delete is 3 bytes / 1 char (ở).
+            assert_eq!(
+                sink.deletes.len(),
+                2,
+                "second correction must use delete_surrounding_text, not ForwardKey"
+            );
+            assert_eq!(sink.deletes[1], (3, 1, 0, 0));
+            assert!(sink.vk_keys.is_empty(), "no ForwardKey backspaces expected");
+        }
     }
 
     mod surrounding_liveness {

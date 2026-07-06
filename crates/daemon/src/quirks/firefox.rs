@@ -67,6 +67,23 @@ impl FirefoxContenteditableQuirk {
         self.use_forward_delete = false;
     }
 
+    /// Classify the surrounding frame against the correction we just issued.
+    ///
+    /// DESIGN: recognize narrowly, degrade safely. Exactly three frame shapes
+    /// are recognized as healthy — the final echo (`expected`), the
+    /// intermediate delete-phase echo (`delete_echo`, an end-deletion — see
+    /// `prefix_after_char_delete`), and a non-recent mismatch (user moved on;
+    /// clear and forget). Every other recent shape — Firefox's stale pre-edit
+    /// cache (Bug 1905481), truncations, cursor drift — lands in one "stale"
+    /// bucket that arms char-count delete / ForwardKey.
+    ///
+    /// Widening the healthy set (matching more stale shapes as benign) is the
+    /// dangerous direction: misreading a genuine external edit as our own
+    /// echo desyncs the shadow and corrupts visible text on the next
+    /// correction. Misclassifying a healthy echo as stale merely costs speed
+    /// — ForwardKey backspaces always work, just less atomically. So
+    /// unrecognized shapes deliberately take the slow-but-correct path
+    /// instead of getting their own patterns.
     pub(crate) fn observe_surrounding(
         &mut self,
         before_cursor: &str,

@@ -5,6 +5,19 @@ pub(crate) struct IbusSurroundingQuirk {
     surrounding_corrections_without_echo: u32,
 }
 
+/// Downgrade threshold: ONE echo-less correction. Deliberately stricter than
+/// the wayland watchdog (`SURROUNDING_DEAD_STRIKE_LIMIT = 2` in composer.rs).
+/// The signals differ: wayland counts *dead frames* (`text="" cursor=0`),
+/// which can be a one-off race, so it absorbs one. Here a strike means a
+/// whole correction round-trip completed with NO surrounding frame of any
+/// kind in between — IBus delivers surrounding updates before the next key
+/// event on a functional client, so even one silent round-trip means the
+/// client isn't echoing, and a second unechoed correction would land another
+/// doubled word. The cost asymmetry favors strictness: a premature downgrade
+/// costs only slower-but-correct ForwardKey deletes; a missed one corrupts
+/// visible text.
+const CORRECTIONS_WITHOUT_ECHO_LIMIT: u32 = 1;
+
 impl IbusSurroundingQuirk {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -28,7 +41,7 @@ impl IbusSurroundingQuirk {
         }
 
         self.surrounding_corrections_without_echo += 1;
-        self.surrounding_corrections_without_echo >= 1
+        self.surrounding_corrections_without_echo >= CORRECTIONS_WITHOUT_ECHO_LIMIT
     }
 
     pub(crate) fn reset(&mut self) {
