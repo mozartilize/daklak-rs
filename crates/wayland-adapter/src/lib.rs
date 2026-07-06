@@ -94,7 +94,8 @@ pub struct TransportProfile {
     /// Commit chars can be synthesized via `zwp_input_method_context_v1::keysym`
     /// (the v1 terminal path). True on ImV1, false on ImV2.
     pub has_keysym_commit: bool,
-    /// `commit_string` actually reaches the client (false on evdev / vk-only).
+    /// `commit_string` actually reaches the client (false on evdev or when
+    /// routing through the synthetic-keymap channel).
     pub delivers_commit_string: bool,
     /// The transport auto-acks the v3 client's `done` (v1 `CommitState`
     /// heartbeat); v2 needs daklak's bare commit to drive the ack.

@@ -2,9 +2,11 @@
 
 [← Back to index](../README.md)
 
-daklak speaks to the desktop through one of three transports, chosen at startup
-in [`main.rs`](../crates/daemon/src/main.rs). This page covers what each mode
-requires and how it maps onto the [backspace tiers](backspace-tiers.md).
+daklak speaks to the desktop through three transport families: native Wayland,
+IBus, and evdev/uinput. Startup chooses the native backend or evdev, and the
+running daemon can switch between the native backend and evdev without a restart.
+This page covers what each backend requires and how it maps onto the
+[backspace tiers](backspace-tiers.md).
 
 ## Contents
 
@@ -15,15 +17,18 @@ requires and how it maps onto the [backspace tiers](backspace-tiers.md).
 
 ## Selection order
 
-At startup the daemon picks the first applicable mode:
+At startup the daemon picks the first applicable active backend:
 
 1. **IBus** — built with `--features ibus` and IBus mode enabled (the `--ibus`
-   flag, or being launched by `ibus-daemon`).
-2. **Wayland** — enabled in config.
-3. **evdev** — the fallback when Wayland is disabled and evdev grab is enabled.
+   flag, or being launched by `ibus-daemon`). IBus is started first so evdev can
+   later layer on top while the IBus connection remains alive in pass-through.
+2. **evdev** — selected when `enable_evdev_grab = true` and IBus did not force
+   the native path first.
+3. **Wayland** — selected when Wayland is enabled and evdev was not selected.
 
-The control plane (enable/disable, IPC, tray) starts before the mode loop and is
-identical across all three.
+The native desktop backend is still either IBus or Wayland; that native choice is
+fixed for the daemon lifetime. The control plane (enable/disable, backend
+switching, IPC, tray) starts before the backend loop and is shared.
 
 ### Runtime switching
 

@@ -14,17 +14,20 @@ command-line control surface.
 
 ## The core design axiom: no preedit
 
-Most IMEs show a *preedit* — an underlined, not-yet-committed buffer that the
-application renders specially. daklak deliberately does **not** do this. Instead
-it follows the Unikey / Gboard model: every keystroke result is **committed
-directly** to the application, so the visible text is always final.
+Most IMEs, especially many CJK-oriented ones, show a *preedit* — an underlined,
+not-yet-committed buffer that the application renders specially. daklak
+deliberately does **not** do this. Instead it follows the Unikey / Gboard model:
+every keystroke result is **committed directly** to the application, so the
+visible text is always final.
 
 This single decision shapes the entire architecture:
 
 - There is no separate "composing" visual state to manage.
 - To correct an in-progress word (e.g. add a tone mark to a vowel typed three
   keys ago), daklak must **retroactively delete** the previously committed tail
-  and commit the corrected text.
+  and commit the corrected text. When the application exposes surrounding text,
+  daklak can also reseed from the word around the cursor, so editing a word you
+  already finished can still change its tone or marks.
 - *How* those deletions are delivered to the application depends entirely on
   what the compositor and the focused client support — which is why the
   [backspace-tier model](backspace-tiers.md) exists and is the heart of the
@@ -70,14 +73,20 @@ edit operations; a transport adapter turns those into the right wire protocol.
 
 ## The three transports
 
-daklak speaks to the desktop through exactly one transport per process,
-selected at startup:
+daklak has three ways to reach applications:
 
 - **Wayland** — for wlroots-based compositors (Sway) via input-method v2, and
-  for KWin/Plasma via input-method v1.
-- **IBus** — for GNOME/mutter, registering as an IBus engine over D-Bus.
-- **evdev** — a universal fallback that grabs the keyboard device directly and
-  emits through `uinput` (requires a custom system keymap).
+  for KWin/Plasma via input-method v1. This is the direct native Wayland path.
+- **IBus** — for GNOME/mutter, registering as an IBus engine over D-Bus because
+  that is GNOME's supported IME integration point.
+- **evdev** — a universal fallback that grabs the keyboard device directly,
+  emits through `uinput`, and uses Daklak's custom keymap so legacy Wayland,
+  X11, and TTY clients receive Vietnamese characters.
+
+At startup daklak chooses the native desktop backend (Wayland or IBus). The
+evdev grab backend can also be selected at startup or switched on/off later
+without restarting the daemon. Runtime switching is native ↔ evdev; it does not
+switch between Wayland and IBus after startup.
 
 See [Transports](transports.md) for the details and trade-offs of each.
 

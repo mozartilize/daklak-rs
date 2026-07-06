@@ -85,9 +85,9 @@ pub trait OutputSink {
     // Tier 2 — zwp_virtual_keyboard_v1
     fn vk_key(&mut self, time: u32, key_code: u32, state: KeyState);
     fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32);
-    /// Tier 4 — emit `c` via `vk_key()` using daklak's synthesized
-    /// Vietnamese keymap. Returns `false` if `c` isn't in the keymap
-    /// inventory (caller should fall back).
+    /// ForwardKey synthetic-keymap channel — emit `c` via `vk_key()` using
+    /// daklak's synthesized Vietnamese keymap. Returns `false` if `c` isn't
+    /// in the keymap inventory (caller should fall back).
     fn vk_commit_char(&mut self, time: u32, c: char) -> bool;
 
     /// Emit `text` as a sequence of `(press, release)` keysym pairs.

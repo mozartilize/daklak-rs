@@ -3,8 +3,8 @@
 //!
 //! Pure data crate — no Wayland or evdev dependencies. Used by both:
 //!
-//! - `viet-ime-wayland-adapter` Tier 4 (uploads `keymap_text()` to
-//!   `zwp_virtual_keyboard_v1.keymap()` via memfd).
+//! - `viet-ime-wayland-adapter` ForwardKey synthetic-keymap channel (uploads
+//!   `keymap_text()` to `zwp_virtual_keyboard_v1.keymap()` via memfd).
 //! - `viet-ime-daemon` evdev mode (writes `keymap_text()` to a
 //!   `.xkb` file, points sway/scroll at it via `swaymsg input … xkb_file`).
 //!

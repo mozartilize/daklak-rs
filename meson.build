@@ -51,10 +51,6 @@ summary({
 if get_option('evdev_grab')
   daklak_builtin_hook_dir = get_option('prefix') / get_option('libexecdir') / 'daklak' / 'hooks'
   daklak_builtin_xkb_dir = get_option('prefix') / get_option('datadir') / 'daklak' / 'xkb'
-  install_data('res/99-daklak.rules',
-    install_dir: '/etc/udev/rules.d',
-    install_mode: 'rw-r--r--',
-  )
   install_data(
     'res/evdev-hooks/sway-set',
     'res/evdev-hooks/sway-unset',
@@ -74,6 +70,9 @@ else
 endif
 
 install_data('res/config.toml.example',
+  install_dir: get_option('datadir') / 'daklak',
+)
+install_data('res/99-daklak-input.rules',
   install_dir: get_option('datadir') / 'daklak',
 )
 

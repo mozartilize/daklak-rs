@@ -1,12 +1,12 @@
 #!/bin/sh
-# Post-install script for daklak.
+# Post-install reminder for daklak evdev mode.
 # Called by meson install when evdev_grab is enabled.
 
-if command -v udevadm >/dev/null 2>&1; then
-    udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger --name-match=uinput 2>/dev/null || true
-    echo "daklak: udev rules reloaded."
-    echo "daklak: you may also need to add yourself to the 'input' group:"
-    echo "  sudo usermod -aG input \$USER"
-    echo "  (then log out and back in)"
-fi
+echo "daklak: evdev hooks and keymap installed."
+echo "daklak: device permissions are NOT handled by this package."
+echo "daklak: enable /dev/uinput access by activating the udev rule:"
+echo "  getent group uinput || sudo groupadd --system uinput"
+echo "  sudo cp /usr/share/daklak/99-daklak-input.rules /etc/udev/rules.d/99-daklak.rules"
+echo "  sudo udevadm control --reload-rules"
+echo "  sudo udevadm trigger --name-match=uinput"
+echo "  sudo usermod -aG input,uinput \$USER   # then log out + back in"

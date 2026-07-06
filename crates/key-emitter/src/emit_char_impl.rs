@@ -6,7 +6,8 @@
 //!
 //! Sites:
 //!
-//! - `AdapterSink::vk_commit_char` (Tier 4 from the IM keyboard grab).
+//! - `AdapterSink::vk_commit_char` (ForwardKey synthetic-keymap channel from
+//!   the IM virtual keyboard).
 //! - `EvdevVkSink` (Tier 5 from the evdev grab) — planned.
 //!
 //! Returns `true` when `c` was emitted, `false` when `c` is outside

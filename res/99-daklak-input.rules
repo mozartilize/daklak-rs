@@ -1,13 +1,15 @@
-# udev rule for daklak: grant access to /dev/uinput without requiring root.
+# Reference udev rule for daklak: grant access to /dev/uinput.
 #
-# Install:
+# Installed to /usr/share/daklak/ (or ~/.local/share/daklak/) as a reference.
+# Copy it to /etc/udev/rules.d/ to activate:
+#
 #   getent group uinput || sudo groupadd --system uinput
-#   sudo cp res/99-daklak.rules /etc/udev/rules.d/
+#   sudo cp /usr/share/daklak/99-daklak-input.rules /etc/udev/rules.d/99-daklak.rules
 #   sudo udevadm control --reload-rules
 #   sudo udevadm trigger --name-match=uinput
 #   sudo usermod -aG input,uinput $USER   # then log out + back in
 #
-# Verify: ls -l /dev/uinput  →  crw-rw---- root uinput
+# See docs/evdev-setup.md for full instructions.
 #
 # SECURITY: /dev/input/event* access via the input group permits physical
 # keyboard observation/grabs. /dev/uinput access via the uinput group permits

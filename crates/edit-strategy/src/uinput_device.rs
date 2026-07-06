@@ -157,7 +157,7 @@ mod tests {
     fn uinput_device_opens() {
         let dev = UinputDevice::open().expect(
             "Could not open /dev/uinput. \
-             Run: sudo chmod 666 /dev/uinput  OR  install res/99-daklak.rules",
+             Run: sudo chmod 666 /dev/uinput  OR  install res/99-daklak-input.rules",
         );
         drop(dev);
         let devices = std::fs::read_to_string("/proc/bus/input/devices").unwrap_or_default();

@@ -25,9 +25,9 @@ source as authoritative for names and module layout.
 | 2 | synthesize `BackSpace` key events, then emit the replacement through one whole backend-selected channel | good — but relies on the client treating forwarded deletes as edits |
 
 `BackspaceMethod` has exactly two variants: `SurroundingText` (Tier 1) and
-`ForwardKey` (Tier 2). There is no separate "VkOnly" tier — the
-synthetic-keymap virtual-keyboard emit that used to be its own tier is now one
-of ForwardKey's replacement channels (see below).
+`ForwardKey` (Tier 2). There is no separate virtual-keyboard-only tier: the
+synthetic-keymap virtual-keyboard emit is one of ForwardKey's replacement
+channels (see below).
 
 ### Why these tiers?
 

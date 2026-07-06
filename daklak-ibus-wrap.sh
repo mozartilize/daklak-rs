@@ -24,4 +24,4 @@ export DAKLAK_LOG_MODULES=daklak=debug,viet_ime_ibus_adapter=info,viet_ime_edit_
 #export DAKLAK_ENABLE_WAYLAND=1
 # export DAKLAK_FORCE_VK_ONLY_APPS=org.keepassxc.KeePassXC,ONLYOFFICE,steam,xfce4-terminal,com.mitchellh.ghostty
 
-exec ./target/debug/daklak --ibus
+exec ./build/daklak --ibus

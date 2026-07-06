@@ -1,0 +1,10 @@
+Package: daklak
+Version: %VER%
+Maintainer: mozartilize
+Description: Vietnamese Input Method
+ A framework-independent Vietnamese input-method daemon running in
+ Wayland, IBus, or evdev grab mode.
+Homepage: https://github.com/mozartilize/daklak-rs
+Section: utils
+Priority: optional
+Architecture: %ARCH%

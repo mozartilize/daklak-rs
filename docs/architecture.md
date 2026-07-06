@@ -45,7 +45,7 @@ Declared in [`Cargo.toml`](../Cargo.toml):
 ## The brain vs the transports
 
 ```
-                  ┌────────────────────────────────────────────┐
+                  ┌───────────────────────────────────────────────┐
                   │                  daemon                       │
                   │                                               │
                   │   handler::Daemon / handler::Router           │
@@ -58,9 +58,9 @@ Declared in [`Cargo.toml`](../Cargo.toml):
                   │     · SurroundingObserver (trust + reseed)    │
                   │                                               │
                   │   control plane: control / ipc / tray         │
-                  └───────────────┬──────────────────────────────┘
+                  └───────────────┬───────────────────────────────┘
                                   │  OutputSink + callbacks
-        ┌─────────────────────────┼─────────────────────────────┐
+        ┌─────────────────────────┼──────────────────────────────┐
         ▼                         ▼                              ▼
   wayland-adapter           ibus-adapter                  evdev-adapter
   IM v2 (wlroots) /         IBus engine over              EVIOCGRAB +
@@ -71,15 +71,20 @@ Declared in [`Cargo.toml`](../Cargo.toml):
    compositor               ibus-daemon                  /dev/input + /dev/uinput
 ```
 
-Only **one** transport is live per daemon process. The control plane
-(enable/disable, IPC socket, tray) is started first and is shared by all modes.
+The daemon has one active composing backend at a time, but the native desktop
+backend and the evdev grab backend are switchable at runtime. The native choice
+(IBus or Wayland) is fixed at startup. When IBus is the native backend and evdev
+is enabled, the IBus D-Bus connection stays alive in suspended pass-through mode
+while evdev owns the physical keyboard; switching back clears the suspension.
+The control plane (enable/disable, backend switching, IPC socket, tray) is
+started first and is shared by all backends.
 
 ## Data flow
 
 A single composing keystroke, end to end:
 
-1. **Key arrives** at the active transport adapter (IM grab key event, IBus
-   `process_key_event`, or a raw evdev event).
+1. **Key arrives** at the active composing backend (Wayland IM grab key event,
+   IBus `process_key_event`, or a raw evdev event).
 2. The adapter forwards it to the brain through a transport callback in
    `handler::Daemon`.
 3. The **`Composer`** feeds the key to the `engine`, compares the new composed
@@ -151,8 +156,9 @@ the tier emit paths. See [Transports](transports.md) and
 
 ### `evdev-adapter`
 Grabs a keyboard device (`EVIOCGRAB`), decodes via the system xkb layout, and
-emits via `uinput`. Used as the universal fallback. Requires a custom system
-xkb layout so emitted keycodes decode to Vietnamese characters.
+emits via `uinput`. Used as the universal fallback and switchable against the
+native backend at runtime. Requires Daklak's custom xkb layout so emitted
+keycodes decode to Vietnamese characters.
 
 ### `ibus-adapter`
 A full IBus engine: registers on the IBus bus, handles `process_key_event`,

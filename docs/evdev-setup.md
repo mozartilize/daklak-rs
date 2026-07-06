@@ -75,19 +75,36 @@ Evdev mode needs two Linux input permissions:
 - `uinput` group access for `/dev/uinput` so Daklak can create its synthetic
   keyboard.
 
-Set up the dedicated `uinput` group and install the udev rule:
+Set them up manually (no install script touches these — they are system-wide
+privileges you control):
 
 ```sh
-getent group uinput || sudo groupadd --system uinput
-sudo cp res/99-daklak.rules /etc/udev/rules.d/
+# 1. Make sure the uinput group exists
+sudo groupadd --system uinput
+
+# 2. Add your user to the input and uinput groups
+sudo usermod -aG input,uinput $USER
+
+# 3. Install the udev rule so /dev/uinput gets the right permissions
+#    (copy from the installed reference or create it directly)
+sudo cp /usr/share/daklak/99-daklak-input.rules /etc/udev/rules.d/99-daklak.rules
+
+# 4. Reload udev and trigger the rule
 sudo udevadm control --reload-rules
 sudo udevadm trigger --name-match=uinput
-sudo usermod -aG input,uinput $USER
+
+# 5. Load the uinput kernel module
 sudo modprobe uinput
 ```
 
-Log out and back in after changing group membership. Verify `/dev/uinput` is
-owned by `root:uinput` with mode `crw-rw----`.
+Log out and back in after changing group membership (or use `newgrp` /
+`sg` in the session that starts daklak). Verify `/dev/uinput` is owned by
+`root:uinput` with mode `crw-rw----`.
+
+Daklak installs the rule as a reference to `/usr/share/daklak/99-daklak-input.rules`
+(or `~/.local/share/daklak/99-daklak-input.rules` for user-local installs).
+Copy it to `/etc/udev/rules.d/99-daklak.rules` to activate — daklak never
+writes to `/etc` on your behalf.
 
 ## Why a synthetic keymap is needed
 
@@ -526,10 +543,10 @@ that `/dev/uinput` is owned by it:
 
 ```sh
 getent group uinput || sudo groupadd --system uinput
-sudo cp res/99-daklak.rules /etc/udev/rules.d/
+sudo usermod -aG uinput $USER
+sudo cp /usr/share/daklak/99-daklak-input.rules /etc/udev/rules.d/99-daklak.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger --name-match=uinput
-sudo usermod -aG uinput $USER
 sudo modprobe uinput
 ls -l /dev/uinput   # expected: root uinput, mode crw-rw----
 ```

@@ -18,11 +18,11 @@ log_path = "/dev/stdout"
 # Per-target overrides; trace is accepted as an alias for debug.
 log_modules = ["daklak=debug", "viet_ime_wayland_adapter=info"]
 
-# Force these app_id values to Tier 4 VkOnly routing (case-insensitive).
+# Force these app_id values to ForwardKey's synthetic-keymap routing (case-insensitive).
 # default: []
 force_vk_only_apps = []
 
-# Treat all focused XWayland windows as VkOnly.
+# Treat all focused XWayland windows as needing synthetic-keymap ForwardKey routing.
 # default: true
 auto_vk_only_for_xwayland = true
 

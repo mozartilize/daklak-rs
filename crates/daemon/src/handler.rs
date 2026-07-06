@@ -581,9 +581,9 @@ mod tests {
                 daemon.router.focused_app_id.as_deref(),
                 Some("com.mitchellh.ghostty")
             );
-            // The synthetic session merges the former Tier 4 VkOnly into
-            // ForwardKey with a dead commit_string, so replacements route
-            // through the virtual keyboard's synthetic keymap.
+            // Synthetic focus sessions use ForwardKey with a dead commit_string,
+            // so replacements route through the virtual keyboard's synthetic
+            // keymap channel.
             let composer = daemon.router.composer.as_ref().expect("composer");
             assert_eq!(composer.method(), BackspaceMethod::ForwardKey);
             assert!(!composer.commit_string_functional);
