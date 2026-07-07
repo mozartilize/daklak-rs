@@ -3,6 +3,9 @@ set -eu
 
 command -v swaymsg >/dev/null 2>&1 || exit 10
 [ -n "${SWAYSOCK:-}" ] || exit 10
+# SWAYSOCK may be set by non-Sway programs (e.g. scroll on KDE).
+# Verify the socket actually speaks Sway IPC before continuing.
+swaymsg -t get_version >/dev/null 2>&1 || exit 10
 
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 device="${DAKLAK_UINPUT_VENDOR:-56001}:${DAKLAK_UINPUT_PRODUCT:-44033}:${DAKLAK_UINPUT_NAME:-daklak}"

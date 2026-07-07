@@ -114,7 +114,21 @@ impl Supervisor {
                     tracing::info!("quit requested via control");
                     std::process::exit(0);
                 }
-                None => return result,
+                None => {
+                    // Evdev failed (hooks, preflight, grab, …): fall back to
+                    // the native backend instead of crashing the daemon.
+                    if current == InputBackend::Evdev {
+                        if let Err(ref e) = result {
+                            let native = InputBackend::native_from_config(&self.config);
+                            if native != InputBackend::Auto {
+                                tracing::warn!(%e, to = %native, "evdev failed — falling back to native backend");
+                                current = native;
+                                continue;
+                            }
+                        }
+                    }
+                    return result;
+                }
             }
         }
     }
