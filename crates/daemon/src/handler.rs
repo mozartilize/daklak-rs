@@ -134,7 +134,7 @@ impl Daemon {
 
     /// Clone the suspended flag so the supervisor can pause/resume this
     /// transport while a layered evdev grab owns the keyboard.
-    #[cfg(any(feature = "ibus", feature = "evdev_grab"))]
+    #[cfg(feature = "ibus")]
     pub fn suspend_flag(&self) -> Arc<AtomicBool> {
         self.suspended.clone()
     }

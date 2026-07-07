@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::backend::BackendTarget;
@@ -114,7 +114,7 @@ pub(crate) fn parse_ipc_command(line: &str) -> Result<CmdKind, String> {
             Some(raw) => {
                 let target = BackendTarget::parse(raw).ok_or_else(|| {
                     if matches!(raw, "ibus" | "wayland") {
-                        format!("direct {raw} switching is not supported; use native or evdev")
+                        format!("direct {raw} switching is not supported; use native, evdev, or toggle")
                     } else {
                         format!("unknown backend: {raw}")
                     }
@@ -204,6 +204,7 @@ pub fn socket_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::backend::BackendTarget;
+    use tokio::io::AsyncBufReadExt;
 
     #[test]
     fn parses_existing_commands() {
@@ -229,17 +230,21 @@ mod tests {
             parse_ipc_command("backend auto"),
             Ok(CmdKind::SetBackend(BackendTarget::Native))
         ));
+        assert!(matches!(
+            parse_ipc_command("backend toggle"),
+            Ok(CmdKind::SetBackend(BackendTarget::Toggle))
+        ));
     }
 
     #[test]
     fn rejects_direct_ibus_wayland_backend_switches() {
         assert_eq!(
             parse_ipc_command("backend ibus"),
-            Err("direct ibus switching is not supported; use native or evdev".to_owned())
+            Err("direct ibus switching is not supported; use native, evdev, or toggle".to_owned())
         );
         assert_eq!(
             parse_ipc_command("backend wayland"),
-            Err("direct wayland switching is not supported; use native or evdev".to_owned())
+            Err("direct wayland switching is not supported; use native, evdev, or toggle".to_owned())
         );
     }
 

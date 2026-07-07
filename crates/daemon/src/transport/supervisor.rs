@@ -123,6 +123,13 @@ impl Supervisor {
         let target = match requested {
             BackendTarget::Native => InputBackend::native_from_config(&self.config),
             BackendTarget::Evdev => InputBackend::Evdev,
+            BackendTarget::Toggle => {
+                if self.current_backend() == InputBackend::Evdev {
+                    InputBackend::native_from_config(&self.config)
+                } else {
+                    InputBackend::Evdev
+                }
+            }
         };
         if target == InputBackend::Auto {
             return Err(anyhow!("no configured native backend available"));
@@ -263,6 +270,11 @@ impl Supervisor {
     async fn run_evdev_in_ibus_slot(&mut self, rx: &mut mpsc::Receiver<Command>) {
         use crate::evdev_hooks::{self, ProcessHookRunner};
 
+        if let Err(e) = crate::evdev_preflight::check_or_notify() {
+            tracing::warn!(%e, "evdev preflight failed");
+            return;
+        }
+
         let hooks = match evdev_hooks::resolve_hooks(&self.config) {
             Ok(h) => h,
             Err(e) => {
@@ -283,23 +295,11 @@ impl Supervisor {
             return;
         }
 
-        let (applied, outcomes) = match tokio::task::spawn_blocking(move || {
-            evdev_hooks::run_setup_hooks(&hooks, &ProcessHookRunner)
-        })
-        .await
-        {
-            Ok(Ok((a, o))) => (a, o),
-            Ok(Err(e)) => {
-                tracing::warn!(%e, "evdev hooks setup failed");
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(%e, "evdev hooks spawn failed");
-                return;
-            }
-        };
-        tracing::info!(?outcomes, "evdev keymap hooks processed");
-        let _ = evdev_hooks::write_rollback_marker(&applied);
+        let setup_handle = tokio::task::spawn_blocking(move || {
+            let (applied, outcomes) = evdev_hooks::run_setup_hooks(&hooks, &ProcessHookRunner)?;
+            evdev_hooks::write_rollback_marker(&applied)?;
+            Ok::<_, anyhow::Error>((applied, outcomes))
+        });
 
         // Flip IBus to passthrough: the still-connected engine forwards keys
         // raw (no compose, no output) while the evdev grab owns the keyboard,
@@ -318,13 +318,47 @@ impl Supervisor {
         daemon.activate_evdev();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let applied_for_cleanup = applied;
         let transport = async {
-            let result = adapter.run_until_shutdown(&mut daemon, shutdown_rx).await;
-            let cleanup = evdev_hooks::run_cleanup_hooks(&applied_for_cleanup, &ProcessHookRunner);
-            if cleanup.is_ok() {
-                evdev_hooks::clear_rollback_marker();
+            let run = adapter.run_until_shutdown(&mut daemon, shutdown_rx);
+            tokio::pin!(run);
+            let mut setup_handle = setup_handle;
+            let mut setup_done = false;
+            let mut applied_for_cleanup = None;
+
+            let result = loop {
+                tokio::select! {
+                    result = &mut run => break result,
+                    setup = &mut setup_handle, if !setup_done => {
+                        setup_done = true;
+                        let (applied, outcomes) = setup
+                            .map_err(|e| anyhow!("evdev hooks setup spawn failed: {e}"))??;
+                        tracing::info!(?outcomes, "evdev keymap hooks processed");
+                        applied_for_cleanup = Some(applied);
+                    }
+                }
+            };
+
+            if !setup_done {
+                let (applied, outcomes) = setup_handle
+                    .await
+                    .map_err(|e| anyhow!("evdev hooks setup spawn failed: {e}"))??;
+                tracing::info!(?outcomes, "evdev keymap hooks processed");
+                applied_for_cleanup = Some(applied);
             }
+
+            let cleanup = if let Some(applied_for_cleanup) = applied_for_cleanup {
+                tokio::task::spawn_blocking(move || {
+                    let cleanup = evdev_hooks::run_cleanup_hooks(&applied_for_cleanup, &ProcessHookRunner);
+                    if cleanup.is_ok() {
+                        evdev_hooks::clear_rollback_marker();
+                    }
+                    cleanup
+                })
+                .await
+                .map_err(|e| anyhow!("evdev hooks cleanup spawn failed: {e}"))?
+            } else {
+                Ok(())
+            };
             result.and(cleanup)
         };
         tokio::pin!(transport);
@@ -365,16 +399,16 @@ impl Supervisor {
     async fn run_evdev_loop(&mut self, rx: &mut mpsc::Receiver<Command>) -> Result<()> {
         use crate::evdev_hooks::{self, ProcessHookRunner};
 
+        crate::evdev_preflight::check_or_notify()?;
         let mut adapter = viet_ime_evdev_adapter::EvdevAdapter::prepare()?;
         let hooks = evdev_hooks::resolve_hooks(&self.config)?;
         adapter.grab_keyboards()?;
 
-        let (applied, outcomes) = tokio::task::spawn_blocking(move || {
-            evdev_hooks::run_setup_hooks(&hooks, &ProcessHookRunner)
-        })
-        .await??;
-        tracing::info!(?outcomes, "evdev keymap hooks processed");
-        evdev_hooks::write_rollback_marker(&applied)?;
+        let setup_handle = tokio::task::spawn_blocking(move || {
+            let (applied, outcomes) = evdev_hooks::run_setup_hooks(&hooks, &ProcessHookRunner)?;
+            evdev_hooks::write_rollback_marker(&applied)?;
+            Ok::<_, anyhow::Error>((applied, outcomes))
+        });
 
         let mut daemon = Daemon::new(
             self.config.clone(),
@@ -384,13 +418,47 @@ impl Supervisor {
         daemon.activate_evdev();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let applied_for_cleanup = applied;
         let transport = async {
-            let result = adapter.run_until_shutdown(&mut daemon, shutdown_rx).await;
-            let cleanup = evdev_hooks::run_cleanup_hooks(&applied_for_cleanup, &ProcessHookRunner);
-            if cleanup.is_ok() {
-                evdev_hooks::clear_rollback_marker();
+            let run = adapter.run_until_shutdown(&mut daemon, shutdown_rx);
+            tokio::pin!(run);
+            let mut setup_handle = setup_handle;
+            let mut setup_done = false;
+            let mut applied_for_cleanup = None;
+
+            let result = loop {
+                tokio::select! {
+                    result = &mut run => break result,
+                    setup = &mut setup_handle, if !setup_done => {
+                        setup_done = true;
+                        let (applied, outcomes) = setup
+                            .map_err(|e| anyhow!("evdev hooks setup spawn failed: {e}"))??;
+                        tracing::info!(?outcomes, "evdev keymap hooks processed");
+                        applied_for_cleanup = Some(applied);
+                    }
+                }
+            };
+
+            if !setup_done {
+                let (applied, outcomes) = setup_handle
+                    .await
+                    .map_err(|e| anyhow!("evdev hooks setup spawn failed: {e}"))??;
+                tracing::info!(?outcomes, "evdev keymap hooks processed");
+                applied_for_cleanup = Some(applied);
             }
+
+            let cleanup = if let Some(applied_for_cleanup) = applied_for_cleanup {
+                tokio::task::spawn_blocking(move || {
+                    let cleanup = evdev_hooks::run_cleanup_hooks(&applied_for_cleanup, &ProcessHookRunner);
+                    if cleanup.is_ok() {
+                        evdev_hooks::clear_rollback_marker();
+                    }
+                    cleanup
+                })
+                .await
+                .map_err(|e| anyhow!("evdev hooks cleanup spawn failed: {e}"))?
+            } else {
+                Ok(())
+            };
             result.and(cleanup)
         };
         tokio::pin!(transport);
@@ -456,6 +524,13 @@ impl Supervisor {
                 if self.current_backend() == target {
                     return ControlReply::Ok(format!("backend {target}"));
                 }
+                #[cfg(feature = "evdev_grab")]
+                if target == InputBackend::Evdev {
+                    if let Err(e) = crate::evdev_preflight::check_or_notify() {
+                        tracing::warn!(%e, "evdev preflight failed");
+                        return ControlReply::Error(format!("backend evdev unavailable: {e}"));
+                    }
+                }
                 tracing::info!(from = %self.current_backend(), to = %target, "IPC requested backend switch");
                 self.pending_action = Some(PendingAction::SwitchTo(target));
                 ControlReply::Ok(format!("backend {target}"))
@@ -485,6 +560,28 @@ mod tests {
         let s = Supervisor::new(cfg, enabled, state_tx, backend_tx, cfg_rx);
         assert_eq!(
             s.resolve_target(BackendTarget::Native).unwrap(),
+            InputBackend::Wayland
+        );
+    }
+
+    #[test]
+    fn toggle_resolves_opposite_current_backend() {
+        let mut cfg = Config::default();
+        cfg.enable_wayland = true;
+        let enabled = Arc::new(AtomicBool::new(true));
+        let (state_tx, _) = watch::channel(true);
+        let (backend_tx, _) = watch::channel(InputBackend::Wayland);
+        let (_cfg_tx, cfg_rx) = watch::channel(crate::control::ConfigChange::default());
+        let s = Supervisor::new(cfg.clone(), enabled.clone(), state_tx.clone(), backend_tx, cfg_rx.clone());
+        assert_eq!(
+            s.resolve_target(BackendTarget::Toggle).unwrap(),
+            InputBackend::Evdev
+        );
+
+        let (backend_tx, _) = watch::channel(InputBackend::Evdev);
+        let s = Supervisor::new(cfg, enabled, state_tx, backend_tx, cfg_rx);
+        assert_eq!(
+            s.resolve_target(BackendTarget::Toggle).unwrap(),
             InputBackend::Wayland
         );
     }

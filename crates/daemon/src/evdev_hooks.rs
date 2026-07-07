@@ -33,6 +33,7 @@ impl AppliedHooks {
         self.hooks.is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn names(&self) -> Vec<String> {
         self.hooks.iter().map(|h| h.name.clone()).collect()
     }

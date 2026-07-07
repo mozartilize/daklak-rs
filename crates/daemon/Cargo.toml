@@ -12,7 +12,7 @@ path = "src/main.rs"
 default = []
 kde = ["viet-ime-wayland-adapter/kde"]
 ibus = ["dep:viet-ime-ibus-adapter"]
-evdev_grab = ["dep:viet-ime-evdev-adapter"]
+evdev_grab = ["dep:viet-ime-evdev-adapter", "dep:zbus"]
 
 [dependencies]
 viet-ime-engine = { path = "../engine" }
@@ -34,6 +34,7 @@ toml = { workspace = true }
 anyhow = { workspace = true }
 ksni = { workspace = true }
 libc = "0.2"
+zbus = { version = "5.16.0", features = ["blocking"], optional = true }
 
 [dev-dependencies]
 # Enable the keymap test builders (real "us" layout) for daemon tests.

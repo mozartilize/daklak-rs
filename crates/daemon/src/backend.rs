@@ -15,6 +15,7 @@ pub enum InputBackend {
 pub enum BackendTarget {
     Native,
     Evdev,
+    Toggle,
 }
 
 impl BackendTarget {
@@ -22,6 +23,7 @@ impl BackendTarget {
         match raw.trim().to_ascii_lowercase().as_str() {
             "native" | "auto" => Some(Self::Native),
             "evdev" | "evdev-grab" | "evdev_grab" => Some(Self::Evdev),
+            "toggle" => Some(Self::Toggle),
             _ => None,
         }
     }
@@ -82,6 +84,7 @@ impl fmt::Display for BackendTarget {
         match self {
             Self::Native => f.write_str("native"),
             Self::Evdev => f.write_str("evdev"),
+            Self::Toggle => f.write_str("toggle"),
         }
     }
 }
@@ -100,6 +103,7 @@ mod tests {
             BackendTarget::parse("evdev-grab"),
             Some(BackendTarget::Evdev)
         );
+        assert_eq!(BackendTarget::parse("toggle"), Some(BackendTarget::Toggle));
         assert_eq!(BackendTarget::parse("ibus"), None);
         assert_eq!(BackendTarget::parse("wayland"), None);
     }

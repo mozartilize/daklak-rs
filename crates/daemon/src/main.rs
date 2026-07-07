@@ -4,6 +4,8 @@ mod config;
 mod control;
 #[cfg(feature = "evdev_grab")]
 mod evdev_hooks;
+#[cfg(feature = "evdev_grab")]
+mod evdev_preflight;
 mod handler;
 mod ipc;
 mod logging;
@@ -26,7 +28,7 @@ fn print_help() {
     println!("  enable       Turn the input method on.");
     println!("  disable      Turn the input method off.");
     println!("  status       Print 'on' or 'off' and exit.");
-    println!("  backend [native|auto|evdev]  Print active backend or toggle evdev grab.");
+    println!("  backend [native|auto|evdev|toggle]  Print/switch/toggle active backend.");
     println!(
         "  gen-keymap   Print daklak's synthetic xkb keymap to stdout and exit.\n\
          \x20              Pipe to a file then load it into your compositor manually:\n\
@@ -117,7 +119,7 @@ where
                         cli.backend_arg =
                             Some(backend::BackendTarget::parse(&raw).ok_or_else(|| {
                                 anyhow::anyhow!(
-                                    "daklak: unknown backend {raw:?}; use native, auto, or evdev"
+                                    "daklak: unknown backend {raw:?}; use native, auto, evdev, or toggle"
                                 )
                             })?);
                     }
@@ -398,5 +400,8 @@ mod cli_tests {
 
         let cli = parse_from(&["backend", "native"]).unwrap();
         assert_eq!(cli.backend_arg, Some(BackendTarget::Native));
+
+        let cli = parse_from(&["backend", "toggle"]).unwrap();
+        assert_eq!(cli.backend_arg, Some(BackendTarget::Toggle));
     }
 }
