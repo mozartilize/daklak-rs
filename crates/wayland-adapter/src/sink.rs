@@ -77,6 +77,8 @@ pub struct AdapterSink<'a> {
     /// and skips its own `self.modifiers` update so daklak's modifier state
     /// tracking isn't transiently corrupted by its own dance.
     pub(crate) synthetic_mods_pending: &'a mut u32,
+    /// Exact synthetic modifier masks expected to echo back through the IM grab.
+    pub(crate) synthetic_mods_expected: &'a mut std::collections::VecDeque<(u32, u32, u32, u32)>,
     /// Stamp of the most recent `synthetic_mods_pending` increment — read by
     /// `on_modifiers` as a TTL safety net (force-reset the counter if no
     /// echo arrives within 50ms, in case the compositor coalesced events).
@@ -224,6 +226,7 @@ impl OutputSink for AdapterSink<'_> {
         viet_ime_key_emitter::emit_char(
             emitter,
             self.synthetic_mods_pending,
+            self.synthetic_mods_expected,
             self.synthetic_mods_emitted_at,
             self.raw_mods,
             self.held_user_kc,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -78,6 +78,12 @@ pub struct AdapterState {
     /// seen mirrored back through the IM grab's `Modifiers` event. Used by
     /// `vk_commit_char`'s level-selecting dance (key-channel commit).
     pub synthetic_mods_pending: u32,
+
+    /// Exact modifier masks daklak expects to see echoed back from its own
+    /// synthetic `vk.modifiers` dance. A real user modifier update may arrive
+    /// while synthetic echoes are pending; only masks matching the front of this
+    /// queue are skipped as echoes.
+    pub synthetic_mods_expected: VecDeque<(u32, u32, u32, u32)>,
 
     /// Timestamp of the last `vk.modifiers` emit that bumped
     /// `synthetic_mods_pending`. TTL safety net (50ms).
@@ -177,6 +183,7 @@ impl AdapterState {
             raw_mods: (0, 0, 0, 0),
             pending_frame: DoneFrame::default(),
             synthetic_mods_pending: 0,
+            synthetic_mods_expected: VecDeque::new(),
             synthetic_mods_emitted_at: None,
             last_forwarded_key: None,
             last_forwarded_release: None,

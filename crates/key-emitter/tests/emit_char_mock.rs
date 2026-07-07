@@ -1,14 +1,15 @@
 //! Pins down `emit_char`'s shared body against a recording `MockEmitter`,
 //! independent of any Wayland/uinput wiring.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use viet_ime_key_emitter::{emit_char, KeyEmitter};
 
 #[derive(Debug, PartialEq, Eq)]
 enum Event {
-    Key(u32, u32, u32),                 // time, keycode, value
-    Modifiers(u32, u32, u32, u32),      // dep, lat, lock, group
+    Key(u32, u32, u32),            // time, keycode, value
+    Modifiers(u32, u32, u32, u32), // dep, lat, lock, group
 }
 
 struct MockEmitter {
@@ -18,7 +19,10 @@ struct MockEmitter {
 
 impl MockEmitter {
     fn new(echo_through_grab: bool) -> Self {
-        Self { log: Vec::new(), echo_through_grab }
+        Self {
+            log: Vec::new(),
+            echo_through_grab,
+        }
     }
 }
 
@@ -38,22 +42,43 @@ impl KeyEmitter for MockEmitter {
 fn emit_char_unknown_returns_false() {
     let mut em = MockEmitter::new(true);
     let mut pending = 0u32;
+    let mut expected = VecDeque::new();
     let mut at: Option<Instant> = None;
-    let ok = emit_char(&mut em, &mut pending, &mut at, (0, 0, 0, 0), None, 0, '\u{FFFF}');
+    let ok = emit_char(
+        &mut em,
+        &mut pending,
+        &mut expected,
+        &mut at,
+        (0, 0, 0, 0),
+        None,
+        0,
+        '\u{FFFF}',
+    );
     assert!(!ok);
     assert!(em.log.is_empty());
     assert_eq!(pending, 0);
+    assert!(expected.is_empty());
 }
 
 #[test]
 fn emit_char_known_char_emits_press_release() {
     let mut em = MockEmitter::new(true);
     let mut pending = 0u32;
+    let mut expected = VecDeque::new();
     let mut at: Option<Instant> = None;
     // 'â' is in the daklak inventory; we don't assert on the specific
     // keycode (depends on slot table), only on the shape of the event
     // stream: optional mod dance, then press(1) then release(0).
-    let ok = emit_char(&mut em, &mut pending, &mut at, (0, 0, 0, 0), None, 42, 'â');
+    let ok = emit_char(
+        &mut em,
+        &mut pending,
+        &mut expected,
+        &mut at,
+        (0, 0, 0, 0),
+        None,
+        42,
+        'â',
+    );
     assert!(ok);
     let keys: Vec<_> = em
         .log
@@ -77,10 +102,33 @@ fn emit_char_bumps_pending_when_echo_grab() {
     // (set + restore).
     let mut em = MockEmitter::new(true);
     let mut pending = 0u32;
+    let mut expected = VecDeque::new();
     let mut at: Option<Instant> = None;
-    let ok = emit_char(&mut em, &mut pending, &mut at, (0, 0, 0, 0), None, 0, 'Â');
+    let ok = emit_char(
+        &mut em,
+        &mut pending,
+        &mut expected,
+        &mut at,
+        (0, 0, 0, 0),
+        None,
+        0,
+        'Â',
+    );
     assert!(ok);
     assert_eq!(pending, 2, "set + restore bump on grab-echo emitter");
+    let emitted_modifiers = em
+        .log
+        .iter()
+        .filter_map(|e| match e {
+            Event::Modifiers(dep, lat, lock, group) => Some((*dep, *lat, *lock, *group)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        expected.into_iter().collect::<Vec<_>>(),
+        emitted_modifiers,
+        "expected echo masks are tracked in wire order"
+    );
     assert!(at.is_some());
 }
 
@@ -88,10 +136,21 @@ fn emit_char_bumps_pending_when_echo_grab() {
 fn emit_char_no_bump_when_no_grab_echo() {
     let mut em = MockEmitter::new(false);
     let mut pending = 0u32;
+    let mut expected = VecDeque::new();
     let mut at: Option<Instant> = None;
-    let ok = emit_char(&mut em, &mut pending, &mut at, (0, 0, 0, 0), None, 0, 'Â');
+    let ok = emit_char(
+        &mut em,
+        &mut pending,
+        &mut expected,
+        &mut at,
+        (0, 0, 0, 0),
+        None,
+        0,
+        'Â',
+    );
     assert!(ok);
     assert_eq!(pending, 0, "no bump on emitters that don't echo through grab");
+    assert!(expected.is_empty());
     assert!(at.is_none());
 }
 
@@ -101,9 +160,19 @@ fn emit_char_path_a_prelude_release() {
     // the very first event must be a release of that keycode.
     let mut em = MockEmitter::new(true);
     let mut pending = 0u32;
+    let mut expected = VecDeque::new();
     let mut at: Option<Instant> = None;
     // First emit 'â' once with no held_user_kc to discover its keycode.
-    let _ = emit_char(&mut em, &mut pending, &mut at, (0, 0, 0, 0), None, 0, 'â');
+    let _ = emit_char(
+        &mut em,
+        &mut pending,
+        &mut expected,
+        &mut at,
+        (0, 0, 0, 0),
+        None,
+        0,
+        'â',
+    );
     let kc = em
         .log
         .iter()
@@ -116,9 +185,23 @@ fn emit_char_path_a_prelude_release() {
     // Now emit again with held_user_kc == kc and assert prelude release.
     let mut em = MockEmitter::new(true);
     let mut pending = 0u32;
+    let mut expected = VecDeque::new();
     let mut at: Option<Instant> = None;
-    let ok = emit_char(&mut em, &mut pending, &mut at, (0, 0, 0, 0), Some(kc), 0, 'â');
+    let ok = emit_char(
+        &mut em,
+        &mut pending,
+        &mut expected,
+        &mut at,
+        (0, 0, 0, 0),
+        Some(kc),
+        0,
+        'â',
+    );
     assert!(ok);
     let first = em.log.first().expect("at least one event");
-    assert_eq!(*first, Event::Key(0, kc, 0), "prelude release must come first");
+    assert_eq!(
+        *first,
+        Event::Key(0, kc, 0),
+        "prelude release must come first"
+    );
 }

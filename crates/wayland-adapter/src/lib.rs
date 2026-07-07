@@ -323,6 +323,7 @@ impl<'a> AdapterCtx<'a> {
                     forward_emitter: &mut vk_forward,
                     synth_keymap_emitter: Some(synth_dyn),
                     synthetic_mods_pending: &mut self.state.synthetic_mods_pending,
+                    synthetic_mods_expected: &mut self.state.synthetic_mods_expected,
                     synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
                     raw_mods,
                     held_user_kc,
@@ -345,6 +346,7 @@ impl<'a> AdapterCtx<'a> {
                     forward_emitter: &mut vk_forward,
                     synth_keymap_emitter: None,
                     synthetic_mods_pending: &mut self.state.synthetic_mods_pending,
+                    synthetic_mods_expected: &mut self.state.synthetic_mods_expected,
                     synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
                     raw_mods,
                     held_user_kc,
@@ -578,19 +580,29 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         {
             tracing::trace!(
                 pending = self.state.synthetic_mods_pending,
-                "on_modifiers: synthetic counter TTL expired, force-reset"
+                "on_modifiers: synthetic echo TTL expired, force-reset"
             );
             self.state.synthetic_mods_pending = 0;
+            self.state.synthetic_mods_expected.clear();
             self.state.synthetic_mods_emitted_at = None;
         }
-        if self.state.synthetic_mods_pending > 0 {
-            self.state.synthetic_mods_pending = self.state.synthetic_mods_pending.saturating_sub(1);
+
+        let incoming_mods = (mods_depressed, mods_latched, mods_locked, group);
+        if self
+            .state
+            .synthetic_mods_expected
+            .front()
+            .is_some_and(|expected| *expected == incoming_mods)
+        {
+            self.state.synthetic_mods_expected.pop_front();
+            self.state.synthetic_mods_pending = self.state.synthetic_mods_expected.len() as u32;
             if self.state.synthetic_mods_pending == 0 {
                 self.state.synthetic_mods_emitted_at = None;
             }
             tracing::trace!(
+                ?incoming_mods,
                 pending_after = self.state.synthetic_mods_pending,
-                "on_modifiers: skipping synthetic echo"
+                "on_modifiers: skipping expected synthetic echo"
             );
             return;
         }
@@ -906,6 +918,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn real_modifier_update_is_not_swallowed_by_pending_synthetic_echo() {
+        let mut app = WaylandAdapter {
+            handler: NoopHandler,
+            state: AdapterState::new(),
+            qh: None,
+        };
+        app.state.xkb = Some(viet_ime_keymap::xkb::XkbState::us_for_test());
+        app.state.synthetic_mods_pending = 1;
+        app.state.synthetic_mods_emitted_at = Some(Instant::now());
+
+        app.handle_modifiers(0x01, 0, 0, 0);
+
+        assert!(
+            app.state.modifiers.contains(ModifierState::SHIFT),
+            "a real Shift modifiers event must update adapter state even when a synthetic echo is pending"
+        );
+        assert_eq!(app.state.raw_mods, (0x01, 0, 0, 0));
+    }
 
     #[test]
     fn press_value_is_2_only_while_forwarding_repeat() {

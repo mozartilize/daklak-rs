@@ -14,6 +14,7 @@
 //! `char_to_emit`'s inventory. The caller is responsible for any
 //! fallback (`commit_string` on Wayland).
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use viet_ime_keymap::{char_to_emit, plan_mod_dance};
@@ -23,6 +24,7 @@ use crate::KeyEmitter;
 pub fn emit_char(
     emitter: &mut dyn KeyEmitter,
     synthetic_mods_pending: &mut u32,
+    synthetic_mods_expected: &mut VecDeque<(u32, u32, u32, u32)>,
     synthetic_mods_emitted_at: &mut Option<Instant>,
     raw_mods: (u32, u32, u32, u32),
     held_user_kc: Option<u32>,
@@ -53,7 +55,8 @@ pub fn emit_char(
     if let Some((emit_mask, _)) = dance {
         emitter.emit_modifiers(emit_mask, lat, lock, group);
         if echo {
-            *synthetic_mods_pending = synthetic_mods_pending.saturating_add(1);
+            synthetic_mods_expected.push_back((emit_mask, lat, lock, group));
+            *synthetic_mods_pending = synthetic_mods_expected.len() as u32;
             *synthetic_mods_emitted_at = Some(Instant::now());
         }
     }
@@ -62,7 +65,8 @@ pub fn emit_char(
     if let Some((_, restore_mask)) = dance {
         emitter.emit_modifiers(restore_mask, lat, lock, group);
         if echo {
-            *synthetic_mods_pending = synthetic_mods_pending.saturating_add(1);
+            synthetic_mods_expected.push_back((restore_mask, lat, lock, group));
+            *synthetic_mods_pending = synthetic_mods_expected.len() as u32;
             *synthetic_mods_emitted_at = Some(Instant::now());
         }
     }
