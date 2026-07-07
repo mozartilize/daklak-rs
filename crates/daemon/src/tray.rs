@@ -583,6 +583,50 @@ fn hook_name_is_safe(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+const SNI_WATCHER: &str = "org.kde.StatusNotifierWatcher";
+
+/// Wait for the StatusNotifierWatcher D-Bus name to appear on the session bus.
+/// Returns Ok(()) when the name is owned, or Err after a timeout (~30s).
+async fn wait_for_sni_watcher() -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    let connection = zbus::Connection::session().await?;
+    let dbus = zbus::fdo::DBusProxy::new(&connection).await?;
+
+    // Already running?
+    if dbus.name_has_owner(SNI_WATCHER.try_into()?).await? {
+        return Ok(());
+    }
+
+    // Watch for it to appear.
+    let mut stream = dbus.receive_name_owner_changed().await?;
+    let timeout = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut timeout => {
+                return Err(anyhow::anyhow!(
+                    "timeout: {SNI_WATCHER} did not appear within 30s"
+                ));
+            }
+            signal = stream.next() => {
+                let Some(signal) = signal else {
+                    return Err(anyhow::anyhow!("D-Bus signal stream ended"));
+                };
+                let args = signal.args()?;
+                if args.name.as_str() == SNI_WATCHER
+                    && !args.new_owner.as_deref().unwrap_or_default().is_empty()
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 /// Spawn the tray icon best-effort. Logs a warning on D-Bus failure and returns
 /// without aborting the daemon — IPC/CLI still work without a session bus.
 pub fn spawn_tray(
@@ -599,22 +643,49 @@ pub fn spawn_tray(
     let evdev_grab_hooks = config.evdev_grab_hooks.clone();
 
     tokio::spawn(async move {
-        let tray = DaklakTray {
-            cmd_tx,
-            config_change_tx,
-            config_path,
+        // Build a fresh DaklakTray from current watch state.
+        let mut make_tray = || DaklakTray {
+            cmd_tx: cmd_tx.clone(),
+            config_change_tx: config_change_tx.clone(),
+            config_path: config_path.clone(),
             enabled: *state_rx.borrow_and_update(),
             method,
             modern_style,
             evdev_enabled,
             backend: *backend_rx.borrow(),
-            evdev_grab_hooks,
+            evdev_grab_hooks: evdev_grab_hooks.clone(),
         };
-        let handle = match tray.spawn().await {
+
+        // Try immediately — works when daklak starts after the DE.
+        let handle = match make_tray().spawn().await {
             Ok(h) => h,
-            Err(e) => {
-                tracing::warn!("app indicator unavailable (no session D-Bus or SNI host?): {e}");
-                return;
+            Err(first_err) => {
+                tracing::debug!(
+                    error = %first_err,
+                    "tray spawn failed; waiting for StatusNotifierWatcher on D-Bus"
+                );
+                match wait_for_sni_watcher().await {
+                    Ok(()) => {
+                        tracing::info!("StatusNotifierWatcher appeared on D-Bus");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "gave up waiting for StatusNotifierWatcher: {e} — \
+                             tray disabled for this session"
+                        );
+                        return;
+                    }
+                }
+                match make_tray().spawn().await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!(
+                            "tray spawn failed even after watcher appeared: {e} — \
+                             tray disabled for this session"
+                        );
+                        return;
+                    }
+                }
             }
         };
         // Repaint on every state or backend change.
