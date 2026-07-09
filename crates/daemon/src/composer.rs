@@ -424,8 +424,8 @@ impl Composer {
             return;
         }
 
-        let shadow_text = self.edit.shadow_text().to_owned();
-        let word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
+        let shadow = self.edit.shadow_text();
+        let word = current_word_before_cursor(shadow, shadow.len() as u32);
         self.engine.reset();
         self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(word);
     }
@@ -473,8 +473,8 @@ impl Composer {
         self.last_input_char = Some(ch);
 
         if self.engine.at_word_beginning() && !prev_was_separator {
-            let shadow_text = self.edit.shadow_text().to_owned();
-            let raw_word = current_word_before_cursor(&shadow_text, shadow_text.len() as u32);
+            let shadow = self.edit.shadow_text();
+            let raw_word = current_word_before_cursor(shadow, shadow.len() as u32);
             if !raw_word.is_empty() {
                 tracing::debug!(word = raw_word, "seed engine from shadow at word boundary");
                 self.retroactive_context = self.engine.feed_context_gated(raw_word);
@@ -592,7 +592,23 @@ impl Composer {
         if quirk_requests_forward {
             self.firefox.arm_forward_sticky();
         }
-        let used_forward_key = quirk_requests_forward || self.firefox.forward_sticky();
+        // Firefox contenteditable byte-vs-char bug (Bug 1905481 family):
+        // delete_surrounding_text uses byte counts per the text-input-v3 spec,
+        // but Firefox contenteditable may misinterpret them as character counts
+        // when the deletion spans multibyte UTF-8 and the composition is being
+        // REVERTED to raw ASCII (e.g. Telex ww undoes ư→w). Normal tone
+        // replacement (à→ả) commits another multibyte char so the byte
+        // arithmetic is self-correcting; raw reverts commit ASCII (1 byte per
+        // char), exposing Firefox's mis-measurement of the preceding delete.
+        // Use ForwardKey (physical Backspace) which always removes exactly
+        // 1 character regardless of byte width.
+        let multibyte_retroactive_revert = self.retroactive_context
+            && backspaces > 0
+            && commit.is_ascii()
+            && backspaces < before.chars().count() // partial revert, not full auto-restore
+            && before.chars().rev().take(backspaces).any(|c| c.len_utf8() > 1);
+        let used_forward_key =
+            quirk_requests_forward || self.firefox.forward_sticky() || multibyte_retroactive_revert;
         tracing::trace!(
             ?delete_unit,
             quirk_requests_forward,
@@ -682,6 +698,17 @@ impl Composer {
     /// focus into existing text) or an explicit `force_reseed`, never on
     /// mid-word typing or within 150 ms of our own action (echo).
     fn apply_surrounding(&mut self, text: &str, cursor: u32, anchor: u32, force_reseed: bool) {
+        // text-input-v3 caps surrounding text at 4000 bytes; IBus has no
+        // protocol limit. Log if an app sends more than ~1 KiB — that's
+        // already far more context than we ever use (one word before cursor).
+        if text.len() > 1024 {
+            tracing::warn!(
+                text_bytes = text.len(),
+                cursor,
+                anchor,
+                "surrounding text is unexpectedly long (>1 KiB)"
+            );
+        }
         let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
         let one_char_typed = self.edit.one_char_insertion_since_prev(text, cursor);
         let before_cursor = text_before_cursor(text, cursor);
@@ -823,6 +850,10 @@ pub fn current_word_before_cursor(text: &str, cursor: u32) -> &str {
     &before[start..]
 }
 
+/// Hyphen is intentionally NOT a word boundary: Vietnamese uses hyphens
+/// within compound words and proper nouns (e.g. `bán-nguyệt`, `Ê-đê`).
+/// Breaking at `-` would prevent surrounding-text reseeding from
+/// reconstructing the full compound for the engine.
 fn is_word_boundary(c: char) -> bool {
     c.is_whitespace()
         || c == '\0'
@@ -1399,6 +1430,65 @@ mod tests {
                     panic!("expected raw 'd', got edit bs={backspaces} commit={commit:?}");
                 }
                 KeyDecision::Consumed => panic!("expected raw 'd', got consumed"),
+            }
+        }
+
+        /// Reproduces the Firefox contenteditable bug: cursor mid-word in
+        /// "sword", user deletes 'w' then types 'ww' to get raw 'w' back.
+        /// First 'w' composes ư (seeded from "s"), second 'w' reverts via
+        /// bs=1 → delete_surrounding_text targets a multibyte char (ư = 2
+        /// bytes). Firefox misinterprets the byte-based delete as character-
+        /// based, eating 2 chars ("sư" = 3 bytes) instead of 2 bytes ("ư").
+        ///
+        /// The fix: when the delete backspaces over a multibyte char produced
+        /// from retroactive context seeding, use ForwardKey instead of
+        /// delete_surrounding_text — physical Backspace always removes
+        /// exactly 1 character regardless of byte width.
+        #[test]
+        fn ww_undo_after_retroactive_seed_uses_forward_key() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            // Simulate: text="sword " cursor=1 (cursor between 's' and 'word')
+            // User deleted 'w' externally, arriving as text="sord" cursor=1
+            c.observe_surrounding_bytes("sord ", ByteCursor(1), ByteCursor(1), true);
+
+            // First 'w': engine seeds from shadow "s", produces ư
+            c.mark_action();
+            match c.feed_key('w') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 0);
+                    assert_eq!(commit, "ư");
+                    c.apply_to_sink(backspaces, &commit, 1, 0, &mut sink);
+                }
+                other => panic!("expected Apply for first 'w', got {:?}", std::mem::discriminant(&other)),
+            }
+
+            // Second 'w': engine reverts ư→w (Telex ww escape)
+            c.mark_action();
+            match c.feed_key('w') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1, "engine wants to delete 1 char (ư)");
+                    assert_eq!(commit, "w");
+                    c.apply_to_sink(backspaces, &commit, 2, 0, &mut sink);
+
+                    // The delete targeted ư (2 bytes, 1 char). On Firefox
+                    // contenteditable this MUST use ForwardKey, not
+                    // delete_surrounding_text, because Firefox mis-counts
+                    // byte offsets as characters.
+                    assert!(
+                        !sink.vk_keys.is_empty(),
+                        "second 'w' revert must use ForwardKey (physical BS), \
+                         not delete_surrounding_text — Firefox contenteditable \
+                         misinterprets byte offsets as char offsets for multibyte \
+                         deletions, eating the seeded context 's' as well"
+                    );
+                }
+                other => panic!("expected Apply for second 'w', got {:?}", std::mem::discriminant(&other)),
             }
         }
 
