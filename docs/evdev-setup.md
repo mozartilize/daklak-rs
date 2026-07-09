@@ -155,6 +155,33 @@ Chromium-Wayland, kate-Wayland) do. Each emit triggers an X11 `MappingNotify`
 storm as the compositor re-pushes the seat keymap on device switch — observable
 in `xev` but harmless in practice (clients typically lazy-cache xkb state).
 
+### Known limitation: EIGHT_LEVEL and old X11 apps
+
+The synth keymap uses `EIGHT_LEVEL` xkb type to pack 4 Vietnamese
+character pairs per keycode (17 keycodes for 134 keysyms). Levels 5-8
+require `ISO_Level5_Shift` (bound to `<HENK>`/Mod3). **Old X11 apps
+that only support up to 4 xkb levels** — notably **urxvt** — silently
+ignore levels 5-8 and produce the level-1 character instead, yielding
+wrong output for roughly half the Vietnamese inventory.
+
+Native Wayland clients (foot, ghostty, Firefox Wayland, kate) and
+modern XWayland clients (Chromium, Firefox X11, JetBrains, OnlyOffice,
+Steam) handle all 8 levels correctly.
+
+Switching to `FOUR_LEVEL` (2 pairs per key) would fix urxvt but
+requires 34 keycodes instead of 17. Finding 17 additional safe
+keycodes with Chromium DomCode support is not feasible — only ~13
+candidates exist (see `plans/four-level-keymap-migration.md`). Since
+xkb ties Shift to level selection (Shift IS level 2, not an
+independent case modifier), uppercase cannot be decoupled from the
+level count — each character pair (lower + Shift→upper) always
+consumes 2 levels.
+
+This is accepted as a known limitation: old X11 terminal emulators
+that lack full xkb level support are not a target platform. Users on
+urxvt can switch to a Wayland-native terminal or use the Wayland
+transport (text-input-v3 / input-method-v1) instead of evdev grab.
+
 ## Generating the keymap
 
 Daklak's `gen-keymap` subcommand prints xkb keymap material to stdout. The
