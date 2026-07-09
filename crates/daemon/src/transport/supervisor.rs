@@ -579,6 +579,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "evdev_grab")]
     fn toggle_resolves_opposite_current_backend() {
         let mut cfg = Config::default();
         cfg.enable_wayland = true;
