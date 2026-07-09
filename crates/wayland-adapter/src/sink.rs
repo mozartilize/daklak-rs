@@ -356,7 +356,23 @@ impl AdapterSink<'_> {
                 }
             }
 
+            // Latin-2+ legacy keysyms (e.g. ă=0x1E3, đ=0x1F0) may exist
+            // in the user's xkb layout, causing KWin's keycodeFromKeysym to
+            // take the "mapped" forwardKeySym path which double-outputs on
+            // Ghostty+pi due to a modifier-change + key-event race. Force
+            // Unicode keysym encoding (0x01000000 | codepoint) for these so
+            // KWin always takes the unmapped/temp-keymap path (kc 247).
+            //
+            // Latin-1 chars (ú=0xFA, ó=0xF3, etc.) MUST keep their legacy
+            // keysyms (= codepoint): KWin's mapped path works correctly for
+            // them, and the temp-keymap path doubles on Ghostty+pi.
             let sym = xkbcommon::xkb::utf32_to_keysym(c as u32);
+            let sym = if sym.raw() > 0xFF && sym.raw() < 0x0100_0000 {
+                // Legacy Latin-2+ keysym — override to Unicode encoding
+                xkbcommon::xkb::Keysym::new(0x0100_0000 | c as u32)
+            } else {
+                sym
+            };
             if sym.raw() == 0 {
                 tracing::debug!(c = %c, "commit_via_keysym: no keysym for char, falling back");
                 return false;
@@ -445,5 +461,34 @@ mod tests {
             v1_replacement_route("ập", false),
             V1ReplacementRoute::WholeKeysym
         );
+    }
+
+    /// Verifies that Latin-2+ legacy keysyms get Unicode encoding to
+    /// bypass KWin's mapped forwardKeySym path, while Latin-1 keysyms
+    /// stay as-is (mapped path works fine for them, temp-keymap doubles).
+    #[test]
+    fn latin2_uses_unicode_keysym_latin1_stays_legacy() {
+        // ă has legacy Latin-2 keysym 0x1E3 — must be overridden.
+        let legacy_a_breve = xkbcommon::xkb::utf32_to_keysym('\u{0103}' as u32);
+        assert_eq!(legacy_a_breve.raw(), 0x1E3, "xkbcommon returns legacy keysym for ă");
+        // Our logic: legacy > 0xFF → force Unicode
+        assert!(legacy_a_breve.raw() > 0xFF && legacy_a_breve.raw() < 0x0100_0000);
+        let unicode_a_breve = xkbcommon::xkb::Keysym::new(0x0100_0000 | '\u{0103}' as u32);
+        assert_eq!(unicode_a_breve.raw(), 0x0100_0103);
+
+        // đ has legacy Latin-2 keysym 0x1F0 — must be overridden.
+        let legacy_dstroke = xkbcommon::xkb::utf32_to_keysym('\u{0111}' as u32);
+        assert_eq!(legacy_dstroke.raw(), 0x1F0);
+        assert!(legacy_dstroke.raw() > 0xFF && legacy_dstroke.raw() < 0x0100_0000);
+
+        // ú (Latin-1, keysym 0xFA) — must NOT be overridden.
+        let latin1_u_acute = xkbcommon::xkb::utf32_to_keysym('\u{00FA}' as u32);
+        assert_eq!(latin1_u_acute.raw(), 0xFA, "ú must keep Latin-1 keysym");
+        assert!(latin1_u_acute.raw() <= 0xFF, "Latin-1 keysym must stay below override threshold");
+
+        // ư has no legacy keysym — already Unicode, no override needed.
+        let unicode_uhorn = xkbcommon::xkb::utf32_to_keysym('\u{01B0}' as u32);
+        assert_eq!(unicode_uhorn.raw(), 0x0100_01B0);
+        assert!(unicode_uhorn.raw() >= 0x0100_0000, "ư is already Unicode keysym");
     }
 }
