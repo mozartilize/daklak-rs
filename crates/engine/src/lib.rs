@@ -5,6 +5,7 @@
 //! state machine of vnkey-engine.
 
 mod telex;
+mod viqr;
 mod vni;
 
 use vnkey_engine::{Engine, InputMethod as VnkeyIm};
@@ -214,10 +215,86 @@ fn context_from_surrounding(text: &str, method: InputMethod) -> (String, Vec<u8>
 }
 
 fn chars_from_composed(ch: char, method: InputMethod) -> &'static str {
-    match method {
+    // Method-specific Vietnamese glyph reversal; falls through to shared
+    // ASCII passthrough so each table only carries diacritical mappings.
+    let vietnamese = match method {
         InputMethod::Telex => telex::telex_chars_from_composed(ch),
         InputMethod::Vni => vni::vni_chars_from_composed(ch),
-        InputMethod::Viqr => telex::telex_chars_from_composed(ch),
+        InputMethod::Viqr => viqr::viqr_chars_from_composed(ch),
+    };
+    if !vietnamese.is_empty() {
+        return vietnamese;
+    }
+    ascii_passthrough(ch)
+}
+
+/// Shared identity mapping for ASCII letters and digits — extracted from the
+/// per-method tables so the Vietnamese-specific reversal modules stay small.
+fn ascii_passthrough(ch: char) -> &'static str {
+    match ch {
+        'A' => "A",
+        'B' => "B",
+        'C' => "C",
+        'D' => "D",
+        'E' => "E",
+        'F' => "F",
+        'G' => "G",
+        'H' => "H",
+        'I' => "I",
+        'J' => "J",
+        'K' => "K",
+        'L' => "L",
+        'M' => "M",
+        'N' => "N",
+        'O' => "O",
+        'P' => "P",
+        'Q' => "Q",
+        'R' => "R",
+        'S' => "S",
+        'T' => "T",
+        'U' => "U",
+        'V' => "V",
+        'W' => "W",
+        'X' => "X",
+        'Y' => "Y",
+        'Z' => "Z",
+        'a' => "a",
+        'b' => "b",
+        'c' => "c",
+        'd' => "d",
+        'e' => "e",
+        'f' => "f",
+        'g' => "g",
+        'h' => "h",
+        'i' => "i",
+        'j' => "j",
+        'k' => "k",
+        'l' => "l",
+        'm' => "m",
+        'n' => "n",
+        'o' => "o",
+        'p' => "p",
+        'q' => "q",
+        'r' => "r",
+        's' => "s",
+        't' => "t",
+        'u' => "u",
+        'v' => "v",
+        'w' => "w",
+        'x' => "x",
+        'y' => "y",
+        'z' => "z",
+        '0' => "0",
+        '1' => "1",
+        '2' => "2",
+        '3' => "3",
+        '4' => "4",
+        '5' => "5",
+        '6' => "6",
+        '7' => "7",
+        '8' => "8",
+        '9' => "9",
+        _ => "",
     }
 }
 
@@ -708,5 +785,56 @@ mod tests {
             e.at_word_beginning(),
             "rejected seed must leave the engine untouched"
         );
+    }
+
+    // ===== VIQR surrounding-text reconstruction =====
+
+    #[test]
+    fn viqr_context_reversal_uses_viqr_keystrokes() {
+        // VIQR uses punctuation marks for tones/diacritics, not Telex letters.
+        let (keys, widths) = context_from_surrounding("nó", InputMethod::Viqr);
+        assert_eq!(keys, "no'", "VIQR acute tone is apostrophe, not 's'");
+        assert_eq!(widths, &[1, 2]);
+    }
+
+    #[test]
+    fn viqr_context_reversal_circumflex_and_horn() {
+        let (keys, _) = context_from_surrounding("ơ", InputMethod::Viqr);
+        assert_eq!(keys, "o+", "VIQR horn is '+'");
+
+        let (keys, _) = context_from_surrounding("ô", InputMethod::Viqr);
+        assert_eq!(keys, "o^", "VIQR circumflex is '^'");
+
+        let (keys, _) = context_from_surrounding("ă", InputMethod::Viqr);
+        assert_eq!(keys, "a(", "VIQR breve is '('");
+    }
+
+    #[test]
+    fn viqr_feed_context_accepts_composed_vietnamese_for_tone_replacement() {
+        let mut eng = EngineState::new(InputMethod::Viqr);
+        assert!(eng.feed_context("nó"));
+
+        let r = eng.process_key('?');
+
+        assert!(r.consumed);
+        assert_eq!(r.backspaces, 1);
+        assert_eq!(r.commit, "ỏ");
+    }
+
+    #[test]
+    fn viqr_feed_context_accepts_composed_vietnamese_inside_word() {
+        let mut eng = EngineState::new(InputMethod::Viqr);
+
+        assert!(eng.feed_context("pho"));
+        let r = eng.process_key('+');
+        assert!(r.consumed);
+        assert_eq!(r.commit, "ơ");
+
+        eng.reset();
+        assert!(eng.feed_context("phơ"));
+        let r = eng.process_key('?');
+        assert!(r.consumed);
+        assert_eq!(r.backspaces, 1);
+        assert_eq!(r.commit, "ở");
     }
 }
