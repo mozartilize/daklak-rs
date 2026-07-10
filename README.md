@@ -7,6 +7,10 @@
 - Surrounding text is the tier-1 model: it enables retroactive word correction (adding or changing tones and marks) after a word is typed.
 - IPC commands enable desktop-agnostic integration (e.g. binding an on/off shortcut).
 
+## Release Signatures
+
+Releases are signed with [7E41F540DBA56839722E1B10354BFCE527EA6812](https://keys.openpgp.org/search?q=7E41F540DBA56839722E1B10354BFCE527EA6812) and published [on GitHub](https://github.com/mozartilize/daklak-rs/releases).
+
 ## Quick installation
 
 From a fresh checkout:

@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }} package
+    runs-on: ubuntu-latest
+    env:
+      HAS_GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: arch
+            dockerfile: build-docker/arch/Dockerfile
+          - target: debian-trixie
+            dockerfile: build-docker/debian-trixie/Dockerfile
+          - target: ubuntu-26.04
+            dockerfile: build-docker/ubuntu-26.04/Dockerfile
+
+    steps:
+      - name: Checkout release source
+        if: ${{ !env.ACT }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Checkout vnkey submodule
+        if: ${{ !env.ACT }}
+        run: git submodule update --init vendors/vnkey
+
+      - name: Validate release tag matches meson version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+
+          case "$tag" in
+            v*) version="${tag#v}" ;;
+            *) echo "Release tag must start with v, got: $tag" >&2; exit 1 ;;
+          esac
+
+          meson_version="$(sed -nE "s/^\s*version:\s*'(.*)',/\1/p" meson.build)"
+          if [ -z "$meson_version" ]; then
+            echo "Could not read project version from meson.build" >&2
+            exit 1
+          fi
+
+          if [ "$version" != "$meson_version" ]; then
+            echo "Tag version ($version) does not match meson.build version ($meson_version)" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build package export image
+        uses: docker/build-push-action@v7
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: export
+          build-args: |
+            features=kde,ibus,evdev_grab
+          outputs: type=local,dest=dist/${{ matrix.target }}
+
+      - name: Import signing key
+        if: ${{ env.HAS_GPG_PRIVATE_KEY == 'true' }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Sign package
+        if: ${{ env.HAS_GPG_PRIVATE_KEY == 'true' }}
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          passphrase_args=()
+          if [ -n "${GPG_PASSPHRASE:-}" ]; then
+            passphrase_args=(--pinentry-mode loopback --passphrase "$GPG_PASSPHRASE")
+          fi
+
+          shopt -s nullglob
+          packages=(dist/${{ matrix.target }}/*.deb dist/${{ matrix.target }}/*.pkg.tar.zst)
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "No package artifacts found in dist/${{ matrix.target }}" >&2
+            exit 1
+          fi
+
+          for package in "${packages[@]}"; do
+            gpg --batch --yes "${passphrase_args[@]}" \
+              --detach-sign --armor "$package"
+          done
+
+      - name: Upload release assets
+        if: ${{ !env.ACT }}
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          tag_name: ${{ steps.meta.outputs.tag }}
+          files: dist/${{ matrix.target }}/*
+          fail_on_unmatched_files: true
+          overwrite_files: true

@@ -21,8 +21,7 @@ COPY meson.build meson_options.txt ./
 RUN cargo fetch
 
 RUN scripts/build.sh -r ${features:+-f "$features"} && \
-    scripts/release-deb.sh /opt/daklak-out && \
-    cp build/out/daklak /opt/daklak-out/
+    DAKLAK_DISTRO=debian-trixie scripts/release-deb.sh /opt/daklak-out
 
 FROM scratch AS export
 COPY --from=builder /opt/daklak-out/ /
