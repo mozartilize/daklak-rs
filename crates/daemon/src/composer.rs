@@ -263,16 +263,32 @@ pub struct Composer {
     /// the round-trip gate ("kư") and forget that ư came from 'w'.
     pending_engine_edit: Option<PendingEngineEdit>,
     /// True when the engine's word context was derived from a client
-    /// surrounding-text frame (cursor jump / focus / confirmed repair) rather
-    /// than from our own live keystrokes. Only frame-derived context is
-    /// cursor-uncertain and requires the confirm-deferred transaction;
-    /// live composition must stay immediate (no flash, engine revert intact).
+    /// surrounding-text frame (focus / confirmed repair) rather than from our
+    /// own live keystrokes. Frame-derived context is cursor-uncertain and uses
+    /// the confirm-deferred transaction, except when it is the destination
+    /// frame explicitly awaited after a forwarded navigation action.
+    /// Live composition must stay immediate (no flash, engine revert intact).
     context_from_frame: bool,
     /// One-shot: armed by a forwarded nav/editing action. The next printable
     /// key has no trustworthy context at all (shadow was reset, no destination
     /// frame arrived — gedit) and must be confirm-deferred even though no
     /// frame context exists yet. Cleared by the next key or trusted frame.
     await_frame_context: bool,
+    /// True once the client reported a selection (`anchor != cursor`) in a
+    /// surrounding frame — the fingerprint of an active autocomplete
+    /// suggestion. Such clients (Chromium omnibox) re-run autocomplete and
+    /// relocate the caret to the end on ANY text mutation, so no positional
+    /// retroactive edit can land: `delete_surrounding_text` and even a single
+    /// vk-Backspace both scatter (proven empirically). While set, a mid-text
+    /// tone key is forwarded raw (a visible literal) instead of corrupting
+    /// distant text. Normal typing never reports a selection, so this never
+    /// affects apps without autocomplete. Cleared on `full_reset`
+    /// (focus change / commit / deactivate).
+    autocomplete_active: bool,
+    /// Whether the last trusted surrounding frame had text after the cursor
+    /// (a mid-text edit position). End-of-text composition is always safe;
+    /// only mid-text edits are exposed to the omnibox caret-relocation race.
+    last_frame_has_trailing_text: bool,
     edit: EditModel,
 }
 
@@ -364,6 +380,8 @@ impl Composer {
             pending_engine_edit: None,
             context_from_frame: false,
             await_frame_context: false,
+            autocomplete_active: false,
+            last_frame_has_trailing_text: false,
         }
     }
 
@@ -495,6 +513,9 @@ impl Composer {
     pub fn full_reset(&mut self) {
         self.reset_composition_preserving_surrounding();
         self.edit.clear_prev_surrounding();
+        // A new focus / committed input starts a fresh autocomplete context.
+        self.autocomplete_active = false;
+        self.last_frame_has_trailing_text = false;
         #[cfg(feature = "ibus")]
         self.ibus.reset();
     }
@@ -509,6 +530,13 @@ impl Composer {
         self.engine.reset();
         self.edit.reset_composition();
         self.last_input_char = None;
+        // Keyboard navigation / editing shortcuts are user activity: refresh
+        // the idle timer so a tone key pressed shortly after navigating is not
+        // treated as post-idle (cursor-uncertain). Without this, `check_idle_reset`
+        // re-arms `await_frame_context` AFTER the navigation's destination frame
+        // cleared it, forcing the confirm-deferred path (raw key forwarded +
+        // cursor-relative repair) which a caret-relocating client races.
+        self.last_keystroke_at = Instant::now();
         self.retroactive_context = false;
         self.context_from_frame = false;
         self.await_frame_context = true;
@@ -577,6 +605,36 @@ impl Composer {
             self.last_input_char,
             Some(c) if !c.is_ascii_alphabetic()
         );
+
+        // Omnibox degradation: a mid-text tone key while an autocomplete
+        // suggestion is live cannot be applied positionally — the client
+        // re-runs autocomplete and relocates the caret to the end on the first
+        // text mutation, scattering any delete+commit or vk-Backspace edit
+        // (proven empirically). Forward the key raw so it lands as a visible
+        // literal the user can correct, rather than corrupting distant text.
+        // Only mid-text edits are affected; end-of-text composition and apps
+        // without autocomplete are untouched.
+        if self.autocomplete_active
+            && self.last_frame_has_trailing_text
+            && self.confirm_retroactive_edits
+            && self.method() == BackspaceMethod::SurroundingText
+            && ch.is_ascii_alphabetic()
+        {
+            tracing::debug!(
+                ch = %ch,
+                "omnibox autocomplete active + mid-text — forward tone key raw (no positional edit)"
+            );
+            self.engine.reset();
+            self.retroactive_context = false;
+            self.context_from_frame = false;
+            self.await_frame_context = false;
+            self.pending_engine_edit = None;
+            self.last_input_char = Some(ch);
+            self.last_keystroke_at = Instant::now();
+            self.edit.push_forwarded_char(ch);
+            return KeyDecision::ForwardRaw;
+        }
+
         // Defence in depth vs. set_method: a pending key is only meaningful
         // while frame confirmation is possible (SurroundingText tier).
         let prior_key_unconfirmed = self.pending_raw_key.is_some()
@@ -910,6 +968,14 @@ impl Composer {
         anchor: u32,
         force_reseed: bool,
     ) -> Option<RetroEdit> {
+        // A selection (anchor != cursor) is the fingerprint of an active
+        // autocomplete suggestion. Record it BEFORE any echo-skip below
+        // (selection frames are skipped as recent echoes) so the signal is not
+        // lost. `last_frame_has_trailing_text` marks a mid-text edit position.
+        if anchor != cursor {
+            self.autocomplete_active = true;
+        }
+        self.last_frame_has_trailing_text = (cursor as usize) < text.len();
         // text-input-v3 caps surrounding text at 4000 bytes; IBus has no
         // protocol limit. Log if an app sends more than ~1 KiB — that's
         // already far more context than we ever use (one word before cursor).
@@ -924,6 +990,7 @@ impl Composer {
         let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
         let one_char_typed = self.edit.one_char_insertion_since_prev(text, cursor);
         let before_cursor = text_before_cursor(text, cursor);
+        let awaited_destination = self.await_frame_context && !force_reseed;
 
         // A raw key awaiting confirmation is stronger evidence than the 150ms
         // echo heuristic: daklak issued no positional edit for this key, and a
@@ -999,10 +1066,13 @@ impl Composer {
             let word = current_word_before_insertion_point(text, cursor, anchor);
             self.engine.reset();
             self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(word);
-            // Engine context now describes a frame-reported cursor which may
-            // go stale before the next key; positional edits from it must be
+            // A changed frame explicitly awaited after forwarded navigation
+            // confirms the destination before the next key. Applying directly
+            // avoids a Chromium autocomplete race where forwarding the raw key
+            // relocates the cursor before the delayed repair is processed.
+            // Other frame-derived context may still go stale and remains
             // confirm-deferred.
-            self.context_from_frame = self.retroactive_context;
+            self.context_from_frame = self.retroactive_context && !awaited_destination;
             // Same invalidation as the deletion arm: after a genuine cursor
             // jump the last typed key describes the previous locale.
             self.last_input_char = None;
@@ -1174,6 +1244,14 @@ impl Composer {
 
     pub fn prev_surrounding_for_trace(&self) -> (&str, u32) {
         self.edit.prev_surrounding_for_trace()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn omnibox_degradation_active_for_test(&self) -> bool {
+        self.autocomplete_active
+            && self.last_frame_has_trailing_text
+            && self.confirm_retroactive_edits
+            && self.method() == BackspaceMethod::SurroundingText
     }
 
     #[cfg(test)]
@@ -2261,6 +2339,191 @@ mod tests {
                 .expect("confirmed raw tone key should repair from retained shadow");
             assert_eq!(repair.backspaces, 4);
             assert_eq!(repair.commit, "ểng");
+        }
+
+        #[test]
+        fn chromium_autocomplete_destination_frame_applies_tone_immediately() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let text = "tiếng việt dịch sang tiếng anh";
+            let end = text.len() as u32;
+
+            c.observe_surrounding_bytes(text, ByteCursor(end), ByteCursor(end), false);
+
+            // A forwarded navigation action moves from the end of Chromium's
+            // accepted autocomplete text back to `sang|`. Unlike gedit's
+            // no-frame case, Chromium reports the destination before the tone
+            // key, so the cursor-relative edit does not need a raw-key round
+            // trip that could trigger autocomplete cursor relocation.
+            c.reset_composition_preserving_surrounding();
+            c.defer_action();
+            let cursor = "tiếng việt dịch sang".len() as u32;
+            assert!(c
+                .observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false)
+                .is_none());
+
+            c.mark_action();
+            match c.feed_key('s') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 3);
+                    assert_eq!(commit, "áng");
+                }
+                _ => {
+                    panic!("confirmed autocomplete destination must compose without a raw-key race")
+                }
+            }
+        }
+
+        #[test]
+        fn autocomplete_active_degrades_midtext_tone_key_to_literal() {
+            // Autocomplete suggestion (selection frame) is live, then the user
+            // navigates into the middle of the text and presses a tone key. No
+            // positional edit is safe on the caret-relocating omnibox, so the
+            // key is forwarded raw (a visible literal) rather than corrupting
+            // distant text.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let t = "ti\u{1ebf}ng vi\u{1ec7}t d\u{1ecb}ch sang ti\u{1ebf}ng anh";
+            let end = t.len() as u32;
+            let anchor = "ti\u{1ebf}ng vi\u{1ec7}t".len() as u32;
+
+            // Autocomplete suggestion arrives as a selection (anchor != cursor).
+            c.mark_action();
+            c.observe_surrounding_bytes(t, ByteCursor(end), ByteCursor(anchor), false);
+
+            // Navigate back to `sang|` (mid-text: text after the cursor).
+            c.reset_composition_preserving_surrounding();
+            c.defer_action();
+            let sang = "ti\u{1ebf}ng vi\u{1ec7}t d\u{1ecb}ch sang".len() as u32;
+            c.observe_surrounding_bytes(t, ByteCursor(sang), ByteCursor(sang), false);
+
+            c.mark_action();
+            assert!(
+                matches!(c.feed_key('s'), KeyDecision::ForwardRaw),
+                "mid-text tone key under live autocomplete must degrade to a raw literal"
+            );
+        }
+
+        #[test]
+        fn autocomplete_active_still_composes_at_end_of_text() {
+            // Same autocomplete signal, but composing at the END of the text
+            // (no trailing text) is safe — the caret is already where any
+            // relocation would put it — so live composition must still work.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let with_sel = "ti\u{1ebf}ng vi\u{1ec7}t";
+            let cur = with_sel.len() as u32;
+            // Selection frame arms autocomplete_active.
+            c.mark_action();
+            c.observe_surrounding_bytes(with_sel, ByteCursor(cur), ByteCursor(2), false);
+
+            // User keeps typing at the end: "san" then 'g' compose; cursor at end.
+            let san = "ti\u{1ebf}ng vi\u{1ec7}t san";
+            let sc = san.len() as u32;
+            c.observe_surrounding_bytes(san, ByteCursor(sc), ByteCursor(sc), false);
+            c.mark_action();
+            // End-of-text (no trailing text) must NOT degrade: the tone key
+            // composes normally.
+            match c.feed_key('g') {
+                KeyDecision::ForwardRaw => {} // 'g' alone doesn't compose a tone; raw is fine
+                KeyDecision::Apply { .. } => {}
+                _ => panic!("unexpected"),
+            }
+            // The gate itself must be inactive at end-of-text.
+            assert!(!c.omnibox_degradation_active_for_test());
+        }
+
+        #[test]
+        fn midtext_edit_without_autocomplete_still_applies() {
+            // No selection was ever reported (app has no autocomplete), so a
+            // mid-text retroactive edit composes normally.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let t = "ti\u{1ebf}ng vi\u{1ec7}t d\u{1ecb}ch sang ti\u{1ebf}ng anh";
+            c.observe_surrounding_bytes(t, ByteCursor(t.len() as u32), ByteCursor(t.len() as u32), false);
+            c.reset_composition_preserving_surrounding();
+            c.defer_action();
+            let sang = "ti\u{1ebf}ng vi\u{1ec7}t d\u{1ecb}ch sang".len() as u32;
+            c.observe_surrounding_bytes(t, ByteCursor(sang), ByteCursor(sang), false);
+            c.mark_action();
+            match c.feed_key('s') {
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    assert_eq!(backspaces, 3);
+                    assert_eq!(commit, "\u{e1}ng");
+                }
+                _ => panic!("mid-text edit without autocomplete must compose"),
+            }
+        }
+
+        #[test]
+        fn keyboard_navigation_refreshes_idle_timer_so_tone_applies_immediately() {
+            // Real repro root cause: the user types a word, reads an
+            // autocomplete, and navigates with arrow keys for >2s before
+            // editing. `check_idle_reset` (run before every key) fires because
+            // the last *composing* keystroke is >2s old, re-arming
+            // `await_frame_context` AFTER the navigation's destination frame
+            // already cleared it — forcing the tone key down the confirm-
+            // deferred path (raw key forwarded, then a cursor-relative repair
+            // that a caret-relocating omnibox races). Keyboard navigation is
+            // activity and must refresh the idle timer so the tone applies
+            // immediately against the freshly-seeded destination word.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let t = "ti\u{1ebf}ng vi\u{1ec7}t d\u{1ecb}ch sang ti\u{1ebf}ng anh";
+
+            // The last composing keystroke happened a few seconds ago (the user
+            // paused to read the autocomplete before navigating).
+            c.last_keystroke_at -= std::time::Duration::from_secs(3);
+
+            // Navigate (arrow keys) back to `sang|`; the destination frame
+            // re-seeds the word.
+            c.reset_composition_preserving_surrounding();
+            c.defer_action();
+            let sang = "ti\u{1ebf}ng vi\u{1ec7}t d\u{1ecb}ch sang".len() as u32;
+            assert!(c
+                .observe_surrounding_bytes(t, ByteCursor(sang), ByteCursor(sang), false)
+                .is_none());
+
+            // Transport runs the idle check before the key. Navigation just
+            // happened (<2s ago), so it must NOT fire and must NOT re-arm the
+            // confirm-deferral.
+            assert!(
+                !c.check_idle_reset(),
+                "recent keyboard navigation must reset the idle timer"
+            );
+
+            c.mark_action();
+            match c.feed_key('s') {
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    assert_eq!(backspaces, 3);
+                    assert_eq!(commit, "\u{e1}ng");
+                }
+                KeyDecision::ForwardRaw => {
+                    panic!("tone deferred after keyboard nav — races caret relocation")
+                }
+                _ => panic!("unexpected decision"),
+            }
+        }
+
+        #[test]
+        fn force_reseed_frame_still_requires_confirmation_after_reset() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let text = "tiếng";
+            let cursor = text.len() as u32;
+
+            c.full_reset();
+            c.observe_surrounding_bytes(
+                text,
+                ByteCursor(cursor),
+                ByteCursor(cursor),
+                true,
+            );
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('s'), KeyDecision::ForwardRaw));
         }
 
         #[test]
