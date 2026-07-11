@@ -50,11 +50,12 @@ impl EditModel {
         self.strategy.set_modifiers(m);
     }
 
-    fn reset(&mut self) {
+    /// Reset IM-owned text while preserving the last application snapshot.
+    /// Composition/navigation actions must not erase surrounding provenance:
+    /// unchanged frames emitted before an action takes effect stay detectable
+    /// as duplicates instead of being mistaken for destination context.
+    fn reset_composition(&mut self) {
         self.strategy.reset_shadow();
-        self.prev_text.clear();
-        self.prev_cursor = 0;
-        self.prev_anchor = 0;
     }
 
     fn shadow_text(&self) -> &str {
@@ -85,6 +86,25 @@ impl EditModel {
 
     fn deletion_since_prev(&self, text: &str, cursor: u32) -> bool {
         detect_deletion(&self.prev_text, self.prev_cursor, text, cursor)
+    }
+
+    /// Prove that `text` is the last confirmed application text plus exactly
+    /// `ch` immediately before `cursor`. Cursor movement is irrelevant; the
+    /// unchanged prefix+suffix proves this key, rather than an existing equal
+    /// character, produced the frame.
+    fn confirms_inserted_char(&self, text: &str, cursor: u32, ch: char) -> bool {
+        let cursor = (cursor as usize).min(text.len());
+        if !text.is_char_boundary(cursor) {
+            return false;
+        }
+        let before = &text[..cursor];
+        let Some((start, actual)) = before.char_indices().next_back() else {
+            return false;
+        };
+        actual == ch
+            && self.prev_text.len() + ch.len_utf8() == text.len()
+            && self.prev_text.as_bytes().get(..start) == text.as_bytes().get(..start)
+            && self.prev_text.as_bytes().get(start..) == text.as_bytes().get(cursor..)
     }
 
     fn is_duplicate_frame(&self, text: &str, cursor: u32, anchor: u32) -> bool {
@@ -162,7 +182,6 @@ const SURROUNDING_DEAD_STRIKE_LIMIT: u32 = 2;
 
 pub struct Composer {
     pub engine: EngineState,
-    edit: EditModel,
     pub last_keystroke_at: Instant,
 
     /// Last printable user keystroke fed to `feed_key`. Tracks user
@@ -224,12 +243,63 @@ pub struct Composer {
     /// Whether `[`/`]`/`{`/`}` Telex shortcuts for ơ/ư/Ơ/Ư are enabled.
     /// Stored so `set_input_method` can recreate the engine with it.
     bracket_shortcuts: bool,
+
+    /// Whether retroactive SurroundingText edits must first be confirmed by a
+    /// client frame containing the raw key at its real insertion point. Only
+    /// Wayland drains frame-triggered repairs; IBus keeps immediate edits.
+    confirm_retroactive_edits: bool,
+
+    /// Raw key awaiting confirmation from surrounding text. While present,
+    /// daklak must not issue a cursor-relative delete from its shadow: the app
+    /// frame containing this character is the authority for the actual cursor.
+    pending_raw_key: Option<char>,
+    /// False when another key arrived before the pending key was confirmed;
+    /// overlapping frames may synchronize state but cannot authorize repair.
+    pending_raw_key_repairable: bool,
+    /// The engine edit computed live for a confirm-deferred key. The engine
+    /// keeps its post-key state (revert history intact); if the confirming
+    /// frame proves the key landed on the same base word, this edit is emitted
+    /// directly instead of re-deriving it from a reseed — a reseed can fail
+    /// the round-trip gate ("kư") and forget that ư came from 'w'.
+    pending_engine_edit: Option<PendingEngineEdit>,
+    /// True when the engine's word context was derived from a client
+    /// surrounding-text frame (cursor jump / focus / confirmed repair) rather
+    /// than from our own live keystrokes. Only frame-derived context is
+    /// cursor-uncertain and requires the confirm-deferred transaction;
+    /// live composition must stay immediate (no flash, engine revert intact).
+    context_from_frame: bool,
+    /// One-shot: armed by a forwarded nav/editing action. The next printable
+    /// key has no trustworthy context at all (shadow was reset, no destination
+    /// frame arrived — gedit) and must be confirm-deferred even though no
+    /// frame context exists yet. Cleared by the next key or trusted frame.
+    await_frame_context: bool,
+    edit: EditModel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SurroundingDecision {
     trust: bool,
     reseed: bool,
+}
+
+/// A retroactive repair emitted from a surrounding_text frame (not a
+/// keystroke). The frame proves where the raw key actually landed; the repair
+/// is therefore calculated from client ground truth rather than shadow cursor.
+#[derive(Debug, Clone)]
+pub(crate) struct RetroEdit {
+    pub(crate) backspaces: usize,
+    pub(crate) commit: String,
+}
+
+/// Live engine edit stashed while a confirm-deferred key awaits its client
+/// frame. `base_word` is the on-screen word the engine believed it was
+/// editing; a confirming frame whose base differs (cursor moved) invalidates
+/// the stash and falls back to reseed-and-replay from frame ground truth.
+#[derive(Debug, Clone)]
+struct PendingEngineEdit {
+    backspaces: usize,
+    commit: String,
+    base_word: String,
 }
 
 // Generic surrounding-frame trust/reseed policy. This is not in `quirks/`
@@ -288,6 +358,12 @@ impl Composer {
             retroactive_context: false,
             firefox: FirefoxContenteditableQuirk::new(),
             bracket_shortcuts,
+            confirm_retroactive_edits: false,
+            pending_raw_key: None,
+            pending_raw_key_repairable: false,
+            pending_engine_edit: None,
+            context_from_frame: false,
+            await_frame_context: false,
         }
     }
 
@@ -296,6 +372,12 @@ impl Composer {
     /// Mark a composing user action just happened (gates the reseed echo).
     pub fn mark_action(&mut self) {
         self.last_action_at = Instant::now();
+    }
+
+    /// Require client-frame confirmation before cursor-relative retroactive
+    /// edits (Wayland only). Idempotent; safe to call on every activate.
+    pub fn set_surrounding_confirmation(&mut self, on: bool) {
+        self.confirm_retroactive_edits = on;
     }
 
     /// Roll the action clock far back so the NEXT surrounding frame bypasses
@@ -314,6 +396,15 @@ impl Composer {
 
     pub fn set_method(&mut self, m: BackspaceMethod) {
         self.edit.set_method(m);
+        if m != BackspaceMethod::SurroundingText {
+            // A non-ST tier has no confirmation transaction: no client frame
+            // will ever confirm (or clear) a pending raw key. Leaving it set
+            // would make every subsequent feed_key reset the engine (ghostty:
+            // composition dead until a non-printable key cleared it).
+            self.pending_raw_key = None;
+            self.pending_raw_key_repairable = false;
+            self.pending_engine_edit = None;
+        }
     }
 
     /// Watchdog for clients that advertise surrounding-text support but never
@@ -402,14 +493,30 @@ impl Composer {
     /// engine, shadow, last_input_char, and the surrounding-text diff
     /// bookkeeping (prev_text, prev_cursor).
     pub fn full_reset(&mut self) {
-        self.engine.reset();
-        self.edit.reset();
-        self.last_input_char = None;
-        self.retroactive_context = false;
-        self.firefox.clear();
-        self.firefox.reset_forward_sticky();
+        self.reset_composition_preserving_surrounding();
+        self.edit.clear_prev_surrounding();
         #[cfg(feature = "ibus")]
         self.ibus.reset();
+    }
+
+    /// Reset IM-owned composition without discarding the last confirmed client
+    /// snapshot. Forwarded cursor/editing actions are asynchronous: KWin may
+    /// re-emit the unchanged pre-action frame before gedit processes the key.
+    /// Keeping `prev_text` makes that frame a duplicate instead of destination
+    /// context. Mouse navigation needs no special handling; its changed frame
+    /// is consumed normally by `apply_surrounding`.
+    pub fn reset_composition_preserving_surrounding(&mut self) {
+        self.engine.reset();
+        self.edit.reset_composition();
+        self.last_input_char = None;
+        self.retroactive_context = false;
+        self.context_from_frame = false;
+        self.await_frame_context = true;
+        self.pending_raw_key = None;
+        self.pending_raw_key_repairable = false;
+        self.pending_engine_edit = None;
+        self.firefox.clear();
+        self.firefox.reset_forward_sticky();
     }
 
     /// Re-seed the engine after a retroactive edit was applied. Must mirror
@@ -442,6 +549,10 @@ impl Composer {
     pub fn check_idle_reset(&mut self) -> bool {
         if self.last_keystroke_at.elapsed().as_secs() >= 2 {
             self.engine.reset();
+            // The cursor may have moved silently during the pause (gedit
+            // sends no frame for mouse clicks). The next key's context is
+            // cursor-uncertain and must be confirm-deferred on ST.
+            self.await_frame_context = true;
             return true;
         }
         false
@@ -466,13 +577,38 @@ impl Composer {
             self.last_input_char,
             Some(c) if !c.is_ascii_alphabetic()
         );
+        // Defence in depth vs. set_method: a pending key is only meaningful
+        // while frame confirmation is possible (SurroundingText tier).
+        let prior_key_unconfirmed = self.pending_raw_key.is_some()
+            && self.method() == BackspaceMethod::SurroundingText;
+        // Only cursor-uncertain context defers to frame confirmation:
+        // a forwarded nav/editing action or idle pause (await_frame_context),
+        // engine context reconstructed from a client frame at a possibly-
+        // stale cursor (context_from_frame), or an in-flight confirmation
+        // transaction (prior_key_unconfirmed). Live composition from our own
+        // keystroke stream is never deferred — no flash, and the engine's
+        // continuous state handles reverts (kww→kw) and auto-restore
+        // (kwin stays raw) natively.
+        let context_uncertain = self.confirm_retroactive_edits
+            && self.method() == BackspaceMethod::SurroundingText
+            && (self.await_frame_context || self.context_from_frame || prior_key_unconfirmed);
+        self.await_frame_context = false;
+        if prior_key_unconfirmed {
+            // More than one key arrived before surrounding confirmation. Never
+            // compose against the speculative shadow; degrade to raw and let
+            // the newest key's frame resynchronize the transaction.
+            self.engine.reset();
+            self.retroactive_context = false;
+            self.pending_engine_edit = None;
+        }
         if !ch.is_ascii_alphabetic() {
             self.retroactive_context = false;
+            self.context_from_frame = false;
             self.firefox.clear();
         }
         self.last_input_char = Some(ch);
 
-        if self.engine.at_word_beginning() && !prev_was_separator {
+        if !prior_key_unconfirmed && self.engine.at_word_beginning() && !prev_was_separator {
             let shadow = self.edit.shadow_text();
             let raw_word = current_word_before_cursor(shadow, shadow.len() as u32);
             if !raw_word.is_empty() {
@@ -481,6 +617,10 @@ impl Composer {
             }
         }
 
+        // A context reconstructed from surrounding text may describe a stale
+        // cursor. Its positional edit is unsafe until the client reports where
+        // this key actually landed. Live composition remains immediate.
+        let confirm_before_positional_edit = context_uncertain;
         let r = self.engine.process_key(ch);
         self.last_keystroke_at = Instant::now();
         tracing::debug!(
@@ -492,7 +632,7 @@ impl Composer {
             "engine.process_key"
         );
 
-        if r.consumed {
+        if r.consumed && !confirm_before_positional_edit {
             let method = self.method();
             KeyDecision::Apply {
                 method,
@@ -500,7 +640,29 @@ impl Composer {
                 commit: r.commit,
             }
         } else {
+            if r.consumed {
+                // Keep the engine's post-key state — it holds the revert
+                // history a reseed cannot reconstruct ("kư" fails the gate).
+                // Stash the computed edit; the confirming frame decides whether
+                // it may be emitted (same base word) or must be re-derived.
+                let base = {
+                    let shadow = self.edit.shadow_text();
+                    current_word_before_cursor(shadow, shadow.len() as u32).to_owned()
+                };
+                self.pending_engine_edit = Some(PendingEngineEdit {
+                    backspaces: r.backspaces,
+                    commit: r.commit.clone(),
+                    base_word: base,
+                });
+            }
             self.edit.push_forwarded_char(ch);
+            if confirm_before_positional_edit {
+                // Only a cursor-uncertain key opens a confirmation
+                // transaction. Plain unconsumed live keys (English words,
+                // word-initial consonants) just extend the shadow as before.
+                self.pending_raw_key = Some(ch);
+                self.pending_raw_key_repairable = !prior_key_unconfirmed;
+            }
             // A forwarded key changes the shadow after the stale echo that
             // armed char-count mode, so that one-shot assumption no longer
             // applies to the next correction.
@@ -511,6 +673,13 @@ impl Composer {
 
     pub fn unrecord_forwarded_char(&mut self) {
         self.edit.pop_forwarded_char();
+        self.pending_raw_key = None;
+        self.pending_raw_key_repairable = false;
+        if self.pending_engine_edit.take().is_some() {
+            // Engine held speculative post-key state the app never applied.
+            self.engine.reset();
+            self.retroactive_context = false;
+        }
     }
 
     pub fn feed_backspace(&mut self) -> KeyDecision {
@@ -574,6 +743,18 @@ impl Composer {
         serial: u32,
         time: u32,
         sink: &mut S,
+    ) {
+        self.apply_to_sink_inner(backspaces, commit, serial, time, sink, false);
+    }
+
+    fn apply_to_sink_inner<S: viet_ime_edit_strategy::OutputSink>(
+        &mut self,
+        backspaces: usize,
+        commit: &str,
+        serial: u32,
+        time: u32,
+        sink: &mut S,
+        preserve_engine: bool,
     ) {
         let before = self.edit.shadow_text().to_owned();
         let delete_echo = prefix_after_char_delete(&before, backspaces);
@@ -643,11 +824,34 @@ impl Composer {
             self.firefox.reset_delete_unit_after_use();
         }
 
-        self.refresh_retroactive_context_after_apply(backspaces);
+        if !preserve_engine {
+            self.refresh_retroactive_context_after_apply(backspaces);
+        }
         if backspaces > 0 && self.method() == BackspaceMethod::SurroundingText {
             self.firefox
                 .record_expected_echo(self.edit.shadow_text().to_owned(), delete_echo);
         }
+    }
+
+    /// Apply a repair calculated from the frame that confirmed a raw key's
+    /// actual insertion point. KWin may repeat the pre-edit frame; that is part
+    /// of this generic transaction, not evidence of Firefox stale state.
+    pub fn apply_confirmed_repair_to_sink<S: viet_ime_edit_strategy::OutputSink>(
+        &mut self,
+        backspaces: usize,
+        commit: &str,
+        serial: u32,
+        time: u32,
+        sink: &mut S,
+    ) {
+        // The engine already holds the authoritative live composition (the
+        // confirmed base word replayed through the raw key) and knows the
+        // key that produced each transform. Reseeding from the on-screen word
+        // would destroy revert history: after 'w'→"kư", the seed gate rejects
+        // "kư" (no unique round-trip), the engine resets, and the second 'w'
+        // composes a fresh "ư" ("kưư") instead of reverting to "kw".
+        self.apply_to_sink_inner(backspaces, commit, serial, time, sink, true);
+        self.firefox.forget_expected_echo();
     }
 
     // ── surrounding-text / reseed gate (the ONE copy) ───────────────────────
@@ -660,8 +864,8 @@ impl Composer {
         cursor: ByteCursor,
         anchor: ByteCursor,
         force_reseed: bool,
-    ) {
-        self.apply_surrounding(text, cursor.0, anchor.0, force_reseed);
+    ) -> Option<RetroEdit> {
+        self.apply_surrounding(text, cursor.0, anchor.0, force_reseed)
     }
 
     /// IBus reports cursor/anchor in **chars**; everything downstream
@@ -682,7 +886,9 @@ impl Composer {
     ) {
         let cursor_bytes = char_to_byte_offset(text, cursor.0);
         let anchor_bytes = char_to_byte_offset(text, anchor.0);
-        self.apply_surrounding(text, cursor_bytes, anchor_bytes, false);
+        // IBus ignores frame-triggered repairs (confirmation stays off), so
+        // `apply_surrounding` never returns one here — drop the Option.
+        let _ = self.apply_surrounding(text, cursor_bytes, anchor_bytes, false);
     }
 
     /// The reseed gate proper — the single home of the logic that previously
@@ -697,7 +903,13 @@ impl Composer {
     /// "phucs". So only re-seed on a genuine cursor jump (click elsewhere /
     /// focus into existing text) or an explicit `force_reseed`, never on
     /// mid-word typing or within 150 ms of our own action (echo).
-    fn apply_surrounding(&mut self, text: &str, cursor: u32, anchor: u32, force_reseed: bool) {
+    fn apply_surrounding(
+        &mut self,
+        text: &str,
+        cursor: u32,
+        anchor: u32,
+        force_reseed: bool,
+    ) -> Option<RetroEdit> {
         // text-input-v3 caps surrounding text at 4000 bytes; IBus has no
         // protocol limit. Log if an app sends more than ~1 KiB — that's
         // already far more context than we ever use (one word before cursor).
@@ -712,6 +924,21 @@ impl Composer {
         let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
         let one_char_typed = self.edit.one_char_insertion_since_prev(text, cursor);
         let before_cursor = text_before_cursor(text, cursor);
+
+        // A raw key awaiting confirmation is stronger evidence than the 150ms
+        // echo heuristic: daklak issued no positional edit for this key, and a
+        // frame containing it immediately before the reported cursor tells us
+        // where the client actually inserted it. Handle this before Firefox or
+        // generic stale-echo classification.
+        if self.pending_raw_key.is_some() && cursor == anchor {
+            if let Some(repair) = self.confirm_pending_raw_key(text, cursor, anchor, before_cursor) {
+                return Some(repair);
+            }
+            if self.pending_raw_key.is_none() {
+                return None;
+            }
+        }
+
         let shadow_confirmed = before_cursor == self.edit.shadow_text();
         let deletion = self.edit.deletion_since_prev(text, cursor) || shadow_confirmed;
         // `shadow_confirmed` (not `has_selection`) gates trust within the
@@ -738,16 +965,28 @@ impl Composer {
 
         if !decision.trust {
             tracing::trace!(text, cursor, anchor, "skip recent surrounding_text echo");
-            return;
+            return None;
         }
 
         let deletion_already_applied = shadow_confirmed;
         self.edit.on_surrounding_text(text, cursor, anchor);
+        // A trusted frame supplies destination context; frame-derived seeds
+        // below carry the uncertainty via `context_from_frame` instead.
+        self.await_frame_context = false;
+        self.pending_raw_key = None;
+        self.pending_raw_key_repairable = false;
+        if self.pending_engine_edit.take().is_some() {
+            // A trusted frame superseded the confirmation transaction; the
+            // engine's speculative post-key state was never applied on screen.
+            self.engine.reset();
+            self.retroactive_context = false;
+        }
 
         if deletion {
             if !deletion_already_applied {
                 self.engine.reset();
                 self.retroactive_context = false;
+                self.context_from_frame = false;
                 // The engine now reflects the app, not the keyboard. A stale
                 // last_input_char (e.g. the ' ' that ended the previous word)
                 // would keep prev_was_separator true and block the
@@ -760,6 +999,10 @@ impl Composer {
             let word = current_word_before_insertion_point(text, cursor, anchor);
             self.engine.reset();
             self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(word);
+            // Engine context now describes a frame-reported cursor which may
+            // go stale before the next key; positional edits from it must be
+            // confirm-deferred.
+            self.context_from_frame = self.retroactive_context;
             // Same invalidation as the deletion arm: after a genuine cursor
             // jump the last typed key describes the previous locale.
             self.last_input_char = None;
@@ -769,6 +1012,132 @@ impl Composer {
         }
 
         self.edit.record_surrounding(text, cursor, anchor);
+        None
+    }
+
+    /// Finish a raw-key transaction from client ground truth. The only required
+    /// proof is the tracked key immediately before the reported cursor; how the
+    /// cursor moved there is irrelevant. The frame is always recorded, ending
+    /// the `prev_text` starvation loop even when replay produces no edit.
+    fn confirm_pending_raw_key(
+        &mut self,
+        text: &str,
+        cursor: u32,
+        anchor: u32,
+        before_cursor: &str,
+    ) -> Option<RetroEdit> {
+        let ch = self.pending_raw_key?;
+        let Some((raw_index, actual_ch)) = before_cursor.char_indices().next_back() else {
+            return None;
+        };
+        if actual_ch != ch {
+            return None;
+        }
+
+        let insertion_proven = self.edit.confirms_inserted_char(text, cursor, ch);
+        let repairable = self.pending_raw_key_repairable;
+        let stripped = &before_cursor[..raw_index];
+        let base_word = current_word_before_cursor(stripped, stripped.len() as u32).to_owned();
+        let actual_word = current_word_before_cursor(before_cursor, before_cursor.len() as u32)
+            .to_owned();
+
+        if !insertion_proven || !repairable {
+            // The frame changed by more than this key (paste/delete/external
+            // edit). It is still the newest ground truth, but cannot justify a
+            // repair. Synchronize and continue from its visible word.
+            self.edit.on_surrounding_text(text, cursor, anchor);
+            self.edit.record_surrounding(text, cursor, anchor);
+            self.pending_raw_key = None;
+            self.pending_raw_key_repairable = false;
+            self.pending_engine_edit = None;
+            self.last_input_char = Some(ch);
+            self.engine.reset();
+            self.retroactive_context = !actual_word.is_empty()
+                && self.engine.feed_context_gated(&actual_word);
+            self.context_from_frame = self.retroactive_context;
+            return None;
+        }
+
+        // Preferred path: the live engine already processed this key against
+        // the same base word the frame now proves. Emit its stashed edit and
+        // KEEP the engine state — it holds revert history a reseed loses
+        // ("kư" fails the round-trip gate, so reseeding forgets ư came from
+        // 'w' and a second 'w' would compose "kưư" instead of reverting).
+        if let Some(stash) = self.pending_engine_edit.take() {
+            if stash.base_word == base_word {
+                self.edit.on_surrounding_text(text, cursor, anchor);
+                self.edit.record_surrounding(text, cursor, anchor);
+                self.pending_raw_key = None;
+                self.pending_raw_key_repairable = false;
+                self.last_input_char = Some(ch);
+                self.retroactive_context = true;
+                self.context_from_frame = true;
+                // The screen shows base_word + raw ch; the engine wants
+                // base_word minus `backspaces` plus `commit`. Deleting the raw
+                // char costs one extra backspace.
+                return Some(RetroEdit {
+                    backspaces: stash.backspaces + 1,
+                    commit: stash.commit,
+                });
+            }
+            // Cursor moved: the key landed on a different word than the one
+            // the engine composed against. Drop the stash and re-derive from
+            // frame ground truth below.
+        }
+
+        self.engine.reset();
+        let seeded = !base_word.is_empty() && self.engine.feed_context_gated(&base_word);
+        let replay = seeded.then(|| self.engine.process_key(ch));
+
+        // This frame is authoritative regardless of whether replay composes.
+        self.edit.on_surrounding_text(text, cursor, anchor);
+        self.edit.record_surrounding(text, cursor, anchor);
+        self.pending_raw_key = None;
+        self.pending_raw_key_repairable = false;
+        self.last_input_char = Some(ch);
+
+        // For boundary-valued IM keys (`[`/`]` Telex shortcuts), extracting the
+        // current word after the raw key yields empty. The proven on-screen word
+        // is instead exactly the base word plus that inserted key.
+        let screen_word = format!("{base_word}{ch}");
+
+        let Some(replay) = replay else {
+            // Fresh word or foreign base: keep the raw key, but seed the full
+            // confirmed word so subsequent keys start from real client state.
+            self.engine.reset();
+            self.retroactive_context = !screen_word.is_empty()
+                && self.engine.feed_context_gated(&screen_word);
+            self.context_from_frame = self.retroactive_context;
+            return None;
+        };
+
+        self.retroactive_context = true;
+        self.context_from_frame = true;
+        if !replay.consumed {
+            // The seeded engine already incorporated the raw key and matches the
+            // screen; no visible correction is needed.
+            return None;
+        }
+
+        let mut desired = base_word;
+        for _ in 0..replay.backspaces {
+            desired.pop();
+        }
+        desired.push_str(&replay.commit);
+
+        let prefix_chars = screen_word
+            .chars()
+            .zip(desired.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let backspaces = screen_word.chars().count() - prefix_chars;
+        let commit: String = desired.chars().skip(prefix_chars).collect();
+
+        if backspaces == 0 && commit.is_empty() {
+            None
+        } else {
+            Some(RetroEdit { backspaces, commit })
+        }
     }
 
     /// True if (text, cursor, anchor) exactly matches the last frame — clients
@@ -1633,6 +2002,546 @@ mod tests {
 
     mod retroactive_context {
         use super::*;
+
+        // Kate, Telex: live typing is continuous composition — never
+        // confirm-deferred, no raw-key flash. "kww" composes ư then reverts
+        // to "kw"; "kwin" auto-restores to raw via normal engine state.
+        #[test]
+        fn kate_kww_reverts_to_kw() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+
+            c.observe_surrounding_bytes("", ByteCursor(0), ByteCursor(0), false);
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('k'), KeyDecision::ForwardRaw));
+            assert!(c
+                .observe_surrounding_bytes("k", ByteCursor(1), ByteCursor(1), false)
+                .is_none());
+
+            // 'w' composes ư immediately: live typing, no deferral.
+            c.mark_action();
+            match c.feed_key('w') {
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    assert_eq!(backspaces, 0);
+                    assert_eq!(commit, "ư");
+                }
+                _ => panic!("live 'w' after k must compose ư immediately"),
+            }
+            let ku = "kư";
+            c.observe_surrounding_bytes(ku, ByteCursor(ku.len() as u32), ByteCursor(ku.len() as u32), false);
+
+            // Second 'w' reverts ư → w through continuous engine state.
+            c.mark_action();
+            match c.feed_key('w') {
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "w");
+                }
+                _ => panic!("second 'w' must revert kư to kw"),
+            }
+        }
+
+        // Live "kwin" must end raw: ư composes on 'w', then the invalid
+        // Vietnamese sequence triggers the engine's raw auto-restore. No
+        // deferral, no flash — same behavior as before the gedit fix.
+        #[test]
+        fn live_kwin_auto_restores_to_raw() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+
+            c.observe_surrounding_bytes("", ByteCursor(0), ByteCursor(0), false);
+            c.mark_action();
+            assert!(matches!(c.feed_key('k'), KeyDecision::ForwardRaw));
+            c.observe_surrounding_bytes("k", ByteCursor(1), ByteCursor(1), false);
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('w'), KeyDecision::Apply { .. }));
+            let ku = "kư";
+            c.observe_surrounding_bytes(ku, ByteCursor(ku.len() as u32), ByteCursor(ku.len() as u32), false);
+
+            // 'i' then 'n': the engine restores raw "kwin".
+            c.mark_action();
+            let mut screen = String::from("kư");
+            for ch in ['i', 'n'] {
+                c.mark_action();
+                match c.feed_key(ch) {
+                    KeyDecision::Apply { backspaces, commit, .. } => {
+                        for _ in 0..backspaces {
+                            screen.pop();
+                        }
+                        screen.push_str(&commit);
+                    }
+                    KeyDecision::ForwardRaw => screen.push(ch),
+                    _ => panic!("unexpected decision for {ch}"),
+                }
+                let cur = screen.len() as u32;
+                c.observe_surrounding_bytes(&screen, ByteCursor(cur), ByteCursor(cur), false);
+            }
+            assert_eq!(screen, "kwin");
+        }
+
+        // Ghostty advertises surrounding-text but every frame is empty; the
+        // liveness watchdog downgrades ST→FK after the first keys. A raw key
+        // forwarded on the ST tier is still pending at that moment. The
+        // downgrade must clear it — no frame will ever confirm it — or every
+        // subsequent feed_key sees prior_key_unconfirmed and resets the
+        // engine, killing composition until a non-printable key (Ctrl+C).
+        #[test]
+        fn tier_downgrade_clears_pending_raw_key_so_composition_survives() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+
+            // First keys forwarded raw on the ST tier → pending set.
+            c.mark_action();
+            assert!(matches!(c.feed_key('t'), KeyDecision::ForwardRaw));
+
+            // Watchdog fires: empty frames despite commits.
+            c.set_method(BackspaceMethod::ForwardKey);
+
+            // Composition must work immediately: "taa" → â on second 'a'.
+            c.feed_key('a');
+            match c.feed_key('a') {
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "â");
+                }
+                _ => panic!("second 'a' must compose â after tier downgrade"),
+            }
+        }
+
+        
+
+        #[test]
+        fn backspace_on_surrounding_context_forwards_instead_of_deleting_at_shadow_cursor() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let text = "tiếng việt";
+            let cursor = "tiếng".len() as u32;
+            c.observe_surrounding_bytes(
+                text,
+                ByteCursor(cursor),
+                ByteCursor(cursor),
+                false,
+            );
+
+            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+        }
+
+        #[test]
+        fn overlapping_raw_keys_degrade_to_sync_without_repair() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let baseline = "tiếng";
+            let cursor = baseline.len() as u32;
+            c.observe_surrounding_bytes(
+                baseline,
+                ByteCursor(cursor),
+                ByteCursor(cursor),
+                false,
+            );
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('r'), KeyDecision::ForwardRaw));
+            c.mark_action();
+            assert!(matches!(c.feed_key('r'), KeyDecision::ForwardRaw));
+
+            // This can only be the first key's frame. Because another key is
+            // already in flight, it may synchronize but must not repair.
+            let first = "tiếngr";
+            let first_cursor = first.len() as u32;
+            assert!(c
+                .observe_surrounding_bytes(
+                    first,
+                    ByteCursor(first_cursor),
+                    ByteCursor(first_cursor),
+                    false,
+                )
+                .is_none());
+            assert_eq!(c.prev_surrounding_for_trace(), (first, first_cursor));
+        }
+
+        #[test]
+        fn equal_trailing_character_without_insertion_never_triggers_repair() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let text = "bar car";
+            c.observe_surrounding_bytes(text, ByteCursor(3), ByteCursor(3), false);
+            c.reset_composition_preserving_surrounding();
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('r'), KeyDecision::ForwardRaw));
+
+            // Cursor moved to another existing word ending in the same letter,
+            // but the document contains no inserted key. Suffix equality alone
+            // must not authorize a positional repair.
+            assert!(c
+                .observe_surrounding_bytes(text, ByteCursor(7), ByteCursor(7), false)
+                .is_none());
+            assert_eq!(c.prev_surrounding_for_trace(), (text, 7));
+        }
+
+        #[test]
+        fn telex_bracket_shortcut_composes_live_when_frame_word_fails_gate() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, true);
+            c.set_surrounding_confirmation(true);
+            // Frame word "t" fails the round-trip seed gate, so no frame
+            // context exists; '[' is live composition and must apply
+            // immediately (ơ) with no confirm-deferral flash.
+            c.observe_surrounding_bytes("t", ByteCursor(1), ByteCursor(1), false);
+
+            c.mark_action();
+            match c.feed_key('[') {
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    assert_eq!(backspaces, 0);
+                    assert_eq!(commit, "ơ");
+                }
+                _ => panic!("live '[' must compose ơ immediately"),
+            }
+        }
+
+        #[test]
+        fn vni_tone_key_on_surrounding_context_waits_for_client_confirmation() {
+            let mut c = Composer::new(InputMethod::Vni, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let text = "tiếng";
+            let cursor = text.len() as u32;
+            c.observe_surrounding_bytes(
+                text,
+                ByteCursor(cursor),
+                ByteCursor(cursor),
+                false,
+            );
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('3'), KeyDecision::ForwardRaw));
+            let raw = "tiếng3";
+            let raw_cursor = raw.len() as u32;
+            assert!(c
+                .observe_surrounding_bytes(
+                    raw,
+                    ByteCursor(raw_cursor),
+                    ByteCursor(raw_cursor),
+                    false,
+                )
+                .is_some());
+        }
+
+        #[test]
+        fn word_boundary_seed_established_during_key_still_requires_confirmation() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let text = "tiếng";
+            let cursor = text.len() as u32;
+            c.observe_surrounding_bytes(
+                text,
+                ByteCursor(cursor),
+                ByteCursor(cursor),
+                false,
+            );
+
+            // Model an uncertain idle reset that retained synchronized shadow.
+            // The key itself performs the word-boundary seed; confirmation must
+            // be decided after that seed, not from the pre-key flag alone.
+            c.last_keystroke_at -= std::time::Duration::from_secs(3);
+            assert!(c.check_idle_reset());
+            c.retroactive_context = false;
+            c.mark_action();
+            assert!(matches!(c.feed_key('r'), KeyDecision::ForwardRaw));
+
+            let raw = "tiếngr";
+            let raw_cursor = raw.len() as u32;
+            let repair = c
+                .observe_surrounding_bytes(
+                    raw,
+                    ByteCursor(raw_cursor),
+                    ByteCursor(raw_cursor),
+                    false,
+                )
+                .expect("confirmed raw tone key should repair from retained shadow");
+            assert_eq!(repair.backspaces, 4);
+            assert_eq!(repair.commit, "ểng");
+        }
+
+        #[test]
+        fn unchanged_pre_action_frame_cannot_seed_a_positional_edit() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let baseline = "tiệng việt mĩ miều";
+            let old_cursor = "tiệng".len() as u32;
+
+            c.observe_surrounding_bytes(
+                baseline,
+                ByteCursor(old_cursor),
+                ByteCursor(old_cursor),
+                false,
+            );
+
+            // A forwarded cursor/editing action resets composition but keeps
+            // the last confirmed application snapshot. KWin may re-emit that
+            // unchanged snapshot before gedit processes the forwarded action;
+            // it must remain a duplicate, never destination context.
+            c.reset_composition_preserving_surrounding();
+            c.defer_action();
+            assert!(c.should_skip_surrounding_frame(
+                baseline,
+                old_cursor,
+                old_cursor,
+                false,
+                false,
+            ));
+
+            // No destination frame arrived. Even though stale "tiệng" is the
+            // last confirmed word, a positional tone edit is unsafe: forward
+            // the key so gedit reports its actual insertion point.
+            c.mark_action();
+            assert!(matches!(c.feed_key('r'), KeyDecision::ForwardRaw));
+
+            // The raw key actually landed after the second word. This frame is
+            // authoritative; any repair must target "việt", not "tiệng".
+            let actual = "tiệng việtr mĩ miều";
+            let actual_cursor = "tiệng việtr".len() as u32;
+            let repair = c.observe_surrounding_bytes(
+                actual,
+                ByteCursor(actual_cursor),
+                ByteCursor(actual_cursor),
+                false,
+            );
+            let repair = repair.expect("actual insertion frame should finish the transaction");
+            assert_eq!(repair.backspaces, 3);
+            assert_eq!(repair.commit, "eejtr");
+            assert_eq!(c.prev_surrounding_for_trace(), (actual, actual_cursor));
+        }
+
+        #[test]
+        fn stale_ctrl_backspace_frame_does_not_poison_retyped_vietnamese_word() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut sink = DeleteCaptureSink::default();
+            let stale = "tiệng vieetjr mĩ miều";
+            let stale_cursor = "tiệng vieetjr".len() as u32;
+
+            c.observe_surrounding_bytes(
+                stale,
+                ByteCursor(stale_cursor),
+                ByteCursor(stale_cursor),
+                false,
+            );
+            c.reset_composition_preserving_surrounding();
+            c.defer_action();
+            assert!(c.should_skip_surrounding_frame(
+                stale,
+                stale_cursor,
+                stale_cursor,
+                false,
+                false,
+            ));
+
+            // Ctrl+Backspace has already removed "vieetjr" in gedit. The first
+            // retyped letter proves the real insertion point and replaces the
+            // stale snapshot as ground truth.
+            c.mark_action();
+            assert!(matches!(c.feed_key('v'), KeyDecision::ForwardRaw));
+            let v_text = "tiệng v mĩ miều";
+            let v_cursor = "tiệng v".len() as u32;
+            assert!(c
+                .observe_surrounding_bytes(
+                    v_text,
+                    ByteCursor(v_cursor),
+                    ByteCursor(v_cursor),
+                    false,
+                )
+                .is_none());
+            assert_eq!(c.shadow_text(), "tiệng v");
+
+            // Continue from surrounding-confirmed context. Raw letters sync;
+            // transformations are inserted raw first, then repaired from their
+            // confirming frame so later cursor movement cannot race an edit.
+            for (ch, text) in [('i', "tiệng vi mĩ miều"), ('e', "tiệng vie mĩ miều")] {
+                c.mark_action();
+                assert!(matches!(c.feed_key(ch), KeyDecision::ForwardRaw));
+                let cursor = text.split(" mĩ").next().unwrap().len() as u32;
+                assert!(c
+                    .observe_surrounding_bytes(
+                        text,
+                        ByteCursor(cursor),
+                        ByteCursor(cursor),
+                        false,
+                    )
+                    .is_none());
+            }
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('e'), KeyDecision::ForwardRaw));
+            let raw_ee = "tiệng viee mĩ miều";
+            let raw_ee_cursor = "tiệng viee".len() as u32;
+            let circumflex = c
+                .observe_surrounding_bytes(
+                    raw_ee,
+                    ByteCursor(raw_ee_cursor),
+                    ByteCursor(raw_ee_cursor),
+                    false,
+                )
+                .expect("confirmed raw e should repair viee to viê");
+            c.apply_confirmed_repair_to_sink(
+                circumflex.backspaces,
+                &circumflex.commit,
+                0,
+                0,
+                &mut sink,
+            );
+            let composed_e = "tiệng viê mĩ miều";
+            let composed_e_cursor = "tiệng viê".len() as u32;
+            c.observe_surrounding_bytes(
+                composed_e,
+                ByteCursor(composed_e_cursor),
+                ByteCursor(composed_e_cursor),
+                false,
+            );
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('t'), KeyDecision::ForwardRaw));
+            let raw_t = "tiệng viêt mĩ miều";
+            let raw_t_cursor = "tiệng viêt".len() as u32;
+            assert!(c
+                .observe_surrounding_bytes(
+                    raw_t,
+                    ByteCursor(raw_t_cursor),
+                    ByteCursor(raw_t_cursor),
+                    false,
+                )
+                .is_none());
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('j'), KeyDecision::ForwardRaw));
+            let raw_j = "tiệng viêtj mĩ miều";
+            let raw_j_cursor = "tiệng viêtj".len() as u32;
+            let tone = c
+                .observe_surrounding_bytes(
+                    raw_j,
+                    ByteCursor(raw_j_cursor),
+                    ByteCursor(raw_j_cursor),
+                    false,
+                )
+                .expect("confirmed raw j should repair viêtj to việt");
+            c.apply_confirmed_repair_to_sink(
+                tone.backspaces,
+                &tone.commit,
+                0,
+                0,
+                &mut sink,
+            );
+            assert_eq!(c.shadow_text(), "tiệng việt");
+        }
+
+        // gedit under KWin (text-input-v1, SurroundingText tier) sends NO
+        // surrounding_text frame for a pure cursor move (Ctrl+Right to the end
+        // of "tiếng|"). The frame only arrives fused with — and one wire event
+        // AFTER — the first typed key, which daklak has already forwarded raw
+        // because the engine was never seeded ("tiếng" + raw 'r' = "tiếngr").
+        // Without recovery this closes a loop: every skipped frame starves
+        // prev_text so the engine never resyncs and tone keys pile up as raw
+        // text ("tiếngrjrjrj…"). The revealed frame is the ground truth; when it
+        // is exactly our forwarded run glued to a real word, retro-compose it.
+        #[test]
+        fn gedit_late_fused_frame_retro_composes_forwarded_tone_key() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut sink = DeleteCaptureSink::default();
+
+            // Last confirmed frame was near the start of the word. Ctrl+Right
+            // resets composition but preserves that application snapshot; no
+            // destination frame follows.
+            let baseline = "tiếng việt mĩ miều";
+            c.observe_surrounding_bytes(
+                baseline,
+                ByteCursor(1),
+                ByteCursor(1),
+                false,
+            );
+            c.reset_composition_preserving_surrounding();
+            c.defer_action();
+
+            // The 'r' keystroke marks an action, then forwards raw (no seed).
+            c.mark_action();
+            assert!(matches!(c.feed_key('r'), KeyDecision::ForwardRaw));
+            assert_eq!(c.shadow_text(), "r");
+
+            // The fused frame lands ~1 wire event later, already containing the
+            // forwarded 'r' at the end of "tiếng": text="tiếngr…" cursor=8.
+            let text = "tiếngr việt mĩ miều";
+            let cursor = "tiếngr".len() as u32; // 8
+            let edit = c
+                .observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false)
+                .expect("late fused frame should yield a retro-compose repair");
+            // Delete the already-forwarded "ếngr" (4 chars) and commit "ểng":
+            // "tiếngr" → "tiểng" (hỏi tone on "tiếng").
+            assert_eq!(edit.backspaces, 4);
+            assert_eq!(edit.commit, "ểng");
+
+            // The transport applies the repair; shadow becomes "tiểng…".
+            c.apply_confirmed_repair_to_sink(
+                edit.backspaces,
+                &edit.commit,
+                0,
+                0,
+                &mut sink,
+            );
+            assert!(
+                !c.firefox.has_pending_echo(),
+                "KWin repair echoes must not enter Firefox stale classification"
+            );
+            let corrected = "tiểng việt mĩ miều";
+            let corrected_cursor = "tiểng".len() as u32;
+            c.observe_surrounding_bytes(
+                corrected,
+                ByteCursor(corrected_cursor),
+                ByteCursor(corrected_cursor),
+                false,
+            );
+
+            // Every surrounding-derived positional edit follows the same safe
+            // transaction. The raw key may flash for one client frame, but the
+            // repair cannot land at an unreported mouse/keyboard cursor.
+            c.mark_action();
+            assert!(matches!(c.feed_key('j'), KeyDecision::ForwardRaw));
+            let raw_j = "tiểngj việt mĩ miều";
+            let raw_j_cursor = "tiểngj".len() as u32;
+            let tone = c
+                .observe_surrounding_bytes(
+                    raw_j,
+                    ByteCursor(raw_j_cursor),
+                    ByteCursor(raw_j_cursor),
+                    false,
+                )
+                .expect("confirmed raw j should yield a tone repair");
+            assert_eq!(tone.backspaces, 4);
+            assert_eq!(tone.commit, "ệng");
+        }
+
+        // The same late-fused-frame shape must NOT fabricate an edit when the
+        // revealed word is English that Telex can't round-trip: navigating into
+        // "wor|" and typing 'd' reveals "word". The gate rejects "wor", so we
+        // only resync the shadow (ending the starvation loop) and forward 'd'
+        // raw — no phantom delete/commit.
+        #[test]
+        fn gedit_late_fused_frame_leaves_english_word_raw() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+
+            c.full_reset();
+            c.defer_action();
+            c.mark_action();
+            assert!(matches!(c.feed_key('d'), KeyDecision::ForwardRaw));
+
+            let text = "word";
+            let cursor = text.len() as u32;
+            let edit =
+                c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
+            assert!(edit.is_none(), "English word must not be retro-composed");
+            // Shadow resynced to ground truth so the loop can't keep starving.
+            assert_eq!(c.shadow_text(), "word");
+        }
 
         #[test]
         fn cursor_jump_after_composed_word_allows_next_tone_key_to_replace_tone() {

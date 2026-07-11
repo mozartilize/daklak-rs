@@ -11,6 +11,7 @@ not re-litigate or add ad-hoc workarounds beyond what's described here.
 
 - [GNOME / IBus ForwardKeyEvent fails in Mutter](#gnome--ibus-forwardkeyevent-fails-in-mutter)
 - [Terminals — forwarded-key routing](#terminals--forwarded-key-routing)
+- [KWin / gedit: delayed surrounding cursor updates](#kwin--gedit-delayed-surrounding-cursor-updates)
 - [Firefox contenteditable: stale-echo delete bypass](#firefox-contenteditable-stale-echo-delete-bypass)
 - [Tail-drop after tone + space](#tail-drop-after-tone--space)
 - [Preedit rendering of forwarded keys](#preedit-rendering-of-forwarded-keys)
@@ -63,6 +64,45 @@ is issued. Because Vietnamese Telex words begin with base letters that commit
 with no delete, no surrounding-text delete ever reaches the PTY, so there is no
 self-emit-loop or dropped commit. On wlroots, terminals (foot, Ghostty) send no
 surrounding-text at all and resolve directly to `ForwardKey`.
+
+## KWin / gedit: delayed surrounding cursor updates
+
+**Behavior:** With KWin's input-method-v1 path, gedit can process a forwarded
+cursor or editing key without first returning a surrounding-text frame for the
+new cursor. It may also repeat the unchanged pre-action frame before the
+forwarded key takes effect. A later printable key is the first event that causes
+gedit to report the actual insertion point. Treating the repeated frame as the
+destination can seed the engine from the wrong word; a cursor-relative delete
+then applies at gedit's real cursor and edits another word.
+
+A second daklak failure mode made this unbounded: a recent frame after a raw
+forward was classified as an edit echo and skipped without recording it as the
+new surrounding baseline. Repeated printable keys continually reopened the
+recent-action window, so the baseline remained empty and raw Telex keys could
+accumulate indefinitely.
+
+**Resolution:** Surrounding text and IM composition have separate lifetimes.
+Resetting composition for a forwarded action preserves the last confirmed
+surrounding snapshot, so unchanged pre-action frames remain duplicates. More
+importantly, daklak never emits a cursor-relative retroactive edit solely from
+surrounding-derived engine state. It first forwards the printable key raw and
+waits for a client frame proving that the new text equals the previous confirmed
+text plus exactly that character immediately before the reported cursor. The
+frame is recorded immediately, the engine is seeded from the actual word at
+that cursor, and the key is replayed. If replay composes, daklak replaces the
+raw character with the composed result; otherwise the raw character remains.
+
+This rule is deliberately independent of how the cursor moved (mouse, arrows,
+Home/End, modifier navigation, or native editing commands). If a frame cannot
+prove the insertion, daklak synchronizes to it but emits no positional repair.
+Overlapping unconfirmed keys likewise degrade to synchronization only. The raw
+key may therefore be visible for one client frame during retroactive editing;
+that bounded visual glitch is preferred to deleting at an unverified cursor.
+Live composition built from the current keyboard stream is unchanged.
+
+Frame-triggered repairs do not use the Firefox stale-echo classifier: KWin's
+pre-edit duplicate is part of this generic confirmation transaction and must
+not arm Firefox-specific ForwardKey fallback.
 
 ## Firefox contenteditable: stale-echo delete bypass
 

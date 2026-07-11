@@ -67,6 +67,14 @@ impl FirefoxContenteditableQuirk {
         self.use_forward_delete = false;
     }
 
+    /// A correction derived from a client-confirmed raw-key frame has its own
+    /// surrounding transaction. Do not let its KWin pre-edit duplicate enter
+    /// Firefox-specific stale-echo classification; preserve any sticky policy
+    /// already learned for this text-input object.
+    pub(crate) fn forget_expected_echo(&mut self) {
+        self.expected_echo = None;
+    }
+
     /// Classify the surrounding frame against the correction we just issued.
     ///
     /// DESIGN: recognize narrowly, degrade safely. Exactly three frame shapes

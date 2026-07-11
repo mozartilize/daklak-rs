@@ -15,7 +15,7 @@ use crate::composer::{ByteCursor, Composer};
 use crate::handler::{Daemon, KEY_BACKSPACE, NAV_KEYS};
 
 impl AdapterHandler for Daemon {
-    fn on_done_frame(&mut self, _ctx: &mut AdapterCtx<'_>, frame: &FrameSnapshot) {
+    fn on_done_frame(&mut self, ctx: &mut AdapterCtx<'_>, frame: &FrameSnapshot) {
         self.sync_config();
 
         if frame.activate && self.router.synthetic_active {
@@ -45,6 +45,10 @@ impl AdapterHandler for Daemon {
                 self.config.bracket_shortcuts,
             );
             c.set_modern_style(self.config.modern_style);
+            // Cursor-relative retroactive edits are confirmed by the client
+            // frame containing the raw key at its actual insertion point.
+            // Wayland-only: IBus cannot drain frame-triggered repairs here.
+            c.set_surrounding_confirmation(true);
             // `commit_string_functional` starts true (the spec default: a v3
             // client is obligated to apply commit_string). It is driven down
             // ONLY by the runtime ST-liveness probe at the ST→FK downgrade —
@@ -137,8 +141,30 @@ impl AdapterHandler for Daemon {
 
             // The ONE reseed gate. force_reseed on activate (always seed from
             // the word at cursor); otherwise the gate decides via the one-char
-            // / recent-action heuristics.
-            w.observe_surrounding_bytes(text, ByteCursor(*cursor), ByteCursor(*anchor), activate);
+            // / recent-action heuristics. On gedit/KWin the returned repair
+            // undoes a raw-forwarded tone key the fused frame just revealed.
+            let repair =
+                w.observe_surrounding_bytes(text, ByteCursor(*cursor), ByteCursor(*anchor), activate);
+            if let Some(repair) = repair {
+                let serial = ctx.serial();
+                let raw_mods = ctx.raw_mods();
+                let commit_string_functional = w.commit_string_functional;
+                tracing::info!(
+                    backspaces = repair.backspaces,
+                    commit = %repair.commit,
+                    "repair from surrounding-confirmed raw key"
+                );
+                // No held key for a frame-triggered edit; frames carry no time.
+                ctx.with_sink(raw_mods, None, commit_string_functional, |sink| {
+                    w.apply_confirmed_repair_to_sink(
+                        repair.backspaces,
+                        &repair.commit,
+                        serial,
+                        0,
+                        sink,
+                    );
+                });
+            }
         } else if !activate && !deactivate {
             w.clear_prev_surrounding();
         }
@@ -198,7 +224,7 @@ impl AdapterHandler for Daemon {
             // cursor lands on. (A repeat already did this on the initial press.)
             if !repeat {
                 if let Some(w) = self.router.composer.as_mut() {
-                    w.full_reset();
+                    w.reset_composition_preserving_surrounding();
                     w.defer_action();
                 }
             }
@@ -215,7 +241,7 @@ impl AdapterHandler for Daemon {
             // feature, multi-hop: "bò bo|" → arrows → "bò bof|" → composes).
             if !repeat {
                 if let Some(w) = self.router.composer.as_mut() {
-                    w.full_reset();
+                    w.reset_composition_preserving_surrounding();
                     w.defer_action();
                 }
             }
