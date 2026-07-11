@@ -67,6 +67,7 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV1, ()> for WaylandAdapter<H> {
                 );
                 state.state.im_ctx_v1 = None;
                 state.state.v1_keyboard = None;
+                state.state.client_repeat.cancel();
                 state.state.apply_event(crate::frame::FrameEvent::Deactivate);
                 // Deactivate has no trailing CommitState — fire immediately.
                 state.apply_done_frame();
@@ -258,6 +259,7 @@ impl<H: AdapterHandler> Dispatch<WlKeyboard, ()> for WaylandAdapter<H> {
                     delay,
                     "v1: wl_keyboard repeat_info"
                 );
+                state.state.client_repeat.set_info(rate, delay);
             }
 
             other => {

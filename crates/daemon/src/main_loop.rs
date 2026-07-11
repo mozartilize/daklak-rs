@@ -15,6 +15,7 @@ pub async fn core_loop_with_wayland_shutdown(
     loop {
         wayland.event_queue.flush().ok();
         let read_guard = wayland.event_queue.prepare_read();
+        let repeat_deadline = wayland.next_client_repeat_deadline();
 
         tokio::select! {
             biased;
@@ -55,6 +56,18 @@ pub async fn core_loop_with_wayland_shutdown(
                 }
             }
 
+            // Biased select handles queued key releases above before a timer
+            // expiring at the same instant, avoiding one trailing repeat.
+            _ = async {
+                match repeat_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                drop(read_guard);
+                wayland.dispatch_client_repeat();
+            }
+
             Some(ev) = async {
                 match fb.as_mut() {
                     Some(b) => b.next_event().await,
@@ -63,6 +76,7 @@ pub async fn core_loop_with_wayland_shutdown(
             } => {
                 drop(read_guard);
                 tracing::debug!(?ev, "focus backend: focused app changed");
+                wayland.cancel_client_repeat();
                 let mut ctx = AdapterCtx { state: &mut wayland.app.state };
                 wayland.app.handler.on_focus_changed(
                     &mut ctx,

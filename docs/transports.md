@@ -123,6 +123,20 @@ The actual key synthesis goes through the unified `KeyEmitter` backends —
 virtual-keyboard v2 or input-method-context v1 — see
 [Key emit & focus](key-emit-and-focus.md).
 
+### Key repeat
+
+Wayland keyboard `repeat_info` assigns repeat generation to the keyboard
+client when `rate > 0`. daklak therefore runs a local delay/interval timer for
+keys consumed by composition and feeds every tick back through the engine as a
+real key press. This lets a held Telex key progress through compose, raw revert,
+and continued raw repetition. Raw-forwarded keys are not locally repeated:
+the focused application receives the held press and repeats it itself.
+
+When `rate == 0`, the local timer is disabled; compositors that provide
+server-side `KeyState::Repeated` events use the existing repeat dispatch path.
+The timer is cancelled on matching release, a newer physical press, input-method
+deactivation, or focus change.
+
 ## IBus / GNOME
 
 Crate: [`ibus-adapter`](../crates/ibus-adapter/). On GNOME/mutter the Wayland

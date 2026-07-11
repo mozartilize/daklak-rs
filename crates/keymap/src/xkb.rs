@@ -108,6 +108,11 @@ impl XkbState {
         })
     }
 
+    /// Whether the active keymap marks this key as auto-repeatable.
+    pub fn key_repeats(&self, evdev_code: u32) -> bool {
+        self.keymap.key_repeats(Keycode::new(evdev_code + 8))
+    }
+
     /// Translate a hardware evdev keycode to the char it produces with the
     /// current modifier state, or `None` for non-printable keys.
     ///
@@ -199,5 +204,17 @@ mod tests {
     fn base_char_none_for_nonprintable() {
         // evdev 59 = F1 — keysym has no UTF-32 mapping.
         assert_eq!(us().base_char(59), None);
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+mod repeat_tests {
+    use super::XkbState;
+
+    #[test]
+    fn key_repeat_flag_distinguishes_letters_from_modifiers() {
+        let xkb = XkbState::us_for_test();
+        assert!(xkb.key_repeats(24), "o repeats");
+        assert!(!xkb.key_repeats(42), "left shift does not repeat");
     }
 }

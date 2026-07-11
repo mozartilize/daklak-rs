@@ -91,6 +91,7 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV2, ()> for WaylandAdapter<H> {
                 state.state.apply_event(FrameEvent::Activate);
             }
             zwp_input_method_v2::Event::Deactivate => {
+                state.state.client_repeat.cancel();
                 state.state.apply_event(FrameEvent::Deactivate);
             }
             zwp_input_method_v2::Event::SurroundingText {
@@ -208,8 +209,9 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for WaylandAd
                 state.handle_modifiers(mods_depressed, mods_latched, mods_locked, group);
             }
 
-            zwp_input_method_keyboard_grab_v2::Event::RepeatInfo { .. } => {
-                // Key repeat not implemented yet
+            zwp_input_method_keyboard_grab_v2::Event::RepeatInfo { rate, delay } => {
+                tracing::debug!(rate, delay, "grab.RepeatInfo");
+                state.state.client_repeat.set_info(rate, delay);
             }
 
             _ => {}

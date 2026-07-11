@@ -1,4 +1,5 @@
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::time::Instant;
 
 use anyhow::Context;
 use tokio::io::unix::AsyncFd;
@@ -50,6 +51,26 @@ impl<H: AdapterHandler> WaylandHandle<H> {
             self.app.apply_done_frame();
         }
         Ok(!self.app.state.should_exit)
+    }
+
+    /// Deadline for a consumed key's client-side repeat. Positive
+    /// wl_keyboard repeat rates require the keyboard client (daklak) to drive
+    /// this timer; rate-zero compositors use protocol state=2 events instead.
+    pub fn next_client_repeat_deadline(&self) -> Option<Instant> {
+        self.app.state.client_repeat.deadline()
+    }
+
+    pub fn cancel_client_repeat(&mut self) {
+        self.app.state.client_repeat.cancel();
+    }
+
+    /// Fire one due client-side repeat and schedule its next interval.
+    pub fn dispatch_client_repeat(&mut self) {
+        let Some((key, time)) = self.app.state.client_repeat.fire(Instant::now()) else {
+            return;
+        };
+        tracing::trace!(key, time, "client repeat timer fired");
+        self.app.dispatch_client_key_repeat(time, key);
     }
 
     pub fn focus_snapshot(&self) -> Option<FocusEvent> {

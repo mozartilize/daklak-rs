@@ -369,9 +369,22 @@ pub struct WaylandAdapter<H: AdapterHandler> {
     pub qh: Option<QueueHandle<WaylandAdapter<H>>>,
 }
 
+fn repeat_forward_values(client_timer: bool) -> &'static [u32] {
+    if client_timer {
+        // A locally generated repeat follows an IM-consumed initial press, so
+        // the focused app has no held key. Emit a complete pulse; clients such
+        // as foot, gedit and Firefox ignore state=2 without an earlier press.
+        &[1, 0]
+    } else {
+        // Compositor-delivered repeat: preserve the protocol repeat state.
+        &[2]
+    }
+}
+
 impl<H: AdapterHandler> WaylandAdapter<H> {
     pub(crate) fn dispatch_key_release(&mut self, time: u32, key: u32) {
         tracing::info!(key, "dispatch_key_release: IM grab delivered release");
+        self.state.client_repeat.release(key);
         // Releases route through the same forward path as presses so the
         // focused app sees a balanced press/release pair.
         self.state.emit_forward_key(time, key, 0);
@@ -384,6 +397,10 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
 
     pub(crate) fn dispatch_key_press(&mut self, time: u32, key: u32) {
         tracing::info!(key, "dispatch_key_press: IM grab delivered press");
+        // wl_keyboard repeats the most recently pressed repeatable key. A new
+        // physical press always supersedes any consumed-key timer; Apply below
+        // arms this key again, while ForwardRaw leaves repetition to the app.
+        self.state.client_repeat.cancel();
         let ch = self.state.xkb.as_ref().and_then(|x| x.key_to_char(key));
 
         let decision = {
@@ -406,6 +423,17 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 backspaces,
                 commit,
             } => {
+                // The physical key was consumed, so the focused client has no
+                // held key to self-repeat. For positive repeat_info rates the
+                // keyboard client (daklak) must synthesize repeats itself.
+                let repeatable = self
+                    .state
+                    .xkb
+                    .as_ref()
+                    .map_or(true, |xkb| xkb.key_repeats(key));
+                if repeatable {
+                    self.state.client_repeat.arm(key, time, Instant::now());
+                }
                 let held_user_kc = self.state.held_user_kc();
 
                 let raw_mods = self.state.raw_mods;
@@ -445,7 +473,15 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
     /// `aaa` plays out on hold. The edit's own key events must use normal
     /// press/release values, so `forwarding_repeat` is cleared around the apply.
     pub(crate) fn dispatch_key_repeat(&mut self, time: u32, key: u32) {
-        tracing::trace!(key, "dispatch_key_repeat: IM grab delivered repeat");
+        self.dispatch_key_repeat_inner(time, key, false);
+    }
+
+    pub(crate) fn dispatch_client_key_repeat(&mut self, time: u32, key: u32) {
+        self.dispatch_key_repeat_inner(time, key, true);
+    }
+
+    fn dispatch_key_repeat_inner(&mut self, time: u32, key: u32, client_timer: bool) {
+        tracing::trace!(key, client_timer, "dispatch_key_repeat: repeat tick");
         let ch = self.state.xkb.as_ref().and_then(|x| x.key_to_char(key));
 
         self.state.forwarding_repeat = true;
@@ -465,7 +501,9 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             // last_forwarded_key — a repeat is not a fresh press for the
             // tail-char-drop window.
             KeyDecision::ForwardRaw => {
-                self.state.emit_forward_key(time, key, 2);
+                for &value in repeat_forward_values(client_timer) {
+                    self.state.emit_forward_key(time, key, value);
+                }
             }
             // A held compose key recomposes: apply the delete+commit edit the
             // same way dispatch_key_press does. The edit's internal key events
@@ -918,6 +956,79 @@ mod tests {
         }
     }
 
+    struct ApplyHandler;
+
+    impl AdapterHandler for ApplyHandler {
+        fn on_done_frame(&mut self, _ctx: &mut AdapterCtx<'_>, _frame: &FrameSnapshot) {}
+
+        fn on_key_pressed(
+            &mut self,
+            _ctx: &mut AdapterCtx<'_>,
+            _time: u32,
+            _key: u32,
+            _ch: Option<char>,
+        ) -> KeyDecision {
+            KeyDecision::Apply {
+                method: BackspaceMethod::ForwardKey,
+                backspaces: 0,
+                commit: "o".to_owned(),
+            }
+        }
+
+        fn apply_pending(
+            &mut self,
+            _ctx: &mut AdapterCtx<'_>,
+            _time: u32,
+            _backspaces: usize,
+            _commit: &str,
+            _raw_mods: (u32, u32, u32, u32),
+            _held_user_kc: Option<u32>,
+        ) {
+        }
+
+        fn on_modifiers(&mut self, _ctx: &mut AdapterCtx<'_>, _mods: ModifierState) {}
+
+        fn on_focus_changed(
+            &mut self,
+            _ctx: &mut AdapterCtx<'_>,
+            _app_id: Option<String>,
+            _is_xwayland: bool,
+        ) {
+        }
+    }
+
+    #[test]
+    fn applied_key_arms_client_repeat_until_release() {
+        let mut app = WaylandAdapter {
+            handler: ApplyHandler,
+            state: AdapterState::new(),
+            qh: None,
+        };
+        app.state.xkb = Some(viet_ime_keymap::xkb::XkbState::us_for_test());
+        app.state.client_repeat.set_info(25, 600);
+
+        app.dispatch_key_press(1234, 24);
+        assert!(app.state.client_repeat.deadline().is_some());
+
+        app.dispatch_key_release(2234, 24);
+        assert_eq!(app.state.client_repeat.deadline(), None);
+    }
+
+    #[test]
+    fn applied_nonrepeatable_key_does_not_arm_client_repeat() {
+        let mut app = WaylandAdapter {
+            handler: ApplyHandler,
+            state: AdapterState::new(),
+            qh: None,
+        };
+        app.state.xkb = Some(viet_ime_keymap::xkb::XkbState::us_for_test());
+        app.state.client_repeat.set_info(25, 600);
+
+        app.dispatch_key_press(1234, 42); // left shift
+
+        assert_eq!(app.state.client_repeat.deadline(), None);
+    }
+
     #[test]
     fn real_modifier_update_is_not_swallowed_by_pending_synthetic_echo() {
         let mut app = WaylandAdapter {
@@ -936,6 +1047,12 @@ mod tests {
             "a real Shift modifiers event must update adapter state even when a synthetic echo is pending"
         );
         assert_eq!(app.state.raw_mods, (0x01, 0, 0, 0));
+    }
+
+    #[test]
+    fn client_timer_raw_repeat_is_a_balanced_pulse() {
+        assert_eq!(repeat_forward_values(true), &[1, 0]);
+        assert_eq!(repeat_forward_values(false), &[2]);
     }
 
     #[test]

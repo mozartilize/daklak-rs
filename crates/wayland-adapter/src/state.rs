@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use viet_ime_edit_strategy::ModifierState;
@@ -37,6 +37,84 @@ use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_w
 
 /// Adapter-side state. Owns Wayland proxies + emit-history. The handler
 /// (daemon) never sees these directly — it interacts via `AdapterCtx`.
+#[derive(Debug, Clone, Copy)]
+struct HeldRepeat {
+    key: u32,
+    wayland_time: u32,
+    pressed_at: Instant,
+    deadline: Instant,
+}
+
+/// Client-side wl_keyboard repeat state. A positive compositor rate means
+/// the keyboard client must synthesize repeats; rate zero means the
+/// compositor supplies state=2 events itself.
+#[derive(Debug)]
+pub(crate) struct ClientRepeat {
+    rate: i32,
+    delay: i32,
+    held: Option<HeldRepeat>,
+}
+
+impl Default for ClientRepeat {
+    fn default() -> Self {
+        Self {
+            // Input-method-v1 may omit repeat_info. Match kime's conservative
+            // fallback until the compositor supplies its actual settings.
+            rate: 20,
+            delay: 400,
+            held: None,
+        }
+    }
+}
+
+impl ClientRepeat {
+    pub(crate) fn set_info(&mut self, rate: i32, delay: i32) {
+        self.rate = rate;
+        self.delay = delay;
+        if rate <= 0 {
+            self.held = None;
+        }
+    }
+
+    pub(crate) fn arm(&mut self, key: u32, wayland_time: u32, now: Instant) {
+        if self.rate <= 0 {
+            return;
+        }
+        self.held = Some(HeldRepeat {
+            key,
+            wayland_time,
+            pressed_at: now,
+            deadline: now + Duration::from_millis(self.delay.max(0) as u64),
+        });
+    }
+
+    pub(crate) fn release(&mut self, key: u32) {
+        if matches!(self.held, Some(held) if held.key == key) {
+            self.held = None;
+        }
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.held = None;
+    }
+
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.held.map(|held| held.deadline)
+    }
+
+    pub(crate) fn fire(&mut self, now: Instant) -> Option<(u32, u32)> {
+        let held = self.held.as_mut()?;
+        if now < held.deadline || self.rate <= 0 {
+            return None;
+        }
+        let elapsed_ms = now.duration_since(held.pressed_at).as_millis() as u32;
+        let event = (held.key, held.wayland_time.wrapping_add(elapsed_ms));
+        let interval = Duration::from_secs_f64(1.0 / self.rate as f64);
+        held.deadline = now + interval;
+        Some(event)
+    }
+}
+
 pub struct AdapterState {
     // Wayland proxies (set after globals binding + setup)
     pub seat: Option<wayland_client::protocol::wl_seat::WlSeat>,
@@ -99,6 +177,10 @@ pub struct AdapterState {
     /// rely on the compositor's server-side repeat (Chromium/Electron on KWin)
     /// get no continuous-key behavior through the IM grab. See dispatch_key_repeat.
     pub forwarding_repeat: bool,
+    /// Local repeat timer state used when wl_keyboard repeat_info has rate>0.
+    /// Only IM-consumed keys are armed; forwarded held keys repeat in the
+    /// focused client itself.
+    pub(crate) client_repeat: ClientRepeat,
 
     /// Set true by `AdapterSink::commit()` (V2 path) whenever daklak emits
     /// `zwp_input_method_v2.commit`. Reset at the start of every
@@ -188,6 +270,7 @@ impl AdapterState {
             last_forwarded_key: None,
             last_forwarded_release: None,
             forwarding_repeat: false,
+            client_repeat: ClientRepeat::default(),
             pending_im_commit_ack: false,
             should_exit: false,
             // Placeholder until `connect()` builds the real profile. Never
@@ -288,5 +371,51 @@ impl AdapterState {
                 self.should_exit = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn consumed_key_arms_repeat_after_compositor_delay() {
+        let now = Instant::now();
+        let mut repeat = ClientRepeat::default();
+        repeat.set_info(25, 600);
+
+        repeat.arm(24, 1234, now);
+
+        assert_eq!(repeat.deadline(), Some(now + Duration::from_millis(600)));
+        assert_eq!(repeat.fire(now + Duration::from_millis(600)), Some((24, 1834)));
+        assert_eq!(repeat.deadline(), Some(now + Duration::from_millis(640)));
+    }
+
+    #[test]
+    fn release_and_zero_rate_cancel_repeat() {
+        let now = Instant::now();
+        let mut repeat = ClientRepeat::default();
+        repeat.set_info(25, 600);
+        repeat.arm(24, 1234, now);
+
+        repeat.release(24);
+        assert_eq!(repeat.deadline(), None);
+
+        repeat.arm(24, 1234, now);
+        repeat.set_info(0, 600);
+        assert_eq!(repeat.deadline(), None);
+    }
+
+    #[test]
+    fn release_of_another_key_does_not_cancel_repeat() {
+        let now = Instant::now();
+        let mut repeat = ClientRepeat::default();
+        repeat.set_info(25, 600);
+        repeat.arm(24, 1234, now);
+
+        repeat.release(38);
+
+        assert_eq!(repeat.deadline(), Some(now + Duration::from_millis(600)));
     }
 }
