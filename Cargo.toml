@@ -15,13 +15,22 @@ members = [
 ]
 
 [workspace.package]
+edition = "2021"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 vnkey-engine = { path = "vendors/vnkey/vnkey-engine" }
 viet-ime-keymap = { path = "crates/keymap" }
 viet-ime-key-emitter = { path = "crates/key-emitter" }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 wayland-backend = "0.3"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
@@ -39,6 +48,12 @@ serde_json = "1"
 toml = "0.9"
 anyhow = "1"
 ksni = { version = "0.3", features = ["tokio"] }
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus = { version = "5.16.0", default-features = false, features = ["tokio"] }
 zvariant = "5"
+futures-util = "0.3"
 viet-ime-ibus-adapter = { path = "crates/ibus-adapter" }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

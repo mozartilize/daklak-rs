@@ -1,8 +1,8 @@
 [package]
 name = "viet-ime-daemon"
 version = "0.1.0"
-edition = "2021"
-license = "GPL-3.0-or-later"
+edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "daklak"
@@ -12,7 +12,7 @@ path = "src/main.rs"
 default = []
 kde = ["viet-ime-wayland-adapter/kde"]
 ibus = ["dep:viet-ime-ibus-adapter"]
-evdev_grab = ["dep:viet-ime-evdev-adapter", "zbus/blocking"]
+evdev_grab = ["dep:viet-ime-evdev-adapter", "zbus/blocking-api"]
 
 [dependencies]
 viet-ime-engine = { path = "../engine" }
@@ -34,8 +34,8 @@ toml = { workspace = true }
 anyhow = { workspace = true }
 ksni = { workspace = true }
 libc = "0.2"
-zbus = "5.16.0"
-futures-util = "0.3"
+zbus = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 # Enable the keymap test builders (real "us" layout) for daemon tests.
