@@ -1,5 +1,7 @@
 # Daklak — UniKey-like Vietnamese Input Method
 
+![Daklak demo](demo/demo.gif)
+
 ## Why Daklak feels different
 
 - UniKey-like: no preedit, ever — not even as a fallback.
