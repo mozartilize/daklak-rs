@@ -104,9 +104,7 @@ impl FirefoxContenteditableQuirk {
 
         if before_cursor == expected_echo.expected {
             self.reset_delete_unit();
-        } else if before_cursor == expected_echo.delete_echo {
-            return;
-        } else if recent_action {
+        } else if before_cursor != expected_echo.delete_echo && recent_action {
             let retroactive_cursor_left_word = retroactive_context
                 && before_cursor
                     .chars()
@@ -120,7 +118,7 @@ impl FirefoxContenteditableQuirk {
             };
             self.use_forward_delete = self.delete_unit == DeleteUnit::Chars;
             self.expected_echo = None;
-        } else {
+        } else if before_cursor != expected_echo.delete_echo {
             self.expected_echo = None;
             self.delete_unit = DeleteUnit::Bytes;
             self.use_forward_delete = false;

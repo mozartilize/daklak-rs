@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, KeyDecision, ModifierState, Strategy};
-use viet_ime_engine::{EngineState, InputMethod};
+use viet_ime_engine::{EngineState, InputMethod, ProcessResult};
 
 use crate::quirks::firefox::FirefoxContenteditableQuirk;
 #[cfg(feature = "ibus")]
@@ -152,9 +152,9 @@ impl EditModel {
     }
 }
 
-/// Per-text-input composition state + behavior. On wlroots/Sway, one instance
-/// at a time (compositor sends deactivate before new activate); ibus/evdev
-/// create one per active session.
+// Per-text-input composition state + behavior. On wlroots/Sway, one instance
+// at a time (compositor sends deactivate before new activate); ibus/evdev
+// create one per active session.
 
 /// Consecutive "dead surrounding" frames (empty text + cursor 0 while our
 /// shadow holds committed content) that trip the SurroundingText→ForwardKey
@@ -249,30 +249,10 @@ pub struct Composer {
     /// Wayland drains frame-triggered repairs; IBus keeps immediate edits.
     confirm_retroactive_edits: bool,
 
-    /// Raw key awaiting confirmation from surrounding text. While present,
-    /// daklak must not issue a cursor-relative delete from its shadow: the app
-    /// frame containing this character is the authority for the actual cursor.
-    pending_raw_key: Option<char>,
-    /// False when another key arrived before the pending key was confirmed;
-    /// overlapping frames may synchronize state but cannot authorize repair.
-    pending_raw_key_repairable: bool,
-    /// The engine edit computed live for a confirm-deferred key. The engine
-    /// keeps its post-key state (revert history intact); if the confirming
-    /// frame proves the key landed on the same base word, this edit is emitted
-    /// directly instead of re-deriving it from a reseed — a reseed can fail
-    /// the round-trip gate ("kư") and forget that ư came from 'w'.
-    pending_engine_edit: Option<PendingEngineEdit>,
-    /// True when the engine's word context was derived from a client
-    /// surrounding-text frame (cursor jump / focus / confirmed repair) rather
-    /// than from our own live keystrokes. Only frame-derived context is
-    /// cursor-uncertain and requires the confirm-deferred transaction;
-    /// live composition must stay immediate (no flash, engine revert intact).
-    context_from_frame: bool,
-    /// One-shot: armed by a forwarded nav/editing action. The next printable
-    /// key has no trustworthy context at all (shadow was reset, no destination
-    /// frame arrived — gedit) and must be confirm-deferred even though no
-    /// frame context exists yet. Cleared by the next key or trusted frame.
-    await_frame_context: bool,
+    /// Complete client-frame confirmation state. Keeping provenance, raw key,
+    /// repairability, and speculative engine edit in one enum prevents invalid
+    /// combinations of independent flags.
+    confirmation: ConfirmationState,
     edit: EditModel,
 }
 
@@ -300,6 +280,144 @@ struct PendingEngineEdit {
     backspaces: usize,
     commit: String,
     base_word: String,
+}
+
+#[derive(Debug, Clone)]
+enum ConfirmationState {
+    Live,
+    LiveConfirmed,
+    FrameDerived,
+    AwaitingFrame,
+    PendingRaw(PendingRaw),
+}
+
+#[derive(Debug, Clone)]
+struct PendingRaw {
+    ch: char,
+    repairable: bool,
+    edit: Option<PendingEngineEdit>,
+    from_frame: bool,
+}
+
+impl ConfirmationState {
+    fn pending_raw(&self) -> Option<&PendingRaw> {
+        match self {
+            Self::PendingRaw(pending) => Some(pending),
+            Self::Live | Self::LiveConfirmed | Self::FrameDerived | Self::AwaitingFrame => None,
+        }
+    }
+
+    fn is_uncertain(&self) -> bool {
+        !matches!(self, Self::Live | Self::LiveConfirmed)
+    }
+
+    fn is_frame_derived(&self) -> bool {
+        match self {
+            Self::FrameDerived => true,
+            Self::PendingRaw(pending) => pending.from_frame,
+            Self::Live | Self::LiveConfirmed | Self::AwaitingFrame => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn replacement_pending(&self, ch: char, edit: Option<PendingEngineEdit>) -> Self {
+        Self::PendingRaw(PendingRaw {
+            ch,
+            repairable: !matches!(self, Self::PendingRaw(_)),
+            edit,
+            from_frame: self.is_frame_derived(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FeedKeyFacts {
+    ch: char,
+    method: BackspaceMethod,
+    confirmation_enabled: bool,
+    confirmation: ConfirmationState,
+    previous_was_separator: bool,
+    engine_at_word_beginning: bool,
+    shadow_word: String,
+}
+
+impl FeedKeyFacts {
+    fn capture(composer: &Composer, ch: char) -> Self {
+        let shadow = composer.edit.shadow_text();
+        let shadow_word = current_word_before_cursor(shadow, shadow.len() as u32).to_owned();
+        Self {
+            ch,
+            method: composer.method(),
+            confirmation_enabled: composer.confirm_retroactive_edits,
+            confirmation: composer.confirmation.clone(),
+            previous_was_separator: matches!(
+                composer.last_input_char,
+                Some(previous) if !previous.is_ascii_alphabetic()
+            ),
+            engine_at_word_beginning: composer.engine.at_word_beginning(),
+            shadow_word,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct KeyStartPlan {
+    context_uncertain: bool,
+    reset_speculation: bool,
+    clear_non_alpha_context: bool,
+    seed_word: Option<String>,
+}
+
+enum KeyFinishPlan {
+    Apply { backspaces: usize, commit: String },
+    Forward { pending: Option<PendingRaw> },
+}
+
+fn plan_key_start(facts: &FeedKeyFacts) -> KeyStartPlan {
+    let prior_pending = matches!(&facts.confirmation, ConfirmationState::PendingRaw(_));
+    let context_uncertain = facts.confirmation_enabled
+        && facts.method == BackspaceMethod::SurroundingText
+        && facts.confirmation.is_uncertain();
+    let seed_word = (!prior_pending
+        && facts.engine_at_word_beginning
+        && !facts.previous_was_separator
+        && !facts.shadow_word.is_empty())
+    .then(|| facts.shadow_word.clone());
+    KeyStartPlan {
+        context_uncertain,
+        reset_speculation: prior_pending,
+        clear_non_alpha_context: !facts.ch.is_ascii_alphabetic(),
+        seed_word,
+    }
+}
+
+fn plan_key_finish(
+    ch: char,
+    context_uncertain: bool,
+    prior_pending: bool,
+    from_frame: bool,
+    result: ProcessResult,
+    base_word: String,
+) -> KeyFinishPlan {
+    let ProcessResult {
+        backspaces,
+        commit,
+        consumed,
+    } = result;
+    if consumed && !context_uncertain {
+        return KeyFinishPlan::Apply { backspaces, commit };
+    }
+    let pending = context_uncertain.then(|| PendingRaw {
+        ch,
+        repairable: !prior_pending,
+        edit: consumed.then_some(PendingEngineEdit {
+            backspaces,
+            commit,
+            base_word,
+        }),
+        from_frame,
+    });
+    KeyFinishPlan::Forward { pending }
 }
 
 // Generic surrounding-frame trust/reseed policy. This is not in `quirks/`
@@ -359,11 +477,7 @@ impl Composer {
             firefox: FirefoxContenteditableQuirk::new(),
             bracket_shortcuts,
             confirm_retroactive_edits: false,
-            pending_raw_key: None,
-            pending_raw_key_repairable: false,
-            pending_engine_edit: None,
-            context_from_frame: false,
-            await_frame_context: false,
+            confirmation: ConfirmationState::Live,
         }
     }
 
@@ -401,9 +515,7 @@ impl Composer {
             // will ever confirm (or clear) a pending raw key. Leaving it set
             // would make every subsequent feed_key reset the engine (ghostty:
             // composition dead until a non-printable key cleared it).
-            self.pending_raw_key = None;
-            self.pending_raw_key_repairable = false;
-            self.pending_engine_edit = None;
+            self.confirmation = ConfirmationState::Live;
         }
     }
 
@@ -510,11 +622,7 @@ impl Composer {
         self.edit.reset_composition();
         self.last_input_char = None;
         self.retroactive_context = false;
-        self.context_from_frame = false;
-        self.await_frame_context = true;
-        self.pending_raw_key = None;
-        self.pending_raw_key_repairable = false;
-        self.pending_engine_edit = None;
+        self.confirmation = ConfirmationState::AwaitingFrame;
         self.firefox.clear();
         self.firefox.reset_forward_sticky();
     }
@@ -537,25 +645,31 @@ impl Composer {
         self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(word);
     }
 
-    /// Check 2-second idle heuristic. Returns true (and resets engine) if
-    /// the gap since last keystroke exceeds 2s — user may have clicked mouse.
+    /// Apply the 2-second idle policy. Returns true when the gap since the
+    /// last keystroke exceeds 2 seconds.
     ///
-    /// Resets engine only, NOT shadow: the killer-feature seed at word
-    /// boundary reads from shadow to recover word context for retroactive
-    /// composition. e.g. user types `la`, waits 5s, types `f` — shadow still
-    /// holds "la" so engine gets seeded → `là` composes. If the cursor moved
-    /// during idle, the next surrounding_text frame resyncs shadow via
-    /// `observe_surrounding_*`.
+    /// ForwardKey has no surrounding frames to detect a cursor move, so idle
+    /// resets its engine and unverifiable shadow. SurroundingText retains
+    /// continuous state and uses frame revalidation instead; idle only defers
+    /// unconfirmed context.
     pub fn check_idle_reset(&mut self) -> bool {
-        if self.last_keystroke_at.elapsed().as_secs() >= 2 {
-            self.engine.reset();
-            // The cursor may have moved silently during the pause (gedit
-            // sends no frame for mouse clicks). The next key's context is
-            // cursor-uncertain and must be confirm-deferred on ST.
-            self.await_frame_context = true;
-            return true;
+        if self.last_keystroke_at.elapsed().as_secs() < 2 {
+            return false;
         }
-        false
+        if self.method() == BackspaceMethod::SurroundingText {
+            if !matches!(self.confirmation, ConfirmationState::LiveConfirmed) {
+                self.confirmation = ConfirmationState::AwaitingFrame;
+            }
+        } else {
+            // ForwardKey receives no cursor frames. After an idle pause its
+            // shadow cannot be trusted: a silent click may have moved the
+            // application cursor while the shadow still names the old word.
+            self.engine.reset();
+            self.edit.reset_composition();
+            self.last_input_char = None;
+            self.retroactive_context = false;
+        }
+        true
     }
 
     // ── composition ───────────────────────────────────────────────────────
@@ -573,109 +687,79 @@ impl Composer {
     /// against garbage (`wor`+`d` → a bogus delete-2 edit instead of plain
     /// "word"). On gate failure the engine stays fresh and the key starts anew.
     pub fn feed_key(&mut self, ch: char) -> KeyDecision {
-        let prev_was_separator = matches!(
-            self.last_input_char,
-            Some(c) if !c.is_ascii_alphabetic()
-        );
-        // Defence in depth vs. set_method: a pending key is only meaningful
-        // while frame confirmation is possible (SurroundingText tier).
-        let prior_key_unconfirmed = self.pending_raw_key.is_some()
-            && self.method() == BackspaceMethod::SurroundingText;
-        // Only cursor-uncertain context defers to frame confirmation:
-        // a forwarded nav/editing action or idle pause (await_frame_context),
-        // engine context reconstructed from a client frame at a possibly-
-        // stale cursor (context_from_frame), or an in-flight confirmation
-        // transaction (prior_key_unconfirmed). Live composition from our own
-        // keystroke stream is never deferred — no flash, and the engine's
-        // continuous state handles reverts (kww→kw) and auto-restore
-        // (kwin stays raw) natively.
-        let context_uncertain = self.confirm_retroactive_edits
-            && self.method() == BackspaceMethod::SurroundingText
-            && (self.await_frame_context || self.context_from_frame || prior_key_unconfirmed);
-        self.await_frame_context = false;
-        if prior_key_unconfirmed {
-            // More than one key arrived before surrounding confirmation. Never
-            // compose against the speculative shadow; degrade to raw and let
-            // the newest key's frame resynchronize the transaction.
+        let facts = FeedKeyFacts::capture(self, ch);
+        let start = plan_key_start(&facts);
+
+        if start.reset_speculation {
             self.engine.reset();
             self.retroactive_context = false;
-            self.pending_engine_edit = None;
         }
-        if !ch.is_ascii_alphabetic() {
+        if start.clear_non_alpha_context {
             self.retroactive_context = false;
-            self.context_from_frame = false;
             self.firefox.clear();
         }
-        self.last_input_char = Some(ch);
-
-        if !prior_key_unconfirmed && self.engine.at_word_beginning() && !prev_was_separator {
-            let shadow = self.edit.shadow_text();
-            let raw_word = current_word_before_cursor(shadow, shadow.len() as u32);
-            if !raw_word.is_empty() {
-                tracing::debug!(word = raw_word, "seed engine from shadow at word boundary");
-                self.retroactive_context = self.engine.feed_context_gated(raw_word);
-            }
+        if let Some(word) = start.seed_word.as_deref() {
+            tracing::debug!(word, "seed engine from shadow at word boundary");
+            self.retroactive_context = self.engine.feed_context_gated(word);
         }
 
-        // A context reconstructed from surrounding text may describe a stale
-        // cursor. Its positional edit is unsafe until the client reports where
-        // this key actually landed. Live composition remains immediate.
-        let confirm_before_positional_edit = context_uncertain;
-        let r = self.engine.process_key(ch);
+        self.last_input_char = Some(ch);
+        let result = self.engine.process_key(ch);
         self.last_keystroke_at = Instant::now();
+        self.trace_process_key(ch, &result);
+
+        let base_word = self.current_shadow_word().to_owned();
+        let prior_pending = matches!(&facts.confirmation, ConfirmationState::PendingRaw(_));
+        match plan_key_finish(
+            ch,
+            start.context_uncertain,
+            prior_pending,
+            facts.confirmation.is_frame_derived(),
+            result,
+            base_word,
+        ) {
+            KeyFinishPlan::Apply { backspaces, commit } => {
+                self.confirmation = ConfirmationState::Live;
+                KeyDecision::Apply {
+                    method: self.method(),
+                    backspaces,
+                    commit,
+                }
+            }
+            KeyFinishPlan::Forward { pending } => {
+                self.edit.push_forwarded_char(ch);
+                self.firefox.clear();
+                self.confirmation = pending
+                    .map(ConfirmationState::PendingRaw)
+                    .unwrap_or(ConfirmationState::Live);
+                KeyDecision::ForwardRaw
+            }
+        }
+    }
+
+    fn trace_process_key(&self, ch: char, result: &ProcessResult) {
         tracing::debug!(
             ch = %ch,
-            consumed = r.consumed,
-            bs = r.backspaces,
-            commit = %r.commit,
+            consumed = result.consumed,
+            bs = result.backspaces,
+            commit = %result.commit,
             shadow = %self.edit.shadow_text(),
             "engine.process_key"
         );
+    }
 
-        if r.consumed && !confirm_before_positional_edit {
-            let method = self.method();
-            KeyDecision::Apply {
-                method,
-                backspaces: r.backspaces,
-                commit: r.commit,
-            }
-        } else {
-            if r.consumed {
-                // Keep the engine's post-key state — it holds the revert
-                // history a reseed cannot reconstruct ("kư" fails the gate).
-                // Stash the computed edit; the confirming frame decides whether
-                // it may be emitted (same base word) or must be re-derived.
-                let base = {
-                    let shadow = self.edit.shadow_text();
-                    current_word_before_cursor(shadow, shadow.len() as u32).to_owned()
-                };
-                self.pending_engine_edit = Some(PendingEngineEdit {
-                    backspaces: r.backspaces,
-                    commit: r.commit.clone(),
-                    base_word: base,
-                });
-            }
-            self.edit.push_forwarded_char(ch);
-            if confirm_before_positional_edit {
-                // Only a cursor-uncertain key opens a confirmation
-                // transaction. Plain unconsumed live keys (English words,
-                // word-initial consonants) just extend the shadow as before.
-                self.pending_raw_key = Some(ch);
-                self.pending_raw_key_repairable = !prior_key_unconfirmed;
-            }
-            // A forwarded key changes the shadow after the stale echo that
-            // armed char-count mode, so that one-shot assumption no longer
-            // applies to the next correction.
-            self.firefox.clear();
-            KeyDecision::ForwardRaw
-        }
+    fn current_shadow_word(&self) -> &str {
+        let shadow = self.edit.shadow_text();
+        current_word_before_cursor(shadow, shadow.len() as u32)
     }
 
     pub fn unrecord_forwarded_char(&mut self) {
         self.edit.pop_forwarded_char();
-        self.pending_raw_key = None;
-        self.pending_raw_key_repairable = false;
-        if self.pending_engine_edit.take().is_some() {
+        let pending = std::mem::replace(&mut self.confirmation, ConfirmationState::Live);
+        if matches!(
+            pending,
+            ConfirmationState::PendingRaw(PendingRaw { edit: Some(_), .. })
+        ) {
             // Engine held speculative post-key state the app never applied.
             self.engine.reset();
             self.retroactive_context = false;
@@ -891,6 +975,14 @@ impl Composer {
         let _ = self.apply_surrounding(text, cursor_bytes, anchor_bytes, false);
     }
 
+    fn revalidate_live_confirmation(&mut self, before_cursor: &str) {
+        if matches!(self.confirmation, ConfirmationState::LiveConfirmed)
+            && before_cursor != self.edit.shadow_text()
+        {
+            self.confirmation = ConfirmationState::AwaitingFrame;
+        }
+    }
+
     /// The reseed gate proper — the single home of the logic that previously
     /// existed in two drifting copies (wayland `on_done_frame` and ibus
     /// `observe_surrounding`). Callers have already passed their own
@@ -924,19 +1016,18 @@ impl Composer {
         let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
         let one_char_typed = self.edit.one_char_insertion_since_prev(text, cursor);
         let before_cursor = text_before_cursor(text, cursor);
+        self.revalidate_live_confirmation(before_cursor);
 
         // A raw key awaiting confirmation is stronger evidence than the 150ms
         // echo heuristic: daklak issued no positional edit for this key, and a
         // frame containing it immediately before the reported cursor tells us
         // where the client actually inserted it. Handle this before Firefox or
         // generic stale-echo classification.
-        if self.pending_raw_key.is_some() && cursor == anchor {
+        if self.confirmation.pending_raw().is_some() && cursor == anchor {
             if let Some(repair) = self.confirm_pending_raw_key(text, cursor, anchor, before_cursor) {
                 return Some(repair);
             }
-            if self.pending_raw_key.is_none() {
-                return None;
-            }
+            self.confirmation.pending_raw()?;
         }
 
         let shadow_confirmed = before_cursor == self.edit.shadow_text();
@@ -970,12 +1061,24 @@ impl Composer {
 
         let deletion_already_applied = shadow_confirmed;
         self.edit.on_surrounding_text(text, cursor, anchor);
-        // A trusted frame supplies destination context; frame-derived seeds
-        // below carry the uncertainty via `context_from_frame` instead.
-        self.await_frame_context = false;
-        self.pending_raw_key = None;
-        self.pending_raw_key_repairable = false;
-        if self.pending_engine_edit.take().is_some() {
+        // A trusted frame supplies destination context; a frame-derived seed
+        // below carries any remaining uncertainty in `confirmation`.
+        let preserve_frame_derived = self.confirmation.is_frame_derived();
+        let confirm_live =
+            shadow_confirmed && !matches!(self.confirmation, ConfirmationState::PendingRaw(_));
+        let had_pending_edit = self
+            .confirmation
+            .pending_raw()
+            .and_then(|pending| pending.edit.as_ref())
+            .is_some();
+        self.confirmation = if preserve_frame_derived {
+            ConfirmationState::FrameDerived
+        } else if confirm_live {
+            ConfirmationState::LiveConfirmed
+        } else {
+            ConfirmationState::Live
+        };
+        if had_pending_edit {
             // A trusted frame superseded the confirmation transaction; the
             // engine's speculative post-key state was never applied on screen.
             self.engine.reset();
@@ -986,7 +1089,7 @@ impl Composer {
             if !deletion_already_applied {
                 self.engine.reset();
                 self.retroactive_context = false;
-                self.context_from_frame = false;
+                self.confirmation = ConfirmationState::Live;
                 // The engine now reflects the app, not the keyboard. A stale
                 // last_input_char (e.g. the ' ' that ended the previous word)
                 // would keep prev_was_separator true and block the
@@ -1002,7 +1105,11 @@ impl Composer {
             // Engine context now describes a frame-reported cursor which may
             // go stale before the next key; positional edits from it must be
             // confirm-deferred.
-            self.context_from_frame = self.retroactive_context;
+            self.confirmation = if self.retroactive_context {
+                ConfirmationState::FrameDerived
+            } else {
+                ConfirmationState::Live
+            };
             // Same invalidation as the deletion arm: after a genuine cursor
             // jump the last typed key describes the previous locale.
             self.last_input_char = None;
@@ -1026,16 +1133,21 @@ impl Composer {
         anchor: u32,
         before_cursor: &str,
     ) -> Option<RetroEdit> {
-        let ch = self.pending_raw_key?;
-        let Some((raw_index, actual_ch)) = before_cursor.char_indices().next_back() else {
-            return None;
-        };
+        let pending = self.confirmation.pending_raw()?.clone();
+        let ch = pending.ch;
+        let (raw_index, actual_ch) = before_cursor.char_indices().next_back()?;
         if actual_ch != ch {
             return None;
         }
 
-        let insertion_proven = self.edit.confirms_inserted_char(text, cursor, ch);
-        let repairable = self.pending_raw_key_repairable;
+        // A delayed client may combine the prior committed transform and this
+        // raw key into one frame, so `prev_text` can lag by more than one edit.
+        // Shadow equality alone also matches a cursor move over an adjacent
+        // identical character; a real insertion changes the document.
+        let document_changed = text != self.edit.prev_surrounding_for_trace().0;
+        let insertion_proven = self.edit.confirms_inserted_char(text, cursor, ch)
+            || (before_cursor == self.edit.shadow_text() && document_changed);
+        let repairable = pending.repairable;
         let stripped = &before_cursor[..raw_index];
         let base_word = current_word_before_cursor(stripped, stripped.len() as u32).to_owned();
         let actual_word = current_word_before_cursor(before_cursor, before_cursor.len() as u32)
@@ -1047,14 +1159,15 @@ impl Composer {
             // repair. Synchronize and continue from its visible word.
             self.edit.on_surrounding_text(text, cursor, anchor);
             self.edit.record_surrounding(text, cursor, anchor);
-            self.pending_raw_key = None;
-            self.pending_raw_key_repairable = false;
-            self.pending_engine_edit = None;
             self.last_input_char = Some(ch);
             self.engine.reset();
-            self.retroactive_context = !actual_word.is_empty()
-                && self.engine.feed_context_gated(&actual_word);
-            self.context_from_frame = self.retroactive_context;
+            self.retroactive_context =
+                !actual_word.is_empty() && self.engine.feed_context_gated(&actual_word);
+            self.confirmation = if self.retroactive_context {
+                ConfirmationState::FrameDerived
+            } else {
+                ConfirmationState::Live
+            };
             return None;
         }
 
@@ -1063,15 +1176,13 @@ impl Composer {
         // KEEP the engine state — it holds revert history a reseed loses
         // ("kư" fails the round-trip gate, so reseeding forgets ư came from
         // 'w' and a second 'w' would compose "kưư" instead of reverting).
-        if let Some(stash) = self.pending_engine_edit.take() {
+        if let Some(stash) = pending.edit {
             if stash.base_word == base_word {
                 self.edit.on_surrounding_text(text, cursor, anchor);
                 self.edit.record_surrounding(text, cursor, anchor);
-                self.pending_raw_key = None;
-                self.pending_raw_key_repairable = false;
                 self.last_input_char = Some(ch);
                 self.retroactive_context = true;
-                self.context_from_frame = true;
+                self.confirmation = ConfirmationState::FrameDerived;
                 // The screen shows base_word + raw ch; the engine wants
                 // base_word minus `backspaces` plus `commit`. Deleting the raw
                 // char costs one extra backspace.
@@ -1092,8 +1203,6 @@ impl Composer {
         // This frame is authoritative regardless of whether replay composes.
         self.edit.on_surrounding_text(text, cursor, anchor);
         self.edit.record_surrounding(text, cursor, anchor);
-        self.pending_raw_key = None;
-        self.pending_raw_key_repairable = false;
         self.last_input_char = Some(ch);
 
         // For boundary-valued IM keys (`[`/`]` Telex shortcuts), extracting the
@@ -1105,14 +1214,18 @@ impl Composer {
             // Fresh word or foreign base: keep the raw key, but seed the full
             // confirmed word so subsequent keys start from real client state.
             self.engine.reset();
-            self.retroactive_context = !screen_word.is_empty()
-                && self.engine.feed_context_gated(&screen_word);
-            self.context_from_frame = self.retroactive_context;
+            self.retroactive_context =
+                !screen_word.is_empty() && self.engine.feed_context_gated(&screen_word);
+            self.confirmation = if self.retroactive_context {
+                ConfirmationState::FrameDerived
+            } else {
+                ConfirmationState::Live
+            };
             return None;
         };
 
         self.retroactive_context = true;
-        self.context_from_frame = true;
+        self.confirmation = ConfirmationState::FrameDerived;
         if !replay.consumed {
             // The seeded engine already incorporated the raw key and matches the
             // screen; no visible correction is needed.
@@ -1153,13 +1266,14 @@ impl Composer {
     /// can report the stale pre-edit text unchanged, and that duplicate is the
     /// only signal to switch the next correction to char-count delete.
     pub fn should_skip_surrounding_frame(
-        &self,
+        &mut self,
         text: &str,
         cursor: u32,
         anchor: u32,
         activate: bool,
         deactivate: bool,
     ) -> bool {
+        self.revalidate_live_confirmation(text_before_cursor(text, cursor));
         !activate
             && !deactivate
             && !self.firefox.has_pending_echo()
@@ -1325,14 +1439,17 @@ pub fn detect_deletion(prev_text: &str, prev_cursor: u32, text: &str, cursor: u3
 mod tests {
     use super::{current_word_before_cursor, current_word_before_insertion_point};
     use super::{ByteCursor, Composer};
+    use viet_ime_edit_strategy::KeyDecision;
     use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, KeyState, OutputSink};
     use viet_ime_engine::InputMethod;
-    use viet_ime_edit_strategy::KeyDecision;
 
     // Re-exports for nested test modules
-    pub(super) use super::{EditModel, SurroundingDecision, SurroundingObserver};
     pub(super) use super::detect_deletion as del;
     pub(super) use super::detect_one_char_insertion as oci;
+    pub(super) use super::{
+        plan_key_finish, plan_key_start, ConfirmationState, EditModel, FeedKeyFacts, KeyFinishPlan,
+        PendingRaw, SurroundingDecision, SurroundingObserver,
+    };
 
     #[derive(Default)]
     struct DeleteCaptureSink {
@@ -2318,9 +2435,18 @@ mod tests {
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
             c.set_surrounding_confirmation(true);
             let mut sink = DeleteCaptureSink::default();
+
+            seed_stale_ctrl_backspace_frame(&mut c);
+            type_confirmed_raw_prefix(&mut c);
+            repair_confirmed_circumflex(&mut c, &mut sink);
+            repair_confirmed_tone(&mut c, &mut sink);
+
+            assert_eq!(c.shadow_text(), "tiệng việt");
+        }
+
+        fn seed_stale_ctrl_backspace_frame(c: &mut Composer) {
             let stale = "tiệng vieetjr mĩ miều";
             let stale_cursor = "tiệng vieetjr".len() as u32;
-
             c.observe_surrounding_bytes(
                 stale,
                 ByteCursor(stale_cursor),
@@ -2334,43 +2460,34 @@ mod tests {
                 stale_cursor,
                 stale_cursor,
                 false,
-                false,
+                false
             ));
+        }
 
+        fn type_confirmed_raw_prefix(c: &mut Composer) {
             // Ctrl+Backspace has already removed "vieetjr" in gedit. The first
             // retyped letter proves the real insertion point and replaces the
             // stale snapshot as ground truth.
-            c.mark_action();
-            assert!(matches!(c.feed_key('v'), KeyDecision::ForwardRaw));
-            let v_text = "tiệng v mĩ miều";
-            let v_cursor = "tiệng v".len() as u32;
-            assert!(c
-                .observe_surrounding_bytes(
-                    v_text,
-                    ByteCursor(v_cursor),
-                    ByteCursor(v_cursor),
-                    false,
-                )
-                .is_none());
+            assert_forwarded_char_confirmed(c, 'v', "tiệng v mĩ miều");
             assert_eq!(c.shadow_text(), "tiệng v");
 
             // Continue from surrounding-confirmed context. Raw letters sync;
             // transformations are inserted raw first, then repaired from their
             // confirming frame so later cursor movement cannot race an edit.
-            for (ch, text) in [('i', "tiệng vi mĩ miều"), ('e', "tiệng vie mĩ miều")] {
-                c.mark_action();
-                assert!(matches!(c.feed_key(ch), KeyDecision::ForwardRaw));
-                let cursor = text.split(" mĩ").next().unwrap().len() as u32;
-                assert!(c
-                    .observe_surrounding_bytes(
-                        text,
-                        ByteCursor(cursor),
-                        ByteCursor(cursor),
-                        false,
-                    )
-                    .is_none());
-            }
+            assert_forwarded_char_confirmed(c, 'i', "tiệng vi mĩ miều");
+            assert_forwarded_char_confirmed(c, 'e', "tiệng vie mĩ miều");
+        }
 
+        fn assert_forwarded_char_confirmed(c: &mut Composer, ch: char, text: &str) {
+            c.mark_action();
+            assert!(matches!(c.feed_key(ch), KeyDecision::ForwardRaw));
+            let cursor = text.split(" mĩ").next().unwrap().len() as u32;
+            assert!(c
+                .observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false)
+                .is_none());
+        }
+
+        fn repair_confirmed_circumflex(c: &mut Composer, sink: &mut DeleteCaptureSink) {
             c.mark_action();
             assert!(matches!(c.feed_key('e'), KeyDecision::ForwardRaw));
             let raw_ee = "tiệng viee mĩ miều";
@@ -2383,13 +2500,8 @@ mod tests {
                     false,
                 )
                 .expect("confirmed raw e should repair viee to viê");
-            c.apply_confirmed_repair_to_sink(
-                circumflex.backspaces,
-                &circumflex.commit,
-                0,
-                0,
-                &mut sink,
-            );
+            c.apply_confirmed_repair_to_sink(circumflex.backspaces, &circumflex.commit, 0, 0, sink);
+
             let composed_e = "tiệng viê mĩ miều";
             let composed_e_cursor = "tiệng viê".len() as u32;
             c.observe_surrounding_bytes(
@@ -2398,20 +2510,10 @@ mod tests {
                 ByteCursor(composed_e_cursor),
                 false,
             );
+            assert_forwarded_char_confirmed(c, 't', "tiệng viêt mĩ miều");
+        }
 
-            c.mark_action();
-            assert!(matches!(c.feed_key('t'), KeyDecision::ForwardRaw));
-            let raw_t = "tiệng viêt mĩ miều";
-            let raw_t_cursor = "tiệng viêt".len() as u32;
-            assert!(c
-                .observe_surrounding_bytes(
-                    raw_t,
-                    ByteCursor(raw_t_cursor),
-                    ByteCursor(raw_t_cursor),
-                    false,
-                )
-                .is_none());
-
+        fn repair_confirmed_tone(c: &mut Composer, sink: &mut DeleteCaptureSink) {
             c.mark_action();
             assert!(matches!(c.feed_key('j'), KeyDecision::ForwardRaw));
             let raw_j = "tiệng viêtj mĩ miều";
@@ -2424,14 +2526,7 @@ mod tests {
                     false,
                 )
                 .expect("confirmed raw j should repair viêtj to việt");
-            c.apply_confirmed_repair_to_sink(
-                tone.backspaces,
-                &tone.commit,
-                0,
-                0,
-                &mut sink,
-            );
-            assert_eq!(c.shadow_text(), "tiệng việt");
+            c.apply_confirmed_repair_to_sink(tone.backspaces, &tone.commit, 0, 0, sink);
         }
 
         // gedit under KWin (text-input-v1, SurroundingText tier) sends NO
@@ -2449,16 +2544,17 @@ mod tests {
             c.set_surrounding_confirmation(true);
             let mut sink = DeleteCaptureSink::default();
 
+            seed_gedit_late_fused_frame(&mut c);
+            assert_late_fused_repair(&mut c, &mut sink);
+            assert_late_fused_next_tone(&mut c);
+        }
+
+        fn seed_gedit_late_fused_frame(c: &mut Composer) {
             // Last confirmed frame was near the start of the word. Ctrl+Right
             // resets composition but preserves that application snapshot; no
             // destination frame follows.
             let baseline = "tiếng việt mĩ miều";
-            c.observe_surrounding_bytes(
-                baseline,
-                ByteCursor(1),
-                ByteCursor(1),
-                false,
-            );
+            c.observe_surrounding_bytes(baseline, ByteCursor(1), ByteCursor(1), false);
             c.reset_composition_preserving_surrounding();
             c.defer_action();
 
@@ -2466,27 +2562,20 @@ mod tests {
             c.mark_action();
             assert!(matches!(c.feed_key('r'), KeyDecision::ForwardRaw));
             assert_eq!(c.shadow_text(), "r");
+        }
 
+        fn assert_late_fused_repair(c: &mut Composer, sink: &mut DeleteCaptureSink) {
             // The fused frame lands ~1 wire event later, already containing the
             // forwarded 'r' at the end of "tiếng": text="tiếngr…" cursor=8.
             let text = "tiếngr việt mĩ miều";
-            let cursor = "tiếngr".len() as u32; // 8
+            let cursor = "tiếngr".len() as u32;
             let edit = c
                 .observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false)
                 .expect("late fused frame should yield a retro-compose repair");
-            // Delete the already-forwarded "ếngr" (4 chars) and commit "ểng":
-            // "tiếngr" → "tiểng" (hỏi tone on "tiếng").
             assert_eq!(edit.backspaces, 4);
             assert_eq!(edit.commit, "ểng");
 
-            // The transport applies the repair; shadow becomes "tiểng…".
-            c.apply_confirmed_repair_to_sink(
-                edit.backspaces,
-                &edit.commit,
-                0,
-                0,
-                &mut sink,
-            );
+            c.apply_confirmed_repair_to_sink(edit.backspaces, &edit.commit, 0, 0, sink);
             assert!(
                 !c.firefox.has_pending_echo(),
                 "KWin repair echoes must not enter Firefox stale classification"
@@ -2499,7 +2588,9 @@ mod tests {
                 ByteCursor(corrected_cursor),
                 false,
             );
+        }
 
+        fn assert_late_fused_next_tone(c: &mut Composer) {
             // Every surrounding-derived positional edit follows the same safe
             // transaction. The raw key may flash for one client frame, but the
             // repair cannot land at an unreported mouse/keyboard cursor.
@@ -2563,6 +2654,66 @@ mod tests {
         }
 
         #[test]
+        fn idle_reset_still_resets_forward_key_engine() {
+            let mut composer =
+                Composer::new(InputMethod::Telex, BackspaceMethod::ForwardKey, false);
+            assert!(matches!(composer.feed_key('k'), KeyDecision::ForwardRaw));
+            assert!(matches!(composer.feed_key('w'), KeyDecision::Apply { .. }));
+            assert!(!composer.engine.at_word_beginning());
+
+            composer.last_keystroke_at -= std::time::Duration::from_secs(3);
+            assert!(composer.check_idle_reset());
+            assert!(composer.engine.at_word_beginning());
+        }
+
+        #[test]
+        fn forward_key_idle_discards_shadow_before_unreported_cursor_move() {
+            let mut composer =
+                Composer::new(InputMethod::Telex, BackspaceMethod::ForwardKey, false);
+            let mut sink = DeleteCaptureSink::default();
+            let mut visible = String::new();
+
+            for ch in "hoom nay muwa".chars() {
+                match composer.feed_key(ch) {
+                    KeyDecision::ForwardRaw => visible.push(ch),
+                    KeyDecision::Apply {
+                        backspaces, commit, ..
+                    } => {
+                        for _ in 0..backspaces {
+                            visible.pop();
+                        }
+                        visible.push_str(&commit);
+                        composer.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                    }
+                    KeyDecision::Consumed => {}
+                }
+            }
+            assert_eq!(visible, "hôm nay mưa");
+
+            composer.last_keystroke_at -= std::time::Duration::from_secs(3);
+            assert!(composer.check_idle_reset());
+            let mut clicked_prefix = "hôm".to_owned();
+            match composer.feed_key('r') {
+                KeyDecision::ForwardRaw => clicked_prefix.push('r'),
+                _ => panic!("stale pre-click word must not receive the tone key"),
+            }
+            assert_eq!(clicked_prefix, "hômr");
+        }
+
+        #[test]
+        fn idle_does_not_reset_surrounding_text_engine() {
+            let mut composer =
+                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            assert!(matches!(composer.feed_key('k'), KeyDecision::ForwardRaw));
+            assert!(matches!(composer.feed_key('w'), KeyDecision::Apply { .. }));
+            assert!(!composer.engine.at_word_beginning());
+
+            composer.last_keystroke_at -= std::time::Duration::from_secs(3);
+            assert!(composer.check_idle_reset());
+            assert!(!composer.engine.at_word_beginning());
+        }
+
+        #[test]
         fn idle_reset_seeds_composed_shadow_for_tone_replacement() {
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
             let text = "là";
@@ -2585,6 +2736,145 @@ mod tests {
                 }
                 _ => panic!("expected tone replacement after idle reset"),
             }
+        }
+
+        #[test]
+        fn confirmed_live_word_applies_tone_immediately_after_idle() {
+            let mut composer =
+                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+            composer.set_surrounding_confirmation(true);
+
+            for (ch, text) in [('m', "m"), ('i', "mi")] {
+                composer.mark_action();
+                assert!(matches!(composer.feed_key(ch), KeyDecision::ForwardRaw));
+                let cursor = text.len() as u32;
+                composer.observe_surrounding_bytes(
+                    text,
+                    ByteCursor(cursor),
+                    ByteCursor(cursor),
+                    false,
+                );
+            }
+
+            composer.mark_action();
+            let KeyDecision::Apply {
+                backspaces, commit, ..
+            } = composer.feed_key('x')
+            else {
+                panic!("x must compose mĩ");
+            };
+            assert_eq!((backspaces, commit.as_str()), (1, "ĩ"));
+            composer.apply_to_sink(backspaces, &commit, 1, 0, &mut sink);
+            composer.observe_surrounding_bytes("mĩ", ByteCursor(3), ByteCursor(3), false);
+
+            composer.last_keystroke_at -= std::time::Duration::from_secs(3);
+            assert!(composer.check_idle_reset());
+            composer.mark_action();
+            match composer.feed_key('s') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => assert_eq!((backspaces, commit.as_str()), (1, "í")),
+                _ => panic!("confirmed live word must not flash a raw tone key"),
+            }
+        }
+
+        #[test]
+        fn mismatching_frame_revokes_live_confirmation_even_when_rejected() {
+            let mut composer =
+                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+            composer.set_surrounding_confirmation(true);
+
+            for (ch, text) in [('m', "m"), ('i', "mi")] {
+                composer.mark_action();
+                assert!(matches!(composer.feed_key(ch), KeyDecision::ForwardRaw));
+                let cursor = text.len() as u32;
+                composer.observe_surrounding_bytes(
+                    text,
+                    ByteCursor(cursor),
+                    ByteCursor(cursor),
+                    false,
+                );
+            }
+
+            composer.mark_action();
+            let KeyDecision::Apply {
+                backspaces, commit, ..
+            } = composer.feed_key('x')
+            else {
+                panic!("x must compose mĩ");
+            };
+            composer.apply_to_sink(backspaces, &commit, 1, 0, &mut sink);
+            composer.observe_surrounding_bytes("mĩ", ByteCursor(3), ByteCursor(3), false);
+
+            // A delayed cursor frame can arrive inside the recent-action
+            // rejection window. Even when ignored for reseeding, it disproves
+            // the earlier live confirmation.
+            composer.mark_action();
+            composer.observe_surrounding_bytes("other", ByteCursor(5), ByteCursor(5), false);
+            composer.last_keystroke_at -= std::time::Duration::from_secs(3);
+            assert!(composer.check_idle_reset());
+            composer.mark_action();
+            assert!(matches!(composer.feed_key('s'), KeyDecision::ForwardRaw));
+        }
+
+        #[test]
+        fn delayed_live_echo_forwards_then_repairs_tone_key() {
+            let mut composer =
+                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+            composer.set_surrounding_confirmation(true);
+
+            for (ch, text) in [('m', "m"), ('i', "mi")] {
+                composer.mark_action();
+                assert!(matches!(composer.feed_key(ch), KeyDecision::ForwardRaw));
+                let cursor = text.len() as u32;
+                composer.observe_surrounding_bytes(
+                    text,
+                    ByteCursor(cursor),
+                    ByteCursor(cursor),
+                    false,
+                );
+            }
+
+            composer.mark_action();
+            let KeyDecision::Apply {
+                backspaces, commit, ..
+            } = composer.feed_key('x')
+            else {
+                panic!("x must compose mĩ");
+            };
+            composer.apply_to_sink(backspaces, &commit, 1, 0, &mut sink);
+
+            composer.last_keystroke_at -= std::time::Duration::from_secs(3);
+            assert!(composer.check_idle_reset());
+            composer.mark_action();
+            assert!(matches!(composer.feed_key('s'), KeyDecision::ForwardRaw));
+
+            let repair = composer
+                .observe_surrounding_bytes("mĩs", ByteCursor(4), ByteCursor(4), false)
+                .expect("combined delayed frame must repair the raw tone key");
+            assert_eq!((repair.backspaces, repair.commit.as_str()), (2, "í"));
+        }
+
+        #[test]
+        fn cursor_move_over_existing_suffix_does_not_confirm_raw_key() {
+            let mut composer =
+                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            composer.set_surrounding_confirmation(true);
+            composer.observe_surrounding_bytes("mĩs", ByteCursor(3), ByteCursor(3), false);
+
+            composer.last_keystroke_at -= std::time::Duration::from_secs(3);
+            assert!(composer.check_idle_reset());
+            composer.mark_action();
+            assert!(matches!(composer.feed_key('s'), KeyDecision::ForwardRaw));
+
+            // The document did not change; only the cursor moved over an
+            // existing `s`. Shadow equality must not authorize a repair.
+            assert!(composer
+                .observe_surrounding_bytes("mĩs", ByteCursor(4), ByteCursor(4), false)
+                .is_none());
         }
 
         #[test]
@@ -3069,6 +3359,108 @@ mod tests {
             );
         }
 
+        #[test]
+        fn confirmation_state_only_pending_variant_contains_raw_key() {
+            let pending = super::ConfirmationState::PendingRaw(super::PendingRaw {
+                ch: 's',
+                repairable: true,
+                edit: None,
+                from_frame: false,
+            });
+
+            assert_eq!(pending.pending_raw().map(|pending| pending.ch), Some('s'));
+            assert!(super::ConfirmationState::Live.pending_raw().is_none());
+            assert!(super::ConfirmationState::LiveConfirmed
+                .pending_raw()
+                .is_none());
+            assert!(super::ConfirmationState::FrameDerived
+                .pending_raw()
+                .is_none());
+            assert!(super::ConfirmationState::AwaitingFrame
+                .pending_raw()
+                .is_none());
+        }
+
+        #[test]
+        fn overlapping_pending_key_becomes_non_repairable() {
+            let state = super::ConfirmationState::PendingRaw(super::PendingRaw {
+                ch: 's',
+                repairable: true,
+                edit: None,
+                from_frame: false,
+            });
+
+            let replacement = state.replacement_pending('f', None);
+            let pending = replacement
+                .pending_raw()
+                .expect("pending replacement state");
+
+            assert_eq!(pending.ch, 'f');
+            assert!(!pending.repairable);
+        }
+
+        #[test]
+        fn selected_frame_preserves_pending_frame_provenance() {
+            let mut composer = super::Composer::new(
+                super::InputMethod::Telex,
+                super::BackspaceMethod::SurroundingText,
+                false,
+            );
+            composer.set_surrounding_confirmation(true);
+            composer.edit.on_surrounding_text("foo", 3, 3);
+            composer.edit.record_surrounding("foo", 3, 3);
+            composer.confirmation = super::ConfirmationState::PendingRaw(super::PendingRaw {
+                ch: 'x',
+                repairable: true,
+                edit: None,
+                from_frame: true,
+            });
+
+            assert!(composer.apply_surrounding("foobar", 3, 6, false).is_none());
+            assert!(matches!(
+                composer.confirmation,
+                super::ConfirmationState::FrameDerived
+            ));
+        }
+
+        #[test]
+        fn key_start_plan_requires_confirmation_for_every_uncertain_state() {
+            for confirmation in [
+                super::ConfirmationState::FrameDerived,
+                super::ConfirmationState::AwaitingFrame,
+                super::ConfirmationState::PendingRaw(super::PendingRaw {
+                    ch: 'r',
+                    repairable: true,
+                    edit: None,
+                    from_frame: false,
+                }),
+            ] {
+                let facts = super::FeedKeyFacts {
+                    ch: 's',
+                    method: super::BackspaceMethod::SurroundingText,
+                    confirmation_enabled: true,
+                    confirmation,
+                    previous_was_separator: false,
+                    engine_at_word_beginning: false,
+                    shadow_word: String::new(),
+                };
+
+                assert!(super::plan_key_start(&facts).context_uncertain);
+            }
+        }
+
+        #[test]
+        fn key_finish_plan_never_applies_from_uncertain_context() {
+            let result = viet_ime_engine::ProcessResult {
+                consumed: true,
+                backspaces: 1,
+                commit: "á".to_owned(),
+            };
+
+            let plan = super::plan_key_finish('s', true, false, false, result, "a".to_owned());
+
+            assert!(matches!(plan, super::KeyFinishPlan::Forward { .. }));
+        }
     }
 
     mod edit_model_behavior {
@@ -3150,7 +3542,7 @@ mod tests {
         fn oci_cursor_mismatch_rejected() {
             // text grew by 1 byte but cursor jumped by 2 (impossible for single
             // keystroke insert at cursor).
-            assert!(!oci("ab", 2, "abc", 3) == false);
+            assert!(oci("ab", 2, "abc", 3));
             // also: cursor at 0 in larger text (not at insertion point).
             assert!(!oci("ab", 2, "abc", 1));
         }
@@ -3585,6 +3977,30 @@ mod tests {
         assert_eq!((before_bytes, before_chars), (4, 2));
     }
 
+    fn press_visible(
+        c: &mut Composer,
+        sink: &mut DeleteCaptureSink,
+        visible: &mut String,
+        ch: char,
+    ) -> KeyDecision {
+        c.mark_action();
+        let decision = c.feed_key(ch);
+        match &decision {
+            KeyDecision::ForwardRaw => visible.push(ch),
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => {
+                for _ in 0..*backspaces {
+                    visible.pop();
+                }
+                visible.push_str(commit);
+                c.apply_to_sink(*backspaces, commit, 0, 0, sink);
+            }
+            KeyDecision::Consumed => {}
+        }
+        decision
+    }
+
     #[test]
     fn chromium_omnibox_stale_selection_does_not_eat_first_word() {
         let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
@@ -3596,44 +4012,15 @@ mod tests {
         let url = "https://invent.kde.org";
         let n = url.len() as u32;
 
-        let press = |c: &mut Composer,
-                     sink: &mut DeleteCaptureSink,
-                     visible: &mut String,
-                     ch: char|
-         -> KeyDecision {
-            c.mark_action();
-            let d = c.feed_key(ch);
-            match &d {
-                KeyDecision::ForwardRaw => visible.push(ch),
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    for _ in 0..*backspaces {
-                        visible.pop();
-                    }
-                    visible.push_str(commit);
-                    c.apply_to_sink(*backspaces, commit, 0, 0, sink);
-                }
-                KeyDecision::Consumed => {}
-            }
-            d
-        };
-
-        // h → raw 'h'; omnibox echoes its autocomplete selection (prefix "h"
-        // still matches shadow here, so it is confirmed and trusted).
-        press(&mut c, &mut sink, &mut visible, 'h');
+        press_visible(&mut c, &mut sink, &mut visible, 'h');
         c.observe_surrounding_bytes(url, ByteCursor(1), ByteCursor(n), false);
-        // a → raw 'a'. Now a STALE "h…" selection frame re-arrives (prefix "h"
-        // no longer matches shadow "ha") and must be dropped, then the real
-        // "ha" frame clears the selection.
-        press(&mut c, &mut sink, &mut visible, 'a');
-        c.observe_surrounding_bytes(url, ByteCursor(1), ByteCursor(n), false); // stale → dropped
-        c.observe_surrounding_bytes("ha", ByteCursor(2), ByteCursor(2), false); // real → clears sel
-                                                                                // f → huyền tone on a: bs=1 commit "à". Must use the plain
-                                                                                // delete_surrounding_text path, NOT the selection-active ForwardKey-BS
-                                                                                // fallback (which would delete "ha" and leave only "à").
-        let d = press(&mut c, &mut sink, &mut visible, 'f');
-        match d {
+
+        press_visible(&mut c, &mut sink, &mut visible, 'a');
+        c.observe_surrounding_bytes(url, ByteCursor(1), ByteCursor(n), false);
+        c.observe_surrounding_bytes("ha", ByteCursor(2), ByteCursor(2), false);
+
+        let decision = press_visible(&mut c, &mut sink, &mut visible, 'f');
+        match decision {
             KeyDecision::Apply {
                 backspaces, commit, ..
             } => {
@@ -3645,12 +4032,11 @@ mod tests {
                 match other {
                     KeyDecision::ForwardRaw => "ForwardRaw",
                     KeyDecision::Consumed => "Consumed",
-                    _ => "?",
+                    KeyDecision::Apply { .. } => "Apply",
                 }
             ),
         }
         assert_eq!(visible, "hà");
-        // No virtual-keyboard backspaces: the stale selection was not honored.
         assert!(
             sink.vk_keys.is_empty(),
             "stale selection must not trigger ForwardKey-BS fallback"
