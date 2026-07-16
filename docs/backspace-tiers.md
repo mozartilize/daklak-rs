@@ -88,11 +88,13 @@ application currently shows for the in-progress word. Each keystroke diffs the
 new composed form against the shadow to produce "delete N, commit S".
 
 The shadow can drift out of sync with reality (the user clicks elsewhere, an app
-rewrites its own field, focus changes). daklak therefore **invalidates** the
-shadow on several signals — cursor jumps, deactivation, navigation/shortcut
-keys, surrounding-text changes it didn't cause, and idle timeout — and reseeds
-from the application's actual surrounding text where available. The
-trust-and-reseed decision is isolated in the `SurroundingObserver`
+rewrites its own field, focus changes). daklak resets or resynchronizes the
+shadow on cursor jumps, deactivation, navigation/shortcut keys, and external
+surrounding-text changes. Idle handling is tier-specific: ForwardKey resets the
+engine and clears its unverifiable shadow; SurroundingText retains both and
+demotes only context lacking a confirmed frame. Incoming surrounding frames
+continuously revalidate that confirmation. The trust-and-reseed decision
+is isolated in the `SurroundingObserver`
 (see [Architecture](architecture.md#crate-responsibilities)).
 
 > **Re-seed gate caution:** navigation and shortcut keys must *not* count as

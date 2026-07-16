@@ -12,6 +12,8 @@ flows from device to committed text.
 - [The brain vs the transports](#the-brain-vs-the-transports)
 - [Data flow](#data-flow)
 - [Composition & seeding](#composition--seeding)
+- [Composer transitions](#composer-transitions)
+- [Failure boundaries](#failure-boundaries)
 - [Crate responsibilities](#crate-responsibilities)
 
 ## Guiding principle
@@ -120,6 +122,48 @@ reconstruction (composed glyphs → telex keystrokes) is replayed and must
 round-trip back to the original glyphs before it is trusted. A word that does
 not round-trip (e.g. English `wor`, which telex-reads as a Vietnamese vowel) is
 left unseeded and typed fresh — never seeded as garbage.
+
+## Composer transitions
+
+`ConfirmationState` is the single source of truth for whether the Composer's
+client context is live, derived from a frame, awaiting a fresh frame, or holding
+a pending raw key. `LiveConfirmed` records that the client echoed the current
+live shadow after the previous key; it authorizes the next post-idle edit to
+apply without a raw-key flash. Every surrounding frame revalidates that proof,
+and a shadow mismatch revokes it even when the frame is otherwise ignored as a
+recent or duplicate frame. Without a confirmed echo, the key remains
+confirm-deferred and is repaired from the delayed frame. `PendingRaw` keeps the
+raw key, repairability, and any speculative engine edit together, so those facts
+cannot drift into invalid flag combinations.
+
+The two-second idle policy is tier-specific. `ForwardKey` resets the engine and
+clears its unverifiable shadow because it has no surrounding frames to report a
+cursor move. `SurroundingText` retains continuous engine state; idle only demotes
+context lacking a confirmed frame, while incoming frames continuously revalidate
+that confirmation.
+
+`Composer::feed_key` owns the key-path mutations. It first snapshots immutable
+`FeedKeyFacts`; pure `plan_key_start` and `plan_key_finish` functions then
+compute the transition without borrowing or changing the Composer. `feed_key`
+applies the selected engine, shadow, quirk, and confirmation mutations in one
+ordered block. This keeps transition policy independently testable while making
+the mutation owner explicit.
+
+## Failure boundaries
+
+Expected first-party operating errors are not silently discarded. Active I/O
+errors are propagated with context where the current operation cannot continue;
+best-effort cleanup and disconnected observers are classified and logged; and
+optional IPC connection and tray tasks are owned and supervised. Failure of an
+optional subsystem disables that subsystem while composition continues. Task
+completion and `JoinError` values are observed, including during shutdown.
+
+Programmer-invariant violations remain assertions or explicit panics. Release
+builds use Rust's unwinding behavior, and the daemon does not try to continue
+from possibly corrupted mutable session state with `catch_unwind`; restarting
+such a process belongs to the launcher. This boundary does not promise recovery
+from out-of-memory aborts, `SIGKILL`, stack overflow, undefined behavior, kernel
+failure, or an abort inside a dependency.
 
 ## Crate responsibilities
 

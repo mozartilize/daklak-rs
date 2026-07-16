@@ -169,9 +169,9 @@ modern XWayland clients (Chromium, Firefox X11, JetBrains, OnlyOffice,
 Steam) handle all 8 levels correctly.
 
 Switching to `FOUR_LEVEL` (2 pairs per key) would fix urxvt but
-requires 34 keycodes instead of 17. Finding 17 additional safe
-keycodes with Chromium DomCode support is not feasible — only ~13
-candidates exist (see `plans/four-level-keymap-migration.md`). Since
+requires 34 keycodes instead of 17. The remaining safe keycodes with
+Chromium DomCode support do not provide the 17 additional slots this
+would require. Since
 xkb ties Shift to level selection (Shift IS level 2, not an
 independent case modifier), uppercase cannot be decoupled from the
 level count — each character pair (lower + Shift→upper) always
