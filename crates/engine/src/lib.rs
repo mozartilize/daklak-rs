@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::let_underscore_must_use,
+    )
+)]
+
 //! viet-ime-engine — thin wrapper around vnkey-engine.
 //!
 //! Exposes a clean API for the daemon: feed keys (chars), get back the bytes
@@ -39,6 +48,15 @@ pub struct ProcessResult {
     pub backspaces: usize,
     pub commit: String,
     pub consumed: bool,
+}
+
+fn decode_engine_output(output: Vec<u8>) -> String {
+    // INVARIANT: vnkey-engine output comes from its internal UTF-8 tables,
+    // never from external byte input.
+    match String::from_utf8(output) {
+        Ok(commit) => commit,
+        Err(error) => panic!("vnkey-engine violated its UTF-8 output invariant: {error}"),
+    }
 }
 
 /// Per-window engine state. One instance per window/text-input the daemon
@@ -101,7 +119,7 @@ impl EngineState {
     /// will treat non-ASCII as word-break).
     pub fn process_key(&mut self, ch: char) -> ProcessResult {
         let r = self.engine.process(ch as u32);
-        let commit = String::from_utf8(r.output).expect("vnkey-engine output must be valid UTF-8");
+        let commit = decode_engine_output(r.output);
         ProcessResult {
             backspaces: r.backspaces,
             commit,
@@ -113,7 +131,7 @@ impl EngineState {
     /// to (or instead of) forwarding the backspace to the app.
     pub fn process_backspace(&mut self) -> ProcessResult {
         let r = self.engine.process_backspace();
-        let commit = String::from_utf8(r.output).expect("vnkey-engine output must be valid UTF-8");
+        let commit = decode_engine_output(r.output);
         ProcessResult {
             backspaces: r.backspaces,
             commit,
