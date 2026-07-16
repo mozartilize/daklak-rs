@@ -115,7 +115,9 @@ fn run_setup_hooks_inner(
             }
             code => {
                 let applied_hooks = AppliedHooks { hooks: applied };
-                let _ = run_cleanup_hooks_inner(&applied_hooks, runner);
+                if let Err(error) = run_cleanup_hooks_inner(&applied_hooks, runner) {
+                    tracing::warn!(%error, "evdev hook rollback cleanup failed");
+                }
                 return Err(anyhow!(
                     "evdev hook {} set failed with exit code {code}",
                     hook.name
@@ -451,8 +453,19 @@ pub fn write_rollback_marker(applied: &AppliedHooks) -> Result<()> {
 }
 
 pub fn clear_rollback_marker() {
-    if let Ok(path) = rollback_marker_path() {
-        let _ = std::fs::remove_file(path);
+    let path = match rollback_marker_path() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::debug!(%error, "evdev rollback marker path unavailable");
+            return;
+        }
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "remove rollback marker failed");
+        }
     }
 }
 
@@ -597,8 +610,10 @@ mod tests {
 
     #[test]
     fn resolves_hook_pairs_from_config_array() {
-        let mut cfg = Config::default();
-        cfg.evdev_grab_hooks = vec!["sway".into(), "kde".into()];
+        let cfg = Config {
+            evdev_grab_hooks: vec!["sway".into(), "kde".into()],
+            ..Config::default()
+        };
         let hooks = resolve_hooks_in(&cfg, Path::new("/tmp/daklak-hooks")).unwrap();
         assert_eq!(
             hooks[0].set_path,
@@ -644,8 +659,10 @@ mod tests {
             std::fs::write(path, "#!/bin/sh\nexit 10\n").unwrap();
         }
 
-        let mut cfg = Config::default();
-        cfg.evdev_grab_hooks = vec!["sway".into(), "kde".into()];
+        let cfg = Config {
+            evdev_grab_hooks: vec!["sway".into(), "kde".into()],
+            ..Config::default()
+        };
         let dirs = vec![user_dir.clone(), packaged_dir.clone()];
         let hooks = resolve_hooks_in_dirs(&cfg, &dirs).unwrap();
 
@@ -683,8 +700,10 @@ mod tests {
             std::fs::write(p, "#!/bin/sh\nexit 10\n").unwrap();
         }
 
-        let mut cfg = Config::default();
-        cfg.evdev_grab_hooks = vec!["kde".into(), "x11".into()];
+        let cfg = Config {
+            evdev_grab_hooks: vec!["kde".into(), "x11".into()],
+            ..Config::default()
+        };
         let dirs = vec![config.clone(), local.clone(), system.clone()];
         let hooks = resolve_hooks_in_dirs(&cfg, &dirs).unwrap();
 
