@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::let_underscore_must_use,
+    )
+)]
+
 use async_trait::async_trait;
 
 #[cfg(feature = "x11")]

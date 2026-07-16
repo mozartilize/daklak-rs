@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use anyhow::{Context, Result};
 use x11rb::connection::Connection as _;
@@ -60,18 +60,17 @@ impl X11Bridge {
 
         let tree = conn.query_tree(root)?.reply()?;
         {
-            let mut guard = inner.write().unwrap();
+            let mut guard = write_windows(&inner)?;
             for win in tree.children {
-                let _ = conn.change_window_attributes(
-                    win,
-                    &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
-                );
+                if let Err(error) = subscribe_property_changes(&conn, win) {
+                    tracing::warn!(window = win, %error, "X11 property subscription failed");
+                }
                 if let Some(entry) = fetch_window(&conn, win) {
                     guard.insert(win, entry);
                 }
             }
         }
-        let _ = conn.flush();
+        conn.flush().context("flush initial X11 subscriptions")?;
 
         let inner_for_thread = inner.clone();
         std::thread::Builder::new()
@@ -108,6 +107,24 @@ impl X11Bridge {
         }
         false
     }
+}
+
+fn write_windows(
+    inner: &RwLock<HashMap<Window, X11Window>>,
+) -> Result<RwLockWriteGuard<'_, HashMap<Window, X11Window>>> {
+    inner
+        .write()
+        .map_err(|_| anyhow::anyhow!("X11 focus state lock poisoned"))
+}
+
+fn subscribe_property_changes(conn: &RustConnection, win: Window) -> Result<()> {
+    conn.change_window_attributes(
+        win,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+    )
+    .context("request X11 property events")?
+    .check()
+    .context("subscribe to X11 property events")
 }
 
 fn fetch_window(conn: &RustConnection, win: Window) -> Option<X11Window> {
@@ -182,10 +199,13 @@ fn run_event_loop(
         };
         match event {
             XEvent::CreateNotify(ev) if ev.parent == root => {
-                let _ = conn.change_window_attributes(
-                    ev.window,
-                    &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
-                );
+                if let Err(error) = subscribe_property_changes(&conn, ev.window) {
+                    tracing::warn!(
+                        window = ev.window,
+                        %error,
+                        "X11 property subscription failed"
+                    );
+                }
                 if let Some(entry) = fetch_window(&conn, ev.window) {
                     if let Ok(mut g) = inner.write() {
                         g.insert(ev.window, entry);
@@ -206,5 +226,23 @@ fn run_event_loop(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_window_map_returns_error_instead_of_panicking() {
+        let windows = Arc::new(RwLock::new(HashMap::new()));
+        let poison = windows.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.write().unwrap();
+            panic!("poison test lock");
+        })
+        .join();
+
+        assert!(write_windows(&windows).is_err());
     }
 }
