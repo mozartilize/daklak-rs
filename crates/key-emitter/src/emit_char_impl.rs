@@ -21,16 +21,33 @@ use viet_ime_keymap::{char_to_emit, plan_mod_dance};
 
 use crate::KeyEmitter;
 
+pub type ModifierSnapshot = (u32, u32, u32, u32);
+
+pub struct SyntheticMods<'a> {
+    pub pending: &'a mut u32,
+    pub expected: &'a mut VecDeque<ModifierSnapshot>,
+    pub emitted_at: &'a mut Option<Instant>,
+}
+
+pub struct EmitCharParams {
+    pub raw_mods: ModifierSnapshot,
+    pub held_user_kc: Option<u32>,
+    pub time: u32,
+    pub c: char,
+}
+
 pub fn emit_char(
     emitter: &mut dyn KeyEmitter,
-    synthetic_mods_pending: &mut u32,
-    synthetic_mods_expected: &mut VecDeque<(u32, u32, u32, u32)>,
-    synthetic_mods_emitted_at: &mut Option<Instant>,
-    raw_mods: (u32, u32, u32, u32),
-    held_user_kc: Option<u32>,
-    time: u32,
-    c: char,
+    synthetic_mods: &mut SyntheticMods<'_>,
+    params: EmitCharParams,
 ) -> bool {
+    let EmitCharParams {
+        raw_mods,
+        held_user_kc,
+        time,
+        c,
+    } = params;
+
     let Some(spec) = char_to_emit(c) else {
         tracing::trace!(char = %c, "emit_char: char not in synthetic keymap");
         return false;
@@ -55,9 +72,11 @@ pub fn emit_char(
     if let Some((emit_mask, _)) = dance {
         emitter.emit_modifiers(emit_mask, lat, lock, group);
         if echo {
-            synthetic_mods_expected.push_back((emit_mask, lat, lock, group));
-            *synthetic_mods_pending = synthetic_mods_expected.len() as u32;
-            *synthetic_mods_emitted_at = Some(Instant::now());
+            synthetic_mods
+                .expected
+                .push_back((emit_mask, lat, lock, group));
+            *synthetic_mods.pending = synthetic_mods.expected.len() as u32;
+            *synthetic_mods.emitted_at = Some(Instant::now());
         }
     }
     emitter.emit_key(time, spec.keycode, 1);
@@ -65,9 +84,11 @@ pub fn emit_char(
     if let Some((_, restore_mask)) = dance {
         emitter.emit_modifiers(restore_mask, lat, lock, group);
         if echo {
-            synthetic_mods_expected.push_back((restore_mask, lat, lock, group));
-            *synthetic_mods_pending = synthetic_mods_expected.len() as u32;
-            *synthetic_mods_emitted_at = Some(Instant::now());
+            synthetic_mods
+                .expected
+                .push_back((restore_mask, lat, lock, group));
+            *synthetic_mods.pending = synthetic_mods.expected.len() as u32;
+            *synthetic_mods.emitted_at = Some(Instant::now());
         }
     }
     tracing::trace!(

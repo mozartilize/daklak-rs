@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::signal;
 
-use viet_ime_wayland_adapter::wayland_handle::WaylandHandle;
+use viet_ime_wayland_adapter::wayland_handle::{is_would_block, WaylandHandle};
 use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler};
 
 use crate::handler::Daemon;
@@ -13,7 +13,7 @@ pub async fn core_loop_with_wayland_shutdown(
     let mut fb = wayland.focus_backend.take();
 
     loop {
-        wayland.event_queue.flush().ok();
+        wayland.flush_nonblocking()?;
         let read_guard = wayland.event_queue.prepare_read();
         let repeat_deadline = wayland.next_client_repeat_deadline();
 
@@ -22,9 +22,16 @@ pub async fn core_loop_with_wayland_shutdown(
 
             changed = shutdown_rx.changed() => {
                 drop(read_guard);
-                if changed.is_ok() && *shutdown_rx.borrow() {
-                    tracing::info!("wayland: supervisor shutdown requested");
-                    break;
+                match changed {
+                    Ok(()) if *shutdown_rx.borrow() => {
+                        tracing::info!("wayland: supervisor shutdown requested");
+                        break;
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, "Wayland shutdown owner dropped");
+                        break;
+                    }
                 }
             }
 
@@ -45,8 +52,14 @@ pub async fn core_loop_with_wayland_shutdown(
                 // releases the read intent. Skipping this caused the
                 // compositor's outbound buffer to fill, blocking
                 // scroll/sway's input delivery to every client.
-                if let Some(rg) = read_guard {
-                    rg.read().ok();
+                if let Some(read_guard) = read_guard {
+                    match read_guard.read() {
+                        Ok(_) => {}
+                        Err(error) if is_would_block(&error) => {
+                            tracing::trace!("Wayland read readiness was stale; retrying");
+                        }
+                        Err(error) => return Err(error).context("read Wayland events"),
+                    }
                 }
                 wayland.dispatch()?;
 
@@ -98,7 +111,9 @@ pub async fn core_loop_with_wayland_shutdown(
     if let Some(vk) = wayland.app.state.vk.take() {
         vk.destroy();
     }
-    wayland.event_queue.flush().ok();
+    if let Err(error) = wayland.flush_nonblocking() {
+        tracing::warn!(%error, "flush Wayland teardown requests failed");
+    }
 
     Ok(())
 }

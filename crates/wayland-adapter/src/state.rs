@@ -231,6 +231,12 @@ pub struct AdapterState {
     pub(crate) plasma_manager: Option<OrgKdePlasmaWindowManagement>,
 }
 
+impl Default for AdapterState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AdapterState {
     pub fn new() -> Self {
         Self {

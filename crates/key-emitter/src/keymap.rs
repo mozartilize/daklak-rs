@@ -5,7 +5,6 @@
 //! and `ei_keyboard.keymap` take an fd + size. The pure xkb text and
 //! Vietnamese inventory remain in `viet-ime-keymap::keymap_text()`.
 
-use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use anyhow::{anyhow, Context, Result};
@@ -27,7 +26,7 @@ pub fn build() -> Result<DaklakKeymap> {
     let text = keymap_text();
 
     let ctx = XkbCtx::new(CONTEXT_NO_FLAGS);
-    let _ = Keymap::new_from_string(
+    let _validated_keymap = Keymap::new_from_string(
         &ctx,
         text.clone(),
         KEYMAP_FORMAT_TEXT_V1,
@@ -35,7 +34,7 @@ pub fn build() -> Result<DaklakKeymap> {
     )
     .ok_or_else(|| anyhow!("xkbcommon rejected synthesized daklak keymap"))?;
 
-    let name = CString::new("daklak-keymap").unwrap();
+    let name = c"daklak-keymap";
     // SAFETY: memfd_create is a stable Linux syscall (>= 3.17).
     let raw = unsafe { libc::memfd_create(name.as_ptr(), 0) };
     if raw < 0 {

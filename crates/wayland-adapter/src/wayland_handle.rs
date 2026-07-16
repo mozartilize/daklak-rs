@@ -4,11 +4,19 @@ use std::time::Instant;
 use anyhow::Context;
 use tokio::io::unix::AsyncFd;
 
+use wayland_client::backend::WaylandError;
 use wayland_client::{Connection, EventQueue};
 
 use viet_ime_focus::{FocusBackend, FocusEvent};
 
 use crate::{AdapterHandler, WaylandAdapter};
+
+pub fn is_would_block(error: &WaylandError) -> bool {
+    matches!(
+        error,
+        WaylandError::Io(io_error) if io_error.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
 
 /// Simple wrapper around a Wayland socket FD for use with `AsyncFd`.
 pub struct WlRawFd(pub RawFd);
@@ -29,8 +37,19 @@ pub struct WaylandHandle<H: AdapterHandler> {
 }
 
 impl<H: AdapterHandler> WaylandHandle<H> {
+    pub fn flush_nonblocking(&self) -> anyhow::Result<()> {
+        match self.event_queue.flush() {
+            Ok(()) => Ok(()),
+            Err(error) if is_would_block(&error) => {
+                tracing::trace!("Wayland flush would block; retrying later");
+                Ok(())
+            }
+            Err(error) => Err(error).context("flush Wayland event queue"),
+        }
+    }
+
     pub fn dispatch(&mut self) -> anyhow::Result<bool> {
-        self.event_queue.flush().ok();
+        self.flush_nonblocking()?;
         self.event_queue
             .dispatch_pending(&mut self.app)
             .context("Wayland dispatch_pending")?;
@@ -88,5 +107,22 @@ impl<H: AdapterHandler> WaylandHandle<H> {
 
     pub fn wl_fd(&self) -> &AsyncFd<WlRawFd> {
         &self.wl_fd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_wayland_would_block_is_retryable() {
+        let error = WaylandError::Io(std::io::ErrorKind::WouldBlock.into());
+        assert!(is_would_block(&error));
+    }
+
+    #[test]
+    fn nested_wayland_broken_pipe_is_fatal() {
+        let error = WaylandError::Io(std::io::ErrorKind::BrokenPipe.into());
+        assert!(!is_would_block(&error));
     }
 }

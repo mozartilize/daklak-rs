@@ -344,7 +344,9 @@ impl<H: AdapterHandler> Dispatch<ZwlrForeignToplevelHandleV1, ()> for WaylandAda
                     }
                     if let Some(tx) = state.state.focus_tx.as_ref() {
                         tracing::trace!(?ev, "ftl: sending focus event");
-                        let _ = tx.send(ev);
+                        if tx.send(ev).is_err() {
+                            tracing::debug!("foreign-toplevel focus observer dropped");
+                        }
                     }
                 }
             }
@@ -357,7 +359,9 @@ impl<H: AdapterHandler> Dispatch<ZwlrForeignToplevelHandleV1, ()> for WaylandAda
                         *g = Some(ev.clone());
                     }
                     if let Some(tx) = state.state.focus_tx.as_ref() {
-                        let _ = tx.send(ev);
+                        if tx.send(ev).is_err() {
+                            tracing::debug!("foreign-toplevel focus observer dropped");
+                        }
                     }
                 }
                 handle.destroy();
@@ -450,7 +454,9 @@ impl<H: AdapterHandler> Dispatch<OrgKdePlasmaWindow, ()> for WaylandAdapter<H> {
                         *g = Some(ev.clone());
                     }
                     if let Some(tx) = state.state.focus_tx.as_ref() {
-                        let _ = tx.send(ev);
+                        if tx.send(ev).is_err() {
+                            tracing::debug!("Plasma focus observer dropped");
+                        }
                     }
                 }
                 handle.destroy();
@@ -494,7 +500,9 @@ impl<H: AdapterHandler> Dispatch<OrgKdePlasmaWindow, ()> for WaylandAdapter<H> {
             }
             if let Some(tx) = state.state.focus_tx.as_ref() {
                 tracing::trace!(?ev, "plasma: sending focus event");
-                let _ = tx.send(ev);
+                if tx.send(ev).is_err() {
+                    tracing::debug!("Plasma focus observer dropped");
+                }
             }
         }
     }
