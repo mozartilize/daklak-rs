@@ -37,6 +37,18 @@ pub struct Supervisor {
     pending_action: Option<PendingAction>,
 }
 
+fn request_transport_shutdown(shutdown_tx: &watch::Sender<bool>) {
+    if shutdown_tx.send(true).is_err() {
+        tracing::debug!("transport shutdown receiver already dropped");
+    }
+}
+
+fn send_command_reply(command: Command, reply: ControlReply) {
+    if command.resp.send(reply).is_err() {
+        tracing::debug!("control client disconnected before receiving reply");
+    }
+}
+
 fn backend_supported_at_build(backend: InputBackend) -> Result<()> {
     match backend {
         InputBackend::Ibus => {
@@ -112,7 +124,7 @@ impl Supervisor {
                 }
                 Some(PendingAction::Quit) => {
                     tracing::info!("quit requested via control");
-                    std::process::exit(0);
+                    return result;
                 }
                 None => {
                     // Evdev failed (hooks, preflight, grab, …): fall back to
@@ -156,6 +168,18 @@ impl Supervisor {
         *self.backend_tx.borrow()
     }
 
+    fn publish_backend(&self, backend: InputBackend) {
+        if self.backend_tx.send(backend).is_err() {
+            tracing::debug!(%backend, "backend observer dropped");
+        }
+    }
+
+    fn publish_enabled(&self, enabled: bool) {
+        if self.state_tx.send(enabled).is_err() {
+            tracing::debug!(enabled, "state observer dropped");
+        }
+    }
+
     // ── single-backend runners ───────────────────────────────────────────────
 
     async fn run_single(
@@ -192,19 +216,21 @@ impl Supervisor {
         // Publish the active backend so `daklak backend` and the tray reflect
         // the switch. Without this, a prior evdev announcement stays latched and
         // the reported backend is wrong after switching back to native.
-        let _ = self.backend_tx.send(InputBackend::Wayland);
+        self.publish_backend(InputBackend::Wayland);
 
         loop {
             if self.pending_action.is_some() {
-                let _ = shutdown_tx.send(true);
-                let _ = (&mut transport).await;
+                request_transport_shutdown(&shutdown_tx);
+                if let Err(error) = (&mut transport).await {
+                    tracing::warn!(%error, "transport failed during shutdown");
+                }
                 return Ok(());
             }
             tokio::select! {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break };
                     let reply = self.handle_cmd(cmd.kind);
-                    let _ = cmd.resp.send(reply);
+                    send_command_reply(cmd, reply);
                 }
                 result = &mut transport => {
                     return result;
@@ -227,7 +253,7 @@ impl Supervisor {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let transport = runtime.run_until_shutdown(shutdown_rx);
         tokio::pin!(transport);
-        let _ = self.backend_tx.send(InputBackend::Ibus);
+        self.publish_backend(InputBackend::Ibus);
 
         loop {
             if let Some(action) = self.pending_action.take() {
@@ -244,14 +270,14 @@ impl Supervisor {
                             // stream end, or emergency escape): resume the SAME
                             // live connection by looping again on `transport`.
                             None | Some(PendingAction::SwitchTo(InputBackend::Ibus)) => {
-                                let _ = self.backend_tx.send(InputBackend::Ibus);
+                                self.publish_backend(InputBackend::Ibus);
                                 continue;
                             }
                             // A different backend or quit: tear the IBus
                             // connection down and let the outer loop take over.
                             Some(other) => {
                                 self.pending_action = Some(other);
-                                let _ = shutdown_tx.send(true);
+                                request_transport_shutdown(&shutdown_tx);
                                 return Ok(());
                             }
                         }
@@ -260,7 +286,7 @@ impl Supervisor {
                     // connection and hand control back to the outer loop.
                     other => {
                         self.pending_action = Some(other);
-                        let _ = shutdown_tx.send(true);
+                        request_transport_shutdown(&shutdown_tx);
                         return Ok(());
                     }
                 }
@@ -269,9 +295,12 @@ impl Supervisor {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break };
                     let reply = self.handle_cmd(cmd.kind);
-                    let _ = cmd.resp.send(reply);
+                    send_command_reply(cmd, reply);
                 }
-                _result = &mut transport => {
+                result = &mut transport => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "ibus connection ended with error");
+                    }
                     tracing::info!("ibus connection closed");
                     return Ok(());
                 }
@@ -321,7 +350,7 @@ impl Supervisor {
         if let Some(ref suspend) = self.ibus_suspend {
             suspend.store(true, Ordering::Release);
         }
-        let _ = self.backend_tx.send(InputBackend::Evdev);
+        self.publish_backend(InputBackend::Evdev);
         tracing::info!("evdev grab backend active; use `daklak backend native` to release grabs");
 
         let mut daemon = Daemon::new(
@@ -379,17 +408,22 @@ impl Supervisor {
 
         loop {
             if self.pending_action.is_some() {
-                let _ = shutdown_tx.send(true);
-                let _ = (&mut transport).await;
+                request_transport_shutdown(&shutdown_tx);
+                if let Err(error) = (&mut transport).await {
+                    tracing::warn!(%error, "transport failed during shutdown");
+                }
                 break;
             }
             tokio::select! {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break };
                     let reply = self.handle_cmd(cmd.kind);
-                    let _ = cmd.resp.send(reply);
+                    send_command_reply(cmd, reply);
                 }
-                _result = &mut transport => {
+                result = &mut transport => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "evdev-in-IBus transport ended with error");
+                    }
                     break;
                 }
             }
@@ -477,20 +511,22 @@ impl Supervisor {
         };
         tokio::pin!(transport);
 
-        let _ = self.backend_tx.send(InputBackend::Evdev);
+        self.publish_backend(InputBackend::Evdev);
         tracing::info!("evdev grab backend active; use `daklak backend native` to release grabs");
 
         loop {
             if self.pending_action.is_some() {
-                let _ = shutdown_tx.send(true);
-                let _ = (&mut transport).await;
+                request_transport_shutdown(&shutdown_tx);
+                if let Err(error) = (&mut transport).await {
+                    tracing::warn!(%error, "transport failed during shutdown");
+                }
                 return Ok(());
             }
             tokio::select! {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break Ok(()) };
                     let reply = self.handle_cmd(cmd.kind);
-                    let _ = cmd.resp.send(reply);
+                    send_command_reply(cmd, reply);
                 }
                 result = &mut transport => {
                     return result;
@@ -513,17 +549,17 @@ impl Supervisor {
             CmdKind::Toggle => {
                 let v = !self.enabled.load(Ordering::Acquire);
                 self.enabled.store(v, Ordering::Release);
-                let _ = self.state_tx.send(v);
+                self.publish_enabled(v);
                 ControlReply::Enabled(v)
             }
             CmdKind::Enable => {
                 self.enabled.store(true, Ordering::Release);
-                let _ = self.state_tx.send(true);
+                self.publish_enabled(true);
                 ControlReply::Enabled(true)
             }
             CmdKind::Disable => {
                 self.enabled.store(false, Ordering::Release);
-                let _ = self.state_tx.send(false);
+                self.publish_enabled(false);
                 ControlReply::Enabled(false)
             }
             CmdKind::Status => ControlReply::Enabled(self.enabled.load(Ordering::Acquire)),
@@ -564,9 +600,11 @@ mod tests {
 
     #[test]
     fn native_resolves_from_config_even_when_evdev_startup_is_enabled() {
-        let mut cfg = Config::default();
-        cfg.enable_wayland = true;
-        cfg.enable_evdev_grab = true;
+        let cfg = Config {
+            enable_wayland: true,
+            enable_evdev_grab: true,
+            ..Config::default()
+        };
         let enabled = Arc::new(AtomicBool::new(true));
         let (state_tx, _) = watch::channel(true);
         let (backend_tx, _) = watch::channel(InputBackend::Auto);
@@ -581,8 +619,10 @@ mod tests {
     #[test]
     #[cfg(feature = "evdev_grab")]
     fn toggle_resolves_opposite_current_backend() {
-        let mut cfg = Config::default();
-        cfg.enable_wayland = true;
+        let cfg = Config {
+            enable_wayland: true,
+            ..Config::default()
+        };
         let enabled = Arc::new(AtomicBool::new(true));
         let (state_tx, _) = watch::channel(true);
         let (backend_tx, _) = watch::channel(InputBackend::Wayland);

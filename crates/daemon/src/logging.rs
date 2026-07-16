@@ -62,6 +62,21 @@ fn normalize_directive(raw: &str) -> Result<String> {
     Ok(format!("{target}={level}"))
 }
 
+#[derive(Clone)]
+struct SharedFile(Arc<File>);
+
+impl Write for SharedFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut file = &*self.0;
+        file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut file = &*self.0;
+        file.flush()
+    }
+}
+
 enum LogWriter {
     Stdout,
     File(Arc<File>),
@@ -73,10 +88,7 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogWriter {
     fn make_writer(&'a self) -> Self::Writer {
         match self {
             LogWriter::Stdout => Box::new(io::stdout()),
-            LogWriter::File(file) => Box::new(
-                file.try_clone()
-                    .expect("failed to clone log file handle"),
-            ),
+            LogWriter::File(file) => Box::new(SharedFile(file.clone())),
         }
     }
 }
@@ -113,6 +125,27 @@ mod tests {
     fn debug_maps_to_trace() {
         let s = build_directives("debug", &["daklak=debug".to_owned()]).unwrap();
         assert_eq!(s, "trace,daklak=trace");
+    }
+
+    #[test]
+    fn shared_file_writers_append_without_cloning_file_handles() {
+        let path = std::env::temp_dir().join(format!("daklak-shared-log-{}", std::process::id()));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let shared = SharedFile(Arc::new(file));
+        let mut first = shared.clone();
+        let mut second = shared;
+
+        first.write_all(b"first\n").unwrap();
+        second.write_all(b"second\n").unwrap();
+        second.flush().unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
