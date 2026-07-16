@@ -73,8 +73,13 @@ impl XkbState {
     #[cfg(feature = "test-util")]
     pub fn us_for_test() -> Self {
         let ctx = XkbContext::new(CONTEXT_NO_FLAGS);
-        let keymap = Keymap::new_from_names(&ctx, "", "", "us", "", None, KEYMAP_COMPILE_NO_FLAGS)
-            .expect("build us test keymap");
+        let Some(keymap) =
+            Keymap::new_from_names(&ctx, "", "", "us", "", None, KEYMAP_COMPILE_NO_FLAGS)
+        else {
+            // INVARIANT: this test-only constructor uses xkbcommon's built-in
+            // `us` layout and requires the test environment's XKB data package.
+            panic!("xkbcommon could not build the test `us` keymap");
+        };
         Self::from_keymap(keymap)
     }
 

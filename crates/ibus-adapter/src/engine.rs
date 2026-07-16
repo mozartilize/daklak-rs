@@ -140,6 +140,12 @@ pub struct Engine<D> {
 
 /// Trait that the daemon must implement to hook into the ibus adapter.
 /// Implemented by crates/daemon handler::Daemon.
+enum IbusDecision {
+    ForwardRaw,
+    Consumed,
+    Apply(IbusSink),
+}
+
 pub trait IbusHandler: Send {
     fn process_key(&mut self, evdev: u32, ch: Option<char>) -> KeyDecision;
     fn apply_with_sink(&mut self, backspaces: usize, commit: &str, time: u32, sink: &mut IbusSink);
@@ -185,31 +191,29 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
         let mods = ibus_state_to_modifiers(state);
 
         // Hold lock only for sync daemon calls; drop before .await.
-        let (decision, sink_opt) = {
-            let mut s = self.state.lock().await;
-            s.daemon.set_modifiers(mods);
-            let decision = s.daemon.process_key(evdev, ch);
-            let sink_opt = if let KeyDecision::Apply {
-                ref backspaces,
-                ref commit,
-                ..
-            } = decision
-            {
-                let mut sink = IbusSink::new();
-                s.daemon.apply_with_sink(*backspaces, commit, 0, &mut sink);
-                Some(sink)
-            } else {
-                None
-            };
-            (decision, sink_opt)
+        let decision = {
+            let mut state = self.state.lock().await;
+            state.daemon.set_modifiers(mods);
+            match state.daemon.process_key(evdev, ch) {
+                KeyDecision::ForwardRaw => IbusDecision::ForwardRaw,
+                KeyDecision::Consumed => IbusDecision::Consumed,
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    let mut sink = IbusSink::new();
+                    state
+                        .daemon
+                        .apply_with_sink(backspaces, &commit, 0, &mut sink);
+                    IbusDecision::Apply(sink)
+                }
+            }
             // lock dropped here
         };
 
         match decision {
-            KeyDecision::ForwardRaw => false,
-            KeyDecision::Consumed => true,
-            KeyDecision::Apply { .. } => {
-                let sink = sink_opt.expect("Apply always produces sink");
+            IbusDecision::ForwardRaw => false,
+            IbusDecision::Consumed => true,
+            IbusDecision::Apply(sink) => {
                 for d in &sink.deletes {
                     if let Err(e) =
                         Engine::<D>::delete_surrounding_text(&emitter, d.offset, d.n_chars).await

@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::let_underscore_must_use,
+    )
+)]
+
 //! IBus engine adapter for the daklak Vietnamese IME.
 //!
 //! Implements `org.freedesktop.IBus.Factory` + `org.freedesktop.IBus.Engine`

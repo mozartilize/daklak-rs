@@ -20,28 +20,32 @@ fn empty_attachments() -> Dict<'static, 'static> {
 /// `IBusAttrList` with no attributes → `(sa{sv}av)`.
 pub fn ibus_attr_list() -> Value<'static> {
     let empty_av = Array::new(&Signature::Variant);
-    Value::Structure(
-        StructureBuilder::new()
-            .append_field(Value::from("IBusAttrList"))
-            .append_field(Value::Dict(empty_attachments()))
-            .append_field(Value::Array(empty_av))
-            .build()
-            .expect("non-empty structure"),
-    )
+    let structure = StructureBuilder::new()
+        .append_field(Value::from("IBusAttrList"))
+        .append_field(Value::Dict(empty_attachments()))
+        .append_field(Value::Array(empty_av))
+        .build();
+    // INVARIANT: the builder above always appends three fields.
+    match structure {
+        Ok(structure) => Value::Structure(structure),
+        Err(error) => panic!("IBusAttrList builder violated its field invariant: {error}"),
+    }
 }
 
 /// `IBusText` wrapping `text` → `(sa{sv}sv)`.
 pub fn ibus_text(text: &str) -> Value<'static> {
     let attrs = Value::Value(Box::new(ibus_attr_list()));
-    Value::Structure(
-        StructureBuilder::new()
-            .append_field(Value::from("IBusText"))
-            .append_field(Value::Dict(empty_attachments()))
-            .append_field(Value::from(text.to_string()))
-            .append_field(attrs)
-            .build()
-            .expect("non-empty structure"),
-    )
+    let structure = StructureBuilder::new()
+        .append_field(Value::from("IBusText"))
+        .append_field(Value::Dict(empty_attachments()))
+        .append_field(Value::from(text.to_string()))
+        .append_field(attrs)
+        .build();
+    // INVARIANT: the builder above always appends four fields.
+    match structure {
+        Ok(structure) => Value::Structure(structure),
+        Err(error) => panic!("IBusText builder violated its field invariant: {error}"),
+    }
 }
 
 #[cfg(test)]
