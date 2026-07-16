@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::let_underscore_must_use,
+    )
+)]
+
 //! Evdev-only adapter — daemon-owned EVIOCGRAB of `/dev/input/event*`
 //! keyboards, composition through the engine, emit through uinput.
 //!

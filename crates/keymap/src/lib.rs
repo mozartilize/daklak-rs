@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::let_underscore_must_use,
+    )
+)]
+
 //! Synthetic xkb keymap data + text generator, plus a thin xkbcommon
 //! wrapper (`XkbState`) shared across adapters.
 //!
@@ -654,7 +663,7 @@ mod tests {
         // every slot in SAFE_KEYCODES — XWayland clients now receive
         // these chars alongside native-Wayland ones.
         for c in ['à', 'ầ', 'ế', 'ờ', 'ữ', 'ặ', 'đ', 'Ầ', 'Ế', 'Đ'] {
-            let s = char_to_emit(c).expect(&format!("missing: {c}"));
+            let s = char_to_emit(c).unwrap_or_else(|| panic!("missing: {c}"));
             assert!(s.keycode <= 247, "{c} keycode {} > 247 (X11 ceiling)", s.keycode);
         }
     }
