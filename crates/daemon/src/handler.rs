@@ -498,8 +498,10 @@ mod tests {
 
         #[test]
         fn activation_honors_legacy_tone_config() {
-            let mut cfg = Config::default();
-            cfg.modern_style = false;
+            let cfg = Config {
+                modern_style: false,
+                ..Config::default()
+            };
             let mut daemon = Daemon::new(
                 cfg,
                 Arc::new(AtomicBool::new(true)),
@@ -871,11 +873,7 @@ mod tests {
                 matches!(decision, KeyDecision::Consumed),
                 "nav repeat forwards + consumes"
             );
-            assert_eq!(
-                NAV_KEYS.contains(&KEY_LEFT),
-                true,
-                "sanity: Left is a nav key"
-            );
+            assert!(NAV_KEYS.contains(&KEY_LEFT), "sanity: Left is a nav key");
         }
 
         #[test]
@@ -1119,8 +1117,10 @@ mod tests {
                 modern_style: false,
                 enable_evdev_grab: false,
             });
-            let mut cfg = Config::default();
-            cfg.modern_style = false;
+            let cfg = Config {
+                modern_style: false,
+                ..Config::default()
+            };
             let mut d = Daemon::new(cfg, Arc::new(AtomicBool::new(true)), rx);
             d.router.current_active = true;
             let mut composer =

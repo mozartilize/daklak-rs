@@ -3,22 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use viet_ime_engine::InputMethod;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MethodConfig {
+    #[default]
     Telex,
     Vni,
     Viqr,
 }
 
-impl Default for MethodConfig {
-    fn default() -> Self {
-        MethodConfig::Telex
-    }
-}
-
 impl MethodConfig {
-    pub fn to_engine(&self) -> InputMethod {
+    pub fn to_engine(self) -> InputMethod {
         match self {
             MethodConfig::Telex => InputMethod::Telex,
             MethodConfig::Vni => InputMethod::Vni,
@@ -133,7 +128,7 @@ impl Config {
     pub fn load_from(path: Option<PathBuf>) -> Result<Self> {
         let mut cfg = match path {
             Some(ref p) => Self::load_file(p)?,
-            None => Self::load_default_file()
+            None => Self::load_default_file()?
                 .unwrap_or_else(|| Self::default_with_config_path(Self::default_config_path())),
         };
 
@@ -196,12 +191,26 @@ impl Config {
         Ok(cfg)
     }
 
-    fn load_default_file() -> Option<Self> {
-        let path = Self::default_config_path()?;
-        let text = std::fs::read_to_string(&path).ok()?;
-        let mut cfg: Self = toml::from_str(&text).ok()?;
-        cfg.config_path = Some(path);
-        Some(cfg)
+    fn load_default_file() -> Result<Option<Self>> {
+        let Some(path) = Self::default_config_path() else {
+            return Ok(None);
+        };
+        Self::load_optional_file(&path)
+    }
+
+    fn load_optional_file(path: &Path) -> Result<Option<Self>> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read config file: {}", path.display()));
+            }
+        };
+        let mut cfg: Self = toml::from_str(&text)
+            .with_context(|| format!("failed to parse config file: {}", path.display()))?;
+        cfg.config_path = Some(path.to_owned());
+        Ok(Some(cfg))
     }
 
     fn default_config_path() -> Option<PathBuf> {
@@ -217,9 +226,10 @@ impl Config {
     }
 
     fn default_with_config_path(config_path: Option<PathBuf>) -> Self {
-        let mut cfg = Self::default();
-        cfg.config_path = config_path;
-        cfg
+        Self {
+            config_path,
+            ..Self::default()
+        }
     }
 
     fn load_file(path: &Path) -> Result<Self> {
@@ -285,6 +295,20 @@ log_path = "/tmp/daklak.log"
         assert_eq!(cfg.log_path, "/tmp/daklak.log");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_optional_default_config_returns_error() {
+        let path = std::env::temp_dir().join(format!(
+            "daklak-invalid-default-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "method = [invalid").unwrap();
+
+        let error = Config::load_optional_file(&path).unwrap_err();
+
+        assert!(error.to_string().contains("failed to parse config file"));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
