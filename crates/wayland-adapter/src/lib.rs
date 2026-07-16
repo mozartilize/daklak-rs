@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::let_underscore_must_use,
+    )
+)]
+
 //! Wayland adapter — pure Wayland protocol I/O layer for the daklak Vietnamese IME.
 //!
 //! Owns:
@@ -430,7 +439,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                     .state
                     .xkb
                     .as_ref()
-                    .map_or(true, |xkb| xkb.key_repeats(key));
+                    .is_none_or(|xkb| xkb.key_repeats(key));
                 if repeatable {
                     self.state.client_repeat.arm(key, time, Instant::now());
                 }

@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::let_underscore_must_use,
+    )
+)]
+
 //! Unified key-emission backends for daklak.
 //!
 //! Three sites emit a single Wayland-shaped key event today:
@@ -24,7 +33,7 @@ mod uinput;
 mod vk_v1;
 mod vk_v2;
 
-pub use emit_char_impl::emit_char;
+pub use emit_char_impl::{emit_char, EmitCharParams, ModifierSnapshot, SyntheticMods};
 pub use keymap::{build, DaklakKeymap};
 pub use uinput::UinputEmitter;
 pub use vk_v1::VkV1Emitter;

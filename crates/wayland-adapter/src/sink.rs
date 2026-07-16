@@ -42,12 +42,22 @@ fn v1_keysym_needs_modifier_guard(
     !is_unmapped && !commit_string_functional && (depressed | latched | locked) != 0
 }
 
-fn forward_backspace_needs_modifier_guard(
-    key_code: u32,
-    raw_mods: (u32, u32, u32, u32),
-) -> bool {
+fn forward_backspace_needs_modifier_guard(key_code: u32, raw_mods: (u32, u32, u32, u32)) -> bool {
     let (depressed, latched, locked, _) = raw_mods;
     key_code == 14 && (depressed | latched | locked) != 0
+}
+
+fn flush_connection(conn: Option<&wayland_client::Connection>, operation: &'static str) -> bool {
+    let Some(conn) = conn else {
+        return true;
+    };
+    match conn.flush() {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, operation, "Wayland emission flush failed");
+            false
+        }
+    }
 }
 
 /// Bridges `edit_strategy::OutputSink` to live Wayland proxy calls.
@@ -223,15 +233,20 @@ impl OutputSink for AdapterSink<'_> {
             );
             return false;
         };
+        let mut synthetic_mods = viet_ime_key_emitter::SyntheticMods {
+            pending: self.synthetic_mods_pending,
+            expected: self.synthetic_mods_expected,
+            emitted_at: self.synthetic_mods_emitted_at,
+        };
         viet_ime_key_emitter::emit_char(
             emitter,
-            self.synthetic_mods_pending,
-            self.synthetic_mods_expected,
-            self.synthetic_mods_emitted_at,
-            self.raw_mods,
-            self.held_user_kc,
-            time,
-            c,
+            &mut synthetic_mods,
+            viet_ime_key_emitter::EmitCharParams {
+                raw_mods: self.raw_mods,
+                held_user_kc: self.held_user_kc,
+                time,
+                c,
+            },
         )
     }
 
@@ -256,8 +271,10 @@ impl OutputSink for AdapterSink<'_> {
                 let mut fallback_buf = String::new();
                 for c in text.chars() {
                     if self.vk_commit_char(time, c) {
-                        if let Some(conn) = self.conn {
-                            let _ = conn.flush();
+                        if !flush_connection(self.conn, "flush synthetic character") {
+                            // Emission was attempted. Returning false would replay
+                            // the replacement through commit_string and risk duplicates.
+                            return true;
                         }
                         continue;
                     }
@@ -296,8 +313,8 @@ impl OutputSink for AdapterSink<'_> {
                     if !self.vk_commit_char(time, c) {
                         return false;
                     }
-                    if let Some(conn) = self.conn {
-                        let _ = conn.flush();
+                    if !flush_connection(self.conn, "flush key-channel character") {
+                        return true;
                     }
                 }
                 true
@@ -399,15 +416,19 @@ impl AdapterSink<'_> {
                     self.raw_mods.3,
                 );
             }
-            if let Some(conn) = self.conn {
-                let _ = conn.flush();
+            if !flush_connection(self.conn, "flush input-method keysym") {
+                return true;
             }
-            tracing::trace!(c = %c, sym = sym.raw(), "commit_via_keysym: keysym emit + barrier (unmapped)");
+            tracing::trace!(
+                c = %c,
+                sym = sym.raw(),
+                "commit_via_keysym: keysym emit + barrier (unmapped)"
+            );
         }
 
-        if let Some(conn) = self.conn {
-            let _ = conn.flush();
-        }
+        // A failed final flush is observed above, but this channel was still
+        // attempted and must not trigger a second-channel replay.
+        let _flushed = flush_connection(self.conn, "flush input-method replacement");
         true
     }
 }
