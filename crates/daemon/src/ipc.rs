@@ -6,6 +6,9 @@ use std::os::unix::fs::PermissionsExt;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::task::{JoinError, JoinSet};
+
+use anyhow::Context;
 
 use crate::backend::BackendTarget;
 use crate::control::{CmdKind, CmdTx, Command};
@@ -17,15 +20,25 @@ pub struct IpcServer {
     pub path: PathBuf,
 }
 
+fn remove_socket(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "remove IPC socket failed");
+        }
+    }
+}
+
 impl IpcServer {
     pub async fn bind() -> Option<Self> {
         let path = socket_path()?;
-        let _ = std::fs::remove_file(&path);
+        remove_socket(&path);
         match UnixListener::bind(&path) {
             Ok(listener) => {
                 if let Err(e) = restrict_socket_permissions(&path) {
                     tracing::warn!(path = %path.display(), error = %e, "IPC socket chmod failed");
-                    let _ = std::fs::remove_file(&path);
+                    remove_socket(&path);
                     return None;
                 }
                 tracing::info!("IPC socket bound at {}", path.display());
@@ -39,19 +52,25 @@ impl IpcServer {
     }
 
     pub async fn accept(&self) -> std::io::Result<UnixStream> {
-        let (stream, _addr) = self.listener.accept().await?;
-        #[cfg(target_os = "linux")]
-        {
-            let peer = peer_uid(&stream)?;
-            validate_peer_uid(peer, current_euid())?;
+        loop {
+            let (stream, _addr) = self.listener.accept().await?;
+            #[cfg(target_os = "linux")]
+            {
+                let peer_result =
+                    peer_uid(&stream).and_then(|peer| validate_peer_uid(peer, current_euid()));
+                if let Err(error) = peer_result {
+                    tracing::warn!(%error, "rejected IPC peer");
+                    continue;
+                }
+            }
+            return Ok(stream);
         }
-        Ok(stream)
     }
 }
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        remove_socket(&self.path);
     }
 }
 
@@ -159,40 +178,129 @@ async fn read_ipc_line(
     String::from_utf8(buf).map_err(|_| "command must be UTF-8".to_owned())
 }
 
-pub async fn handle_connection(stream: UnixStream, cmd_tx: CmdTx) {
+pub async fn handle_connection(stream: UnixStream, cmd_tx: CmdTx) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
     let line = match read_ipc_line(&mut reader).await {
         Ok(line) => line,
-        Err(e) => {
-            let _ = writer.write_all(format!("err {e}\n").as_bytes()).await;
-            return;
+        Err(error) => {
+            writer
+                .write_all(format!("err {error}\n").as_bytes())
+                .await
+                .context("write IPC input error")?;
+            return Ok(());
         }
     };
 
     let kind = match parse_ipc_command(&line) {
         Ok(kind) => kind,
-        Err(e) => {
-            let _ = writer.write_all(format!("err {e}\n").as_bytes()).await;
-            return;
+        Err(error) => {
+            writer
+                .write_all(format!("err {error}\n").as_bytes())
+                .await
+                .context("write IPC command error")?;
+            return Ok(());
         }
     };
 
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    if cmd_tx.send(Command { kind, resp: resp_tx }).await.is_err() {
-        let _ = writer.write_all(b"err daemon unavailable\n").await;
-        return;
+    if cmd_tx
+        .send(Command {
+            kind,
+            resp: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        writer
+            .write_all(b"err daemon unavailable\n")
+            .await
+            .context("write unavailable IPC response")?;
+        anyhow::bail!("daemon command channel closed");
     }
 
     match resp_rx.await {
-        Ok(reply) => {
-            let _ = writer.write_all(format!("{}\n", reply.as_ipc_line()).as_bytes()).await;
-        }
-        Err(_) => {
-            let _ = writer.write_all(b"err no reply\n").await;
+        Ok(reply) => writer
+            .write_all(format!("{}\n", reply.as_ipc_line()).as_bytes())
+            .await
+            .context("write IPC response")?,
+        Err(error) => {
+            writer
+                .write_all(b"err no reply\n")
+                .await
+                .context("write missing IPC response")?;
+            return Err(error).context("daemon dropped IPC response");
         }
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskDisposition {
+    Continue,
+    Shutdown,
+}
+
+fn classify_connection_join(joined: Result<anyhow::Result<()>, JoinError>) -> TaskDisposition {
+    match joined {
+        Ok(Ok(())) => TaskDisposition::Continue,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "IPC connection ended with error");
+            TaskDisposition::Continue
+        }
+        Err(error) if error.is_cancelled() => {
+            tracing::debug!(%error, "IPC connection task cancelled");
+            TaskDisposition::Shutdown
+        }
+        Err(error) => {
+            tracing::error!(%error, "IPC connection task panicked");
+            TaskDisposition::Continue
+        }
+    }
+}
+
+pub async fn serve(server: IpcServer, cmd_tx: CmdTx) -> anyhow::Result<()> {
+    const ACCEPT_DELAYS: [std::time::Duration; 2] = [
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_millis(500),
+    ];
+    let mut accept_failures = 0_usize;
+    let mut connections = JoinSet::new();
+    let result = loop {
+        tokio::select! {
+            accepted = server.accept() => match accepted {
+                Ok(stream) => {
+                    accept_failures = 0;
+                    connections.spawn(handle_connection(stream, cmd_tx.clone()));
+                }
+                Err(error) => {
+                    if accept_failures == ACCEPT_DELAYS.len() {
+                        break Err(error).context(
+                            "IPC accept failed three consecutive times",
+                        );
+                    }
+                    let delay = ACCEPT_DELAYS[accept_failures];
+                    accept_failures += 1;
+                    tracing::warn!(%error, ?delay, "IPC accept failed; retrying");
+                    tokio::time::sleep(delay).await;
+                }
+            },
+            joined = connections.join_next(), if !connections.is_empty() => {
+                if let Some(joined) = joined {
+                    if classify_connection_join(joined) == TaskDisposition::Shutdown {
+                        break Ok(());
+                    }
+                }
+            }
+        }
+    };
+
+    connections.abort_all();
+    while let Some(joined) = connections.join_next().await {
+        classify_connection_join(joined);
+    }
+    result
 }
 
 pub fn socket_path() -> Option<PathBuf> {
@@ -309,9 +417,15 @@ mod tests {
         let mut reply = String::new();
         reader.read_line(&mut reply).await.unwrap();
 
-        assert!(reply.starts_with("err command too long"), "reply was {reply:?}");
-        assert!(cmd_rx.try_recv().is_err(), "overlong command must not dispatch");
-        task.await.unwrap();
+        assert!(
+            reply.starts_with("err command too long"),
+            "reply was {reply:?}"
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "overlong command must not dispatch"
+        );
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -330,6 +444,60 @@ mod tests {
         let mut reply = String::new();
         reader.read_line(&mut reply).await.unwrap();
         assert_eq!(reply, "on\n");
-        task.await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_ipc_connection_does_not_stop_later_connections() {
+        let root = std::env::temp_dir().join(format!("daklak-ipc-serve-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("daklak.sock");
+        let server = IpcServer {
+            listener: UnixListener::bind(&path).unwrap(),
+            path: path.clone(),
+        };
+        let (cmd_tx, mut cmd_rx) = crate::control::channel();
+        let server_task = tokio::spawn(serve(server, cmd_tx));
+
+        let mut bad = UnixStream::connect(&path).await.unwrap();
+        let mut overlong = vec![b'x'; MAX_IPC_LINE_BYTES + 1];
+        overlong.push(b'\n');
+        bad.write_all(&overlong).await.unwrap();
+        let mut bad_reply = String::new();
+        BufReader::new(bad).read_line(&mut bad_reply).await.unwrap();
+        assert!(bad_reply.starts_with("err command too long"));
+
+        let mut good = UnixStream::connect(&path).await.unwrap();
+        good.write_all(b"status\n").await.unwrap();
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .unwrap()
+            .expect("valid command dispatched after failed connection");
+        assert!(matches!(cmd.kind, CmdKind::Status));
+        cmd.resp
+            .send(crate::control::ControlReply::Enabled(true))
+            .unwrap();
+        let mut good_reply = String::new();
+        BufReader::new(good)
+            .read_line(&mut good_reply)
+            .await
+            .unwrap();
+        assert_eq!(good_reply, "on\n");
+
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn connection_join_panic_is_observed_and_listener_continues() {
+        let joined = tokio::spawn(async {
+            panic!("connection task panic for classifier test");
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+
+        assert_eq!(classify_connection_join(joined), TaskDisposition::Continue);
     }
 }

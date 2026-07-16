@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::let_underscore_must_use,
+    )
+)]
+
 mod backend;
 mod composer;
 mod config;
@@ -115,7 +124,11 @@ where
                 set_command(&mut cli.command, Command::Backend, &arg)?;
                 if let Some(next) = args.peek() {
                     if !next.starts_with('-') {
-                        let raw = args.next().unwrap();
+                        let Some(raw) = args.next() else {
+                            return Err(anyhow::anyhow!(
+                                "daklak: backend argument disappeared during parsing"
+                            ));
+                        };
                         cli.backend_arg =
                             Some(backend::BackendTarget::parse(&raw).ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -264,6 +277,90 @@ fn ipc_send(cmd: &str) -> Result<String> {
     Ok(reply.trim().to_owned())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundTask {
+    Ipc,
+    Tray,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundEvent {
+    Exited(BackgroundTask),
+    Failed(BackgroundTask),
+    Cancelled,
+    Panicked,
+}
+
+fn classify_background_join(
+    joined: Result<(BackgroundTask, anyhow::Result<()>), tokio::task::JoinError>,
+) -> BackgroundEvent {
+    match joined {
+        Ok((task, Ok(()))) => {
+            tracing::info!(?task, "optional background subsystem stopped");
+            BackgroundEvent::Exited(task)
+        }
+        Ok((task, Err(error))) => {
+            tracing::warn!(?task, %error, "optional background subsystem disabled");
+            BackgroundEvent::Failed(task)
+        }
+        Err(error) if error.is_cancelled() => {
+            tracing::debug!(%error, "background task cancelled");
+            BackgroundEvent::Cancelled
+        }
+        Err(error) => {
+            tracing::error!(%error, "background task panicked; daemon continuing");
+            BackgroundEvent::Panicked
+        }
+    }
+}
+
+async fn run_services(config: config::Config) -> Result<()> {
+    let enabled = Arc::new(AtomicBool::new(true));
+    let (cmd_tx, cmd_rx) = control::channel();
+    let (state_tx, state_rx) = tokio::sync::watch::channel(true);
+    let (backend_tx, backend_rx) = tokio::sync::watch::channel(backend::InputBackend::Auto);
+    let (config_change_tx, config_change_rx) =
+        tokio::sync::watch::channel(control::ConfigChange::default());
+    let mut background = tokio::task::JoinSet::new();
+
+    if let Some(server) = ipc::IpcServer::bind().await {
+        let tx = cmd_tx.clone();
+        background.spawn(async move { (BackgroundTask::Ipc, ipc::serve(server, tx).await) });
+    }
+    let tray_config = config.clone();
+    background.spawn(async move {
+        let result =
+            tray::run_tray(cmd_tx, state_rx, backend_rx, config_change_tx, tray_config).await;
+        (BackgroundTask::Tray, result)
+    });
+
+    let supervisor = transport::supervisor::Supervisor::new(
+        config,
+        enabled,
+        state_tx,
+        backend_tx,
+        config_change_rx,
+    );
+    let supervisor_run = supervisor.run(cmd_rx);
+    tokio::pin!(supervisor_run);
+    let result = loop {
+        tokio::select! {
+            result = &mut supervisor_run => break result,
+            joined = background.join_next(), if !background.is_empty() => {
+                if let Some(joined) = joined {
+                    classify_background_join(joined);
+                }
+            }
+        }
+    };
+
+    background.abort_all();
+    while let Some(joined) = background.join_next().await {
+        classify_background_join(joined);
+    }
+    result
+}
+
 fn main() -> Result<()> {
     let cli = parse_cli()?;
 
@@ -332,51 +429,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    rt.block_on(async move {
-        // --- shared control plane (works in every mode) ---
-        let enabled = Arc::new(AtomicBool::new(true));
-        let (cmd_tx, cmd_rx) = control::channel();
-        let (state_tx, state_rx) = tokio::sync::watch::channel(true);
-        let (backend_tx, _backend_rx) = tokio::sync::watch::channel(backend::InputBackend::Auto);
-        let (config_change_tx, config_change_rx) =
-            tokio::sync::watch::channel(control::ConfigChange::default());
-
-        if let Some(server) = ipc::IpcServer::bind().await {
-            let tx = cmd_tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    match server.accept().await {
-                        Ok(stream) => {
-                            let tx = tx.clone();
-                            tokio::spawn(ipc::handle_connection(stream, tx));
-                        }
-                        Err(e) => {
-                            tracing::warn!(?e, "IPC accept errored — IPC task exiting");
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-
-        tray::spawn_tray(
-            cmd_tx.clone(),
-            state_rx,
-            _backend_rx,
-            config_change_tx.clone(),
-            &config,
-        );
-
-        // --- supervisor owns transport lifecycle and command dispatch ---
-        let supervisor = transport::supervisor::Supervisor::new(
-            config,
-            enabled.clone(),
-            state_tx,
-            backend_tx,
-            config_change_rx,
-        );
-        supervisor.run(cmd_rx).await
-    })
+    rt.block_on(run_services(config))
 }
 
 #[cfg(test)]
@@ -403,5 +456,18 @@ mod cli_tests {
 
         let cli = parse_from(&["backend", "toggle"]).unwrap();
         assert_eq!(cli.backend_arg, Some(BackendTarget::Toggle));
+    }
+
+    #[tokio::test]
+    async fn background_task_panic_is_observed_as_nonfatal_failure() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async {
+            panic!("background task panic for classifier test");
+            #[allow(unreachable_code)]
+            (BackgroundTask::Tray, Ok(()))
+        });
+        let joined = tasks.join_next().await.unwrap();
+
+        assert_eq!(classify_background_join(joined), BackgroundEvent::Panicked);
     }
 }

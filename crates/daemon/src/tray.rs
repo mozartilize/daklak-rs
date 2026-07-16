@@ -15,6 +15,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use ksni::TrayMethods;
 
 use tokio::sync::watch;
@@ -222,7 +223,9 @@ impl ksni::Tray for DaklakTray {
 impl DaklakTray {
     /// Send runtime-safe config changes to the daemon and persist the full tray config.
     fn apply(&mut self, change: ConfigChange) {
-        let _ = self.config_change_tx.send(change);
+        if self.config_change_tx.send(change).is_err() {
+            tracing::warn!("config-change receiver dropped");
+        }
         self.save_current_config();
     }
 
@@ -252,10 +255,12 @@ impl DaklakTray {
 
 fn fire(tx: &CmdTx, kind: CmdKind) {
     let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.try_send(Command {
+    if let Err(error) = tx.try_send(Command {
         kind,
         resp: resp_tx,
-    });
+    }) {
+        tracing::warn!(%error, "tray command could not reach supervisor");
+    }
 }
 
 /// Standard install locations for the config example file, in search order.
@@ -283,7 +288,10 @@ fn copy_config_example(target: &Path) -> Option<String> {
         .find(|p| p.is_file())?;
     let text = std::fs::read_to_string(&example).ok()?;
     if let Some(parent) = target.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::warn!(path = %parent.display(), %error, "create config directory failed");
+            return None;
+        }
     }
     if std::fs::write(target, &text).is_err() {
         return None;
@@ -404,10 +412,9 @@ fn format_hooks_array(hooks: &[String]) -> String {
 fn save_config(path: &Path, change: ConfigChange, evdev_grab_hooks: &[String]) {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match copy_config_example(path) {
-            Some(t) => t,
-            None => String::new(),
-        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            copy_config_example(path).unwrap_or_default()
+        }
         Err(e) => {
             tracing::warn!(path = %path.display(), %e, "tray: failed to read config for save");
             return;
@@ -627,84 +634,61 @@ async fn wait_for_sni_watcher() -> anyhow::Result<()> {
     }
 }
 
-/// Spawn the tray icon best-effort. Logs a warning on D-Bus failure and returns
+/// Run the tray icon best-effort. Logs a warning on D-Bus failure and returns
 /// without aborting the daemon — IPC/CLI still work without a session bus.
-pub fn spawn_tray(
+pub async fn run_tray(
     cmd_tx: CmdTx,
     mut state_rx: StateRx,
     mut backend_rx: watch::Receiver<InputBackend>,
     config_change_tx: tokio::sync::watch::Sender<ConfigChange>,
-    config: &Config,
-) {
-    let method = config.method;
-    let modern_style = config.modern_style;
-    let config_path = config.config_path.clone();
-    let evdev_enabled = config.enable_evdev_grab;
-    let evdev_grab_hooks = config.evdev_grab_hooks.clone();
+    config: Config,
+) -> anyhow::Result<()> {
+    let mut make_tray = || DaklakTray {
+        cmd_tx: cmd_tx.clone(),
+        config_change_tx: config_change_tx.clone(),
+        config_path: config.config_path.clone(),
+        enabled: *state_rx.borrow_and_update(),
+        method: config.method,
+        modern_style: config.modern_style,
+        evdev_enabled: config.enable_evdev_grab,
+        backend: *backend_rx.borrow(),
+        evdev_grab_hooks: config.evdev_grab_hooks.clone(),
+    };
 
-    tokio::spawn(async move {
-        // Build a fresh DaklakTray from current watch state.
-        let mut make_tray = || DaklakTray {
-            cmd_tx: cmd_tx.clone(),
-            config_change_tx: config_change_tx.clone(),
-            config_path: config_path.clone(),
-            enabled: *state_rx.borrow_and_update(),
-            method,
-            modern_style,
-            evdev_enabled,
-            backend: *backend_rx.borrow(),
-            evdev_grab_hooks: evdev_grab_hooks.clone(),
-        };
+    let handle = match make_tray().spawn().await {
+        Ok(handle) => handle,
+        Err(first_error) => {
+            tracing::debug!(
+                error = %first_error,
+                "tray spawn failed; waiting for StatusNotifierWatcher on D-Bus"
+            );
+            wait_for_sni_watcher()
+                .await
+                .with_context(|| format!("initial tray spawn failed: {first_error}"))?;
+            tracing::info!("StatusNotifierWatcher appeared on D-Bus");
+            make_tray()
+                .spawn()
+                .await
+                .context("spawn tray after StatusNotifierWatcher appeared")?
+        }
+    };
 
-        // Try immediately — works when daklak starts after the DE.
-        let handle = match make_tray().spawn().await {
-            Ok(h) => h,
-            Err(first_err) => {
-                tracing::debug!(
-                    error = %first_err,
-                    "tray spawn failed; waiting for StatusNotifierWatcher on D-Bus"
-                );
-                match wait_for_sni_watcher().await {
-                    Ok(()) => {
-                        tracing::info!("StatusNotifierWatcher appeared on D-Bus");
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "gave up waiting for StatusNotifierWatcher: {e} — \
-                             tray disabled for this session"
-                        );
-                        return;
-                    }
-                }
-                match make_tray().spawn().await {
-                    Ok(h) => h,
-                    Err(e) => {
-                        tracing::warn!(
-                            "tray spawn failed even after watcher appeared: {e} — \
-                             tray disabled for this session"
-                        );
-                        return;
-                    }
-                }
+    loop {
+        tokio::select! {
+            biased;
+            changed = state_rx.changed() => {
+                if changed.is_err() { break; }
+                let on = *state_rx.borrow_and_update();
+                handle.update(|t| t.enabled = on).await;
             }
-        };
-        // Repaint on every state or backend change.
-        loop {
-            tokio::select! {
-                biased;
-                changed = state_rx.changed() => {
-                    if changed.is_err() { break; }
-                    let on = *state_rx.borrow_and_update();
-                    handle.update(|t| t.enabled = on).await;
-                }
-                changed = backend_rx.changed() => {
-                    if changed.is_err() { break; }
-                    let b = *backend_rx.borrow_and_update();
-                    handle.update(|t| t.backend = b).await;
-                }
+            changed = backend_rx.changed() => {
+                if changed.is_err() { break; }
+                let backend = *backend_rx.borrow_and_update();
+                handle.update(|t| t.backend = backend).await;
             }
         }
-    });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
