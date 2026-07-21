@@ -108,7 +108,9 @@ distinct compositor families through two input-method protocol versions.
   event the way v2 does.
 
 These differences are captured as capability booleans rather than hard-coded
-branches; see [Capability model](capability-model.md).
+branches; see [Capability model](capability-model.md). For the protocol history,
+keyboard-filter design, and future XX path, see
+[Wayland input-method protocols](wayland-input-method-protocols.md).
 
 ### Focus
 
@@ -194,5 +196,7 @@ for the synthetic keymap, per-platform install steps, and troubleshooting.
 
 - [Capability model](capability-model.md) — how the Wayland adapter records what
   each protocol can do.
+- [Wayland input-method protocols](wayland-input-method-protocols.md) — how the
+  v1, unofficial v2, XX, keyboard-filter, and draft v3 contracts differ.
 - [Compositor quirks](compositor-quirks.md) — the upstream behaviors each
   transport has to accommodate.

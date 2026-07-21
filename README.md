@@ -79,7 +79,8 @@ two pages first.
 | 7 | [Capability model](docs/capability-model.md) | How Daklak decides what each compositor/app can support. |
 | 8 | [Key emit & focus](docs/key-emit-and-focus.md) | Key-emission backends and focus tracking. |
 | 9 | [Compositor quirks](docs/compositor-quirks.md) | Known compositor/app behaviors and workarounds. |
-| 10 | [Contributing](docs/contributing.md) | Rules and conventions for maintainers. |
+| 10 | [Wayland input-method protocols](docs/wayland-input-method-protocols.md) | How v1, unofficial v2, XX, keyboard filtering, and draft v3 differ. |
+| 11 | [Contributing](docs/contributing.md) | Rules and conventions for maintainers. |
 
 ## For technical readers
 

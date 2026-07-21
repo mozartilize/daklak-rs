@@ -196,7 +196,7 @@ pub struct AdapterState {
     // ── Compositor backend selection ─────────────────────────────────────────
     /// Process-scoped transport capability profile. Set during `connect()`.
     pub profile: crate::TransportProfile,
-    /// v1 IM global (only on KWin/Mutter). `None` on wlroots.
+    /// v1 IM global (only on KWin/Plasma). `None` on wlroots.
     pub im_v1: Option<ZwpInputMethodV1>,
     /// v1 context proxy — short-lived, one per text-input session.
     /// Replaced on each `activate` event and dropped on `deactivate`.

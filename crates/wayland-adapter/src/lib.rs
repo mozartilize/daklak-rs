@@ -78,7 +78,7 @@ pub use viet_ime_edit_strategy::{BackspaceMethod, KeyState, ModifierState, Outpu
 pub enum ImProtocol {
     /// `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` — wlroots path.
     ImV2,
-    /// `zwp_input_method_v1` (KWin/Mutter) — no vk, v1 context is the
+    /// `zwp_input_method_v1` (KWin/Plasma) — no vk, v1 context is the
     /// key-emission path.
     ImV1,
 }
@@ -777,7 +777,7 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
         .context("bind wl_seat")?;
     app.state.seat = Some(seat.clone());
 
-    // ── Compositor backend detection: v2 (wlroots) or v1 (KWin/Mutter) ─────
+    // ── Compositor backend detection: v2 (wlroots) or v1 (KWin/Plasma) ─────
     let mut profile = if let Ok(v2) = globals.bind::<ZwpInputMethodManagerV2, _, _>(&qh, 1..=1, ())
     {
         // ── v2 (wlroots) path ────────────────────────────────────────────────
@@ -823,7 +823,7 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
         // so the vk keyboard is always present.
         TransportProfile::for_protocol(ImProtocol::ImV2)
     } else if let Ok(v1) = globals.bind::<ZwpInputMethodV1, _, _>(&qh, 1..=1, ()) {
-        // ── v1 (KWin/Mutter) path ────────────────────────────────────────────
+        // ── v1 (KWin/Plasma) path ────────────────────────────────────────────
         app.state.im_v1 = Some(v1.clone());
         app.state.conn = Some(conn.clone());
 
@@ -834,7 +834,7 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
             .roundtrip(&mut app)
             .context("initial roundtrip")?;
 
-        tracing::info!("input method v1 bound (KWin/Mutter)");
+        tracing::info!("input method v1 bound (KWin/Plasma)");
         TransportProfile::for_protocol(ImProtocol::ImV1)
     } else {
         anyhow::bail!("neither zwp_input_method_v2 nor zwp_input_method_v1 exposed by compositor");

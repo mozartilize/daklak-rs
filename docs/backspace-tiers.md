@@ -74,7 +74,7 @@ capabilities. The important rules:
   replacement through the virtual-keyboard synthetic keymap. A real `Activate`
   always wins and replaces the synthesized session.
 - **The synthetic-keymap channel requires a virtual-keyboard-capable
-  transport.** On the KWin/Mutter im-v1 relay (no vk keyboard), that channel is
+  transport.** On the KWin/Plasma im-v1 relay (no vk keyboard), that channel is
   unavailable, so ForwardKey emits through the keysym channel instead.
 - **Default is ForwardKey.** With no surrounding text and nothing special, Tier 2.
 
