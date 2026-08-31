@@ -1182,7 +1182,17 @@ impl Composer {
                 self.edit.record_surrounding(text, cursor, anchor);
                 self.last_input_char = Some(ch);
                 self.retroactive_context = true;
-                self.confirmation = ConfirmationState::FrameDerived;
+                // The frame just PROVED our own keystroke landed where the
+                // engine composed it, so the cursor is known again — return to
+                // live composition instead of re-arming FrameDerived. Leaving
+                // it frame-derived made the deferral sticky: it survived word
+                // boundaries (a backspace-reseed then leaked into every later
+                // tone key, flashing raw + repairing via the frame until an
+                // external Ctrl+A→Backspace reset). A genuine later cursor move
+                // is still caught — `revalidate_live_confirmation` downgrades
+                // LiveConfirmed→AwaitingFrame on a shadow mismatch, and idle
+                // re-defers after 2s.
+                self.confirmation = ConfirmationState::LiveConfirmed;
                 // The screen shows base_word + raw ch; the engine wants
                 // base_word minus `backspaces` plus `commit`. Deleting the raw
                 // char costs one extra backspace.
@@ -2198,6 +2208,45 @@ mod tests {
             assert_eq!(screen, "kwin");
         }
 
+        // A confirmed raw key (stash-hit) proves where our own keystroke
+        // landed, so the cursor is known again — the deferral must NOT persist
+        // into the following live composition. Regression for a
+        // backspace-triggered reseed (killer feature) that left confirmation
+        // stuck in FrameDerived: on gedit/KWin every later tone key then
+        // flashed raw and repaired via the frame until an external reset
+        // (Ctrl+A → Backspace). After a stash-hit repair, the next key from our
+        // own stream must compose live.
+        #[test]
+        fn stash_confirmed_raw_key_does_not_leak_deferral_into_next_key() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+
+            // Cursor-jump reseed into an existing word "ho" → FrameDerived
+            // (no recent action, not a one-char insertion, not a deletion).
+            c.observe_surrounding_bytes("ho", ByteCursor(2), ByteCursor(2), false);
+
+            // 'w' is cursor-uncertain here → forwarded raw and confirm-deferred.
+            c.mark_action();
+            assert!(matches!(c.feed_key('w'), KeyDecision::ForwardRaw));
+
+            // The client frame proves 'w' landed after "ho": stash-hit repair.
+            let repair = c
+                .observe_surrounding_bytes("how", ByteCursor(3), ByteCursor(3), false)
+                .expect("frame confirming the raw 'w' must repair to ơ");
+            assert_eq!((repair.backspaces, repair.commit.as_str()), (2, "ơ"));
+
+            // The cursor is now proven. The next composing key from our own
+            // keystroke stream must apply live (ớ), never defer again.
+            c.mark_action();
+            match c.feed_key('s') {
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ớ");
+                }
+                _ => panic!("live 's' after a confirmed 'w' must compose ớ, not defer"),
+            }
+        }
+
         // Ghostty advertises surrounding-text but every frame is empty; the
         // liveness watchdog downgrades ST→FK after the first keys. A raw key
         // forwarded on the ST tier is still pending at that moment. The
@@ -2430,8 +2479,14 @@ mod tests {
             assert_eq!(c.prev_surrounding_for_trace(), (actual, actual_cursor));
         }
 
+        // After a stale Ctrl+Backspace snapshot, the retyped prefix forwards
+        // raw and repairs from confirming frames. Once one of those frames
+        // proves the insertion point (a stash-hit repair: viee→viê), the cursor
+        // is known and the following tone key composes LIVE (viêt→việt) instead
+        // of re-deferring — no per-key raw flash. The retyped word is still not
+        // poisoned: the final shadow anchors "tiệng việt".
         #[test]
-        fn stale_ctrl_backspace_frame_does_not_poison_retyped_vietnamese_word() {
+        fn stale_ctrl_backspace_prefix_composes_live_after_confirmed_repair() {
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
             c.set_surrounding_confirmation(true);
             let mut sink = DeleteCaptureSink::default();
@@ -2439,7 +2494,7 @@ mod tests {
             seed_stale_ctrl_backspace_frame(&mut c);
             type_confirmed_raw_prefix(&mut c);
             repair_confirmed_circumflex(&mut c, &mut sink);
-            repair_confirmed_tone(&mut c, &mut sink);
+            live_tone_after_confirmed_prefix(&mut c, &mut sink);
 
             assert_eq!(c.shadow_text(), "tiệng việt");
         }
@@ -2513,20 +2568,20 @@ mod tests {
             assert_forwarded_char_confirmed(c, 't', "tiệng viêt mĩ miều");
         }
 
-        fn repair_confirmed_tone(c: &mut Composer, sink: &mut DeleteCaptureSink) {
+        fn live_tone_after_confirmed_prefix(c: &mut Composer, sink: &mut DeleteCaptureSink) {
+            // The circumflex frame already proved the insertion point, so the
+            // tone key composes live (viêt → việt) with no raw flash.
             c.mark_action();
-            assert!(matches!(c.feed_key('j'), KeyDecision::ForwardRaw));
-            let raw_j = "tiệng viêtj mĩ miều";
-            let raw_j_cursor = "tiệng viêtj".len() as u32;
-            let tone = c
-                .observe_surrounding_bytes(
-                    raw_j,
-                    ByteCursor(raw_j_cursor),
-                    ByteCursor(raw_j_cursor),
-                    false,
-                )
-                .expect("confirmed raw j should repair viêtj to việt");
-            c.apply_confirmed_repair_to_sink(tone.backspaces, &tone.commit, 0, 0, sink);
+            match c.feed_key('j') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 2);
+                    assert_eq!(commit, "ệt");
+                    c.apply_to_sink(backspaces, &commit, 0, 0, sink);
+                }
+                _ => panic!("tone 'j' after a stash-hit-confirmed prefix must compose việt live"),
+            }
         }
 
         // gedit under KWin (text-input-v1, SurroundingText tier) sends NO
