@@ -328,6 +328,17 @@ impl ConfirmationState {
             from_frame: self.is_frame_derived(),
         })
     }
+
+    #[cfg(test)]
+    fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Live => "Live",
+            Self::LiveConfirmed => "LiveConfirmed",
+            Self::FrameDerived => "FrameDerived",
+            Self::AwaitingFrame => "AwaitingFrame",
+            Self::PendingRaw(_) => "PendingRaw",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -492,6 +503,11 @@ impl Composer {
     /// edits (Wayland only). Idempotent; safe to call on every activate.
     pub fn set_surrounding_confirmation(&mut self, on: bool) {
         self.confirm_retroactive_edits = on;
+    }
+
+    #[cfg(test)]
+    fn confirmation_variant(&self) -> &'static str {
+        self.confirmation.variant_name()
     }
 
     /// Roll the action clock far back so the NEXT surrounding frame bypasses
@@ -786,15 +802,32 @@ impl Composer {
             tracing::trace!("BS not consumed → forward");
             let deleted_visible = self.edit.shadow_text().chars().last();
             self.edit.pop_forwarded_char();
-            // `processed=false` can still carry a positive backspace count:
-            // vnkey recognized that an owned glyph was deleted but did not emit
-            // an edit for the daemon. The app will perform that delete through
-            // the forwarded Backspace; when the deleted visible glyph is a
-            // composed non-ASCII char (e.g. `u`+`w` -> `ư`), drop stale raw
-            // history before a later raw restore resurrects the deleted prefix
-            // (`sưi`+`t` -> `uswit`). Plain ASCII English backspaces keep their
-            // engine history so retyping `doesnt` stays raw.
-            if r.backspaces > 0 && matches!(deleted_visible, Some(ch) if !ch.is_ascii()) {
+            if self.method() == BackspaceMethod::ForwardKey {
+                // ForwardKey clients (foot and other terminals that advertise
+                // surrounding-text but never reflect it, so the liveness
+                // watchdog downgrades ST→FK) never deliver a post-backspace
+                // frame to resync engine state. After a raw restore (e.g.
+                // `tự`+`d` → `tuwjd`), vnkey holds a NonVn buffer; forwarded
+                // backspaces only decrement it, so it stays non-composable and
+                // a re-typed tone key (`tu`+`w`) forwards raw instead of
+                // composing `ư`. Reseed the engine from the word the backspace
+                // just re-exposed. The render gate keeps English/foreign words
+                // raw — they fail the round-trip and leave the engine empty —
+                // and seeding from the popped shadow (not the pre-delete
+                // buffer) never resurrects the deleted glyph.
+                let word = self.current_shadow_word().to_owned();
+                self.engine.reset();
+                self.retroactive_context =
+                    !word.is_empty() && self.engine.feed_context_gated(&word);
+            } else if r.backspaces > 0 && matches!(deleted_visible, Some(ch) if !ch.is_ascii()) {
+                // SurroundingText: `processed=false` can still carry a positive
+                // backspace count — vnkey recognized an owned glyph was deleted
+                // but emitted no edit. When that glyph is a composed non-ASCII
+                // char (e.g. `u`+`w` -> `ư`), drop stale raw history before a
+                // later raw restore resurrects the deleted prefix (`sưi`+`t` ->
+                // `uswit`). Plain ASCII English backspaces keep their engine
+                // history so retyping `doesnt` stays raw. (The post-backspace
+                // surrounding frame re-seeds when the cursor context warrants.)
                 self.engine.reset();
                 self.retroactive_context = false;
             }
@@ -872,8 +905,25 @@ impl Composer {
             && commit.is_ascii()
             && backspaces < before.chars().count() // partial revert, not full auto-restore
             && before.chars().rev().take(backspaces).any(|c| c.len_utf8() > 1);
-        let used_forward_key =
-            quirk_requests_forward || self.firefox.forward_sticky() || multibyte_retroactive_revert;
+        // Mixed expanding revert (e.g. gedit `tự` + `w`: delete `ự`, commit
+        // `ụw`). A Telex `ww`-revert that undoes a horn but keeps the tone
+        // commits ONE multibyte char plus raw ASCII, expanding the char count
+        // (commit chars > backspaces). Some apps drop the positional
+        // `delete_surrounding_text` for this shape while still applying the
+        // `commit_string`, leaving the deleted glyph on screen (`tự` → `tựụw`
+        // instead of `tụw`). The commit is not fully ASCII, so the revert
+        // guard above misses it; route the deletion through physical Backspace,
+        // which every app honors. Independent of `retroactive_context` (the
+        // gedit repro composes live, `retroactive_context=false`).
+        let mixed_expanding_revert = backspaces > 0
+            && backspaces < before.chars().count() // partial revert, not full auto-restore
+            && commit.chars().count() > backspaces
+            && commit.chars().any(|c| c.is_ascii())
+            && before.chars().rev().take(backspaces).any(|c| c.len_utf8() > 1);
+        let used_forward_key = quirk_requests_forward
+            || self.firefox.forward_sticky()
+            || multibyte_retroactive_revert
+            || mixed_expanding_revert;
         tracing::trace!(
             ?delete_unit,
             quirk_requests_forward,
@@ -1155,15 +1205,31 @@ impl Composer {
 
         if !insertion_proven || !repairable {
             // The frame changed by more than this key (paste/delete/external
-            // edit). It is still the newest ground truth, but cannot justify a
-            // repair. Synchronize and continue from its visible word.
+            // edit), or an overlapping key already invalidated the stashed
+            // repair. Either way it is the newest ground truth but cannot
+            // justify emitting a repair. Synchronize and continue from its
+            // visible word.
             self.edit.on_surrounding_text(text, cursor, anchor);
             self.edit.record_surrounding(text, cursor, anchor);
             self.last_input_char = Some(ch);
             self.engine.reset();
             self.retroactive_context =
                 !actual_word.is_empty() && self.engine.feed_context_gated(&actual_word);
-            self.confirmation = if self.retroactive_context {
+            // When the frame PROVED this pending key landed at the reported
+            // cursor (`insertion_proven`) but a later overlapping key made it
+            // unrepairable, the cursor and latest character are known — end the
+            // deferral instead of re-arming FrameDerived. Leaving it frame-
+            // derived was sticky: every following key kept forwarding raw and
+            // dropping its commit. Observed in LibreOffice Writer typing "hơn":
+            // a stale post-backspace frame (arriving after the recent-action
+            // window because forwarded backspaces do not mark an action)
+            // reseeded to FrameDerived, then two overlapping keys pinned
+            // `repairable=false`, so "ho"+w never composed ơ and raw "how"/
+            // "howj" was left on screen. Only the unproven case stays
+            // conservative — it may be a genuine cursor jump.
+            self.confirmation = if insertion_proven {
+                ConfirmationState::LiveConfirmed
+            } else if self.retroactive_context {
                 ConfirmationState::FrameDerived
             } else {
                 ConfirmationState::Live
@@ -1765,6 +1831,96 @@ mod tests {
         }
 
         #[test]
+        fn mixed_expanding_revert_uses_forward_key_delete() {
+            // gedit repro: compose `tự` live (tuwj), then press `w` again. The
+            // Telex `ww`-revert undoes the horn but keeps the tone → delete `ự`
+            // (1 multibyte char), commit `ụw` (2 chars, one non-ASCII + one
+            // ASCII). gedit dropped the positional delete_surrounding_text after
+            // an idle gap while still applying commit_string, leaving `tựụw`.
+            // The deletion must go through physical Backspace, which gedit
+            // honors, so the screen becomes `tụw`.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            for ch in ['t', 'u', 'w', 'j'] {
+                if let KeyDecision::Apply {
+                    backspaces, commit, ..
+                } = c.feed_key(ch)
+                {
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+            }
+            assert_eq!(c.shadow_text(), "tự");
+            let deletes_before = sink.deletes.len();
+            let vk_before = sink.vk_keys.len();
+
+            match c.feed_key('w') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ụw");
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                _ => panic!("expected `ww`-revert Apply(1, \"ụw\")"),
+            }
+
+            // The revert deletion routed through ForwardKey (one Backspace
+            // press/release pair), NOT an added delete_surrounding_text.
+            assert_eq!(
+                sink.deletes.len(),
+                deletes_before,
+                "mixed expanding revert must not use delete_surrounding_text"
+            );
+            assert_eq!(sink.vk_keys.len(), vk_before + 2);
+            assert_eq!(sink.vk_keys[vk_before], (0, 14, KeyState::Pressed));
+            assert_eq!(sink.vk_keys[vk_before + 1], (0, 14, KeyState::Released));
+            assert_eq!(c.shadow_text(), "tụw");
+        }
+
+        #[test]
+        fn ordinary_multibyte_tone_replacement_still_uses_surrounding_delete() {
+            // Control: `tư` + `j` → delete `ư` (1 multibyte char), commit `ự`
+            // (1 multibyte char). commit chars == backspaces, so it is NOT a
+            // mixed expanding revert — it must keep normal SurroundingText
+            // delete_surrounding_text (byte-count), not physical Backspace.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+
+            for ch in ['t', 'u', 'w'] {
+                if let KeyDecision::Apply {
+                    backspaces, commit, ..
+                } = c.feed_key(ch)
+                {
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+            }
+            assert_eq!(c.shadow_text(), "tư");
+            let vk_before = sink.vk_keys.len();
+
+            match c.feed_key('j') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ự");
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                _ => panic!("expected tone Apply(1, \"ự\")"),
+            }
+
+            // Normal tone replacement uses delete_surrounding_text (2 bytes for
+            // the multibyte `ư`), NOT physical Backspace.
+            assert_eq!(
+                sink.vk_keys.len(),
+                vk_before,
+                "must not emit ForwardKey Backspace"
+            );
+            assert_eq!(sink.deletes.last().copied(), Some((2, 1, 0, 0)));
+            assert_eq!(c.shadow_text(), "tự");
+        }
+
+        #[test]
         fn stale_firefox_echo_marks_commit_string_unusable_before_forward_key() {
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
             let mut sink = DeleteCaptureSink::default();
@@ -2325,6 +2481,58 @@ mod tests {
                 )
                 .is_none());
             assert_eq!(c.prev_surrounding_for_trace(), (first, first_cursor));
+
+            // The frame PROVED the (unrepairable) pending key's insertion point,
+            // so the deferral must end — confirmation returns to a certain
+            // state, not sticky FrameDerived. Otherwise every following key
+            // would keep forwarding raw and dropping its commit (see the
+            // LibreOffice "hơn" cascade test below).
+            assert_eq!(c.confirmation_variant(), "LiveConfirmed");
+        }
+
+        // End-to-end shape of the LibreOffice Writer "hơn" drop: an uncertain
+        // confirmation state (here induced by idle; in the field by a stale
+        // post-backspace frame reseeding to FrameDerived) plus two overlapping
+        // raw keys pins the second key `repairable=false`. The authoritative
+        // frame then proves that key's insertion point. Before the fix the
+        // deferral stayed sticky (FrameDerived), so the next composing key
+        // forwarded raw and dropped its commit — leaving raw "how"/"howj"
+        // instead of "hơn". It must instead recover to live composition.
+        #[test]
+        fn unrepairable_but_proven_frame_recovers_to_live_composition() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+
+            // Idle >2s on SurroundingText arms an uncertain state (AwaitingFrame)
+            // — the same uncertain class a stale-frame reseed produces.
+            c.last_keystroke_at -= std::time::Duration::from_secs(3);
+            assert!(c.check_idle_reset());
+
+            // Two overlapping raw keys: 'h' defers (repairable), then 'o' defers
+            // while 'h' is still pending → 'o' is marked unrepairable.
+            c.mark_action();
+            assert!(matches!(c.feed_key('h'), KeyDecision::ForwardRaw));
+            c.mark_action();
+            assert!(matches!(c.feed_key('o'), KeyDecision::ForwardRaw));
+
+            // The client frame proves 'o' landed after 'h' ("ho"). It cannot
+            // emit a repair (unrepairable), but it proves the cursor — so the
+            // deferral must end.
+            assert!(c
+                .observe_surrounding_bytes("ho", ByteCursor(2), ByteCursor(2), false)
+                .is_none());
+            assert_eq!(c.confirmation_variant(), "LiveConfirmed");
+
+            // The next composing key must apply live (ho + w → ơ), never defer
+            // and drop its commit.
+            c.mark_action();
+            match c.feed_key('w') {
+                KeyDecision::Apply { backspaces, commit, .. } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ơ");
+                }
+                _ => panic!("composing 'w' after a proven-insertion sync must compose ơ, not defer"),
+            }
         }
 
         #[test]
@@ -3199,6 +3407,116 @@ mod tests {
                 matches!(c.feed_key('f'), KeyDecision::ForwardRaw),
                 "'f' after deleting 'a' must forward raw, not tone a stale seed"
             );
+        }
+
+        #[test]
+        fn forwardkey_backspace_after_raw_restore_reseeds_so_tone_recomposes() {
+            // foot and other terminals advertise surrounding-text but send only
+            // empty frames, so the liveness watchdog downgrades ST→FK and no
+            // frame ever resyncs engine state. Field repro (typing "tự"):
+            //   tuwj → tự, then 'd' raw-restores the invalid syllable to "tuwjd",
+            //   three forwarded Backspaces bring the visible text to "tu", and
+            //   the next 'w' must re-compose ư. Before the reseed the engine held
+            //   a stale NonVn buffer and 'w' forwarded raw, leaving "tuw".
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::ForwardKey, false);
+            let mut sink = DeleteCaptureSink::default();
+            let mut visible = String::new();
+
+            for ch in ['t', 'u', 'w', 'j'] {
+                press_visible(&mut c, &mut sink, &mut visible, ch);
+            }
+            assert_eq!(visible, "tự");
+
+            // 'd' → invalid syllable → raw restore to "tuwjd".
+            press_visible(&mut c, &mut sink, &mut visible, 'd');
+            assert_eq!(visible, "tuwjd");
+
+            // Forwarded Backspaces back down to "tu".
+            for _ in 0..3 {
+                c.mark_action();
+                assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+                visible.pop();
+            }
+            assert_eq!(visible, "tu");
+
+            // The re-typed tone must compose ư now, not forward raw.
+            c.mark_action();
+            match c.feed_key('w') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!(backspaces, 1);
+                    assert_eq!(commit, "ư");
+                }
+                _ => panic!("'w' on re-exposed \"tu\" must compose ư, not forward raw"),
+            }
+        }
+
+        #[test]
+        fn forwardkey_backspace_keeps_english_word_raw() {
+            // The reseed must not turn English into Vietnamese. Type "him"
+            // (no Telex tone/modifier keys), Backspace to "hi", then retype 'm'.
+            // "hi" round-trips the render gate and seeds the engine, but 'm' has
+            // no vowel to tone, so it forwards raw — "him" stays "him".
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::ForwardKey, false);
+            let mut sink = DeleteCaptureSink::default();
+            let mut visible = String::new();
+
+            for ch in ['h', 'i', 'm'] {
+                assert!(matches!(
+                    press_visible(&mut c, &mut sink, &mut visible, ch),
+                    KeyDecision::ForwardRaw
+                ));
+            }
+            assert_eq!(visible, "him");
+
+            c.mark_action();
+            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+            visible.pop();
+            assert_eq!(visible, "hi");
+
+            assert!(
+                matches!(
+                    press_visible(&mut c, &mut sink, &mut visible, 'm'),
+                    KeyDecision::ForwardRaw
+                ),
+                "retyped 'm' after an English backspace must stay raw"
+            );
+            assert_eq!(visible, "him");
+        }
+
+        #[test]
+        fn forwardkey_backspace_of_vowel_does_not_tone_a_stale_seed() {
+            // The ForwardKey analog of the SurroundingText
+            // `forwarded_ascii_backspace_on_seeded_word_stays_consistent`
+            // guard. Type "la", Backspace the vowel to "l", then 'f'. The
+            // reseed feeds "l" (which round-trips) but it has no vowel, so 'f'
+            // must forward raw ("lf"), NOT compose a stale "l"+a→"là" edit.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::ForwardKey, false);
+            let mut sink = DeleteCaptureSink::default();
+            let mut visible = String::new();
+
+            for ch in ['l', 'a'] {
+                assert!(matches!(
+                    press_visible(&mut c, &mut sink, &mut visible, ch),
+                    KeyDecision::ForwardRaw
+                ));
+            }
+            assert_eq!(visible, "la");
+
+            c.mark_action();
+            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+            visible.pop();
+            assert_eq!(visible, "l");
+
+            assert!(
+                matches!(
+                    press_visible(&mut c, &mut sink, &mut visible, 'f'),
+                    KeyDecision::ForwardRaw
+                ),
+                "'f' after deleting the vowel must forward raw, not tone a stale seed"
+            );
+            assert_eq!(visible, "lf");
         }
 
         #[test]
