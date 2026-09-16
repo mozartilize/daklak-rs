@@ -13,9 +13,8 @@
 //! to commit and the count of preceding chars to delete. Hides the internal
 //! state machine of vnkey-engine.
 
+mod reversal;
 mod telex;
-mod viqr;
-mod vni;
 
 use vnkey_engine::{Engine, InputMethod as VnkeyIm};
 
@@ -233,87 +232,7 @@ fn context_from_surrounding(text: &str, method: InputMethod) -> (String, Vec<u8>
 }
 
 fn chars_from_composed(ch: char, method: InputMethod) -> &'static str {
-    // Method-specific Vietnamese glyph reversal; falls through to shared
-    // ASCII passthrough so each table only carries diacritical mappings.
-    let vietnamese = match method {
-        InputMethod::Telex => telex::telex_chars_from_composed(ch),
-        InputMethod::Vni => vni::vni_chars_from_composed(ch),
-        InputMethod::Viqr => viqr::viqr_chars_from_composed(ch),
-    };
-    if !vietnamese.is_empty() {
-        return vietnamese;
-    }
-    ascii_passthrough(ch)
-}
-
-/// Shared identity mapping for ASCII letters and digits — extracted from the
-/// per-method tables so the Vietnamese-specific reversal modules stay small.
-fn ascii_passthrough(ch: char) -> &'static str {
-    match ch {
-        'A' => "A",
-        'B' => "B",
-        'C' => "C",
-        'D' => "D",
-        'E' => "E",
-        'F' => "F",
-        'G' => "G",
-        'H' => "H",
-        'I' => "I",
-        'J' => "J",
-        'K' => "K",
-        'L' => "L",
-        'M' => "M",
-        'N' => "N",
-        'O' => "O",
-        'P' => "P",
-        'Q' => "Q",
-        'R' => "R",
-        'S' => "S",
-        'T' => "T",
-        'U' => "U",
-        'V' => "V",
-        'W' => "W",
-        'X' => "X",
-        'Y' => "Y",
-        'Z' => "Z",
-        'a' => "a",
-        'b' => "b",
-        'c' => "c",
-        'd' => "d",
-        'e' => "e",
-        'f' => "f",
-        'g' => "g",
-        'h' => "h",
-        'i' => "i",
-        'j' => "j",
-        'k' => "k",
-        'l' => "l",
-        'm' => "m",
-        'n' => "n",
-        'o' => "o",
-        'p' => "p",
-        'q' => "q",
-        'r' => "r",
-        's' => "s",
-        't' => "t",
-        'u' => "u",
-        'v' => "v",
-        'w' => "w",
-        'x' => "x",
-        'y' => "y",
-        'z' => "z",
-        '0' => "0",
-        '1' => "1",
-        '2' => "2",
-        '3' => "3",
-        '4' => "4",
-        '5' => "5",
-        '6' => "6",
-        '7' => "7",
-        '8' => "8",
-        '9' => "9",
-        _ => "",
-    }
+    reversal::chars_from_composed(ch, method)
 }
 
 #[cfg(test)]

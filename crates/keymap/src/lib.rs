@@ -258,49 +258,109 @@ fn locate_vn(c: char) -> Option<(usize, u8)> {
 /// Caller adds `MOD_SHIFT` for uppercase / shifted punctuation. None
 /// for chars outside the ASCII printable range.
 fn ascii_evdev(c: char) -> Option<(u32, u32)> {
-    Some(match c {
-        // Lowercase letters
-        'a' => (30, 0), 'b' => (48, 0), 'c' => (46, 0), 'd' => (32, 0),
-        'e' => (18, 0), 'f' => (33, 0), 'g' => (34, 0), 'h' => (35, 0),
-        'i' => (23, 0), 'j' => (36, 0), 'k' => (37, 0), 'l' => (38, 0),
-        'm' => (50, 0), 'n' => (49, 0), 'o' => (24, 0), 'p' => (25, 0),
-        'q' => (16, 0), 'r' => (19, 0), 's' => (31, 0), 't' => (20, 0),
-        'u' => (22, 0), 'v' => (47, 0), 'w' => (17, 0), 'x' => (45, 0),
-        'y' => (21, 0), 'z' => (44, 0),
-        // Uppercase letters — same keycode + Shift
-        'A' => (30, MOD_SHIFT), 'B' => (48, MOD_SHIFT), 'C' => (46, MOD_SHIFT),
-        'D' => (32, MOD_SHIFT), 'E' => (18, MOD_SHIFT), 'F' => (33, MOD_SHIFT),
-        'G' => (34, MOD_SHIFT), 'H' => (35, MOD_SHIFT), 'I' => (23, MOD_SHIFT),
-        'J' => (36, MOD_SHIFT), 'K' => (37, MOD_SHIFT), 'L' => (38, MOD_SHIFT),
-        'M' => (50, MOD_SHIFT), 'N' => (49, MOD_SHIFT), 'O' => (24, MOD_SHIFT),
-        'P' => (25, MOD_SHIFT), 'Q' => (16, MOD_SHIFT), 'R' => (19, MOD_SHIFT),
-        'S' => (31, MOD_SHIFT), 'T' => (20, MOD_SHIFT), 'U' => (22, MOD_SHIFT),
-        'V' => (47, MOD_SHIFT), 'W' => (17, MOD_SHIFT), 'X' => (45, MOD_SHIFT),
-        'Y' => (21, MOD_SHIFT), 'Z' => (44, MOD_SHIFT),
-        // Digits — top row, no Shift
-        '1' => (2, 0), '2' => (3, 0), '3' => (4, 0), '4' => (5, 0), '5' => (6, 0),
-        '6' => (7, 0), '7' => (8, 0), '8' => (9, 0), '9' => (10, 0), '0' => (11, 0),
-        // Shifted digit row
-        '!' => (2, MOD_SHIFT), '@' => (3, MOD_SHIFT), '#' => (4, MOD_SHIFT),
-        '$' => (5, MOD_SHIFT), '%' => (6, MOD_SHIFT), '^' => (7, MOD_SHIFT),
-        '&' => (8, MOD_SHIFT), '*' => (9, MOD_SHIFT), '(' => (10, MOD_SHIFT),
-        ')' => (11, MOD_SHIFT),
-        // Common punct
-        ' ' => (57, 0),
-        '-' => (12, 0), '_' => (12, MOD_SHIFT),
-        '=' => (13, 0), '+' => (13, MOD_SHIFT),
-        '[' => (26, 0), '{' => (26, MOD_SHIFT),
-        ']' => (27, 0), '}' => (27, MOD_SHIFT),
-        ';' => (39, 0), ':' => (39, MOD_SHIFT),
-        '\'' => (40, 0), '"' => (40, MOD_SHIFT),
-        '`' => (41, 0), '~' => (41, MOD_SHIFT),
-        '\\' => (43, 0), '|' => (43, MOD_SHIFT),
-        ',' => (51, 0), '<' => (51, MOD_SHIFT),
-        '.' => (52, 0), '>' => (52, MOD_SHIFT),
-        '/' => (53, 0), '?' => (53, MOD_SHIFT),
-        _ => return None,
-    })
+    ASCII_EVDEV
+        .binary_search_by_key(&c, |row| row.0)
+        .ok()
+        .map(|i| (ASCII_EVDEV[i].1, ASCII_EVDEV[i].2))
 }
+
+const ASCII_EVDEV: &[(char, u32, u32)] = &[
+    (' ', 57, 0),
+    ('!', 2, MOD_SHIFT),
+    ('"', 40, MOD_SHIFT),
+    ('#', 4, MOD_SHIFT),
+    ('$', 5, MOD_SHIFT),
+    ('%', 6, MOD_SHIFT),
+    ('&', 8, MOD_SHIFT),
+    ('\'', 40, 0),
+    ('(', 10, MOD_SHIFT),
+    (')', 11, MOD_SHIFT),
+    ('*', 9, MOD_SHIFT),
+    ('+', 13, MOD_SHIFT),
+    (',', 51, 0),
+    ('-', 12, 0),
+    ('.', 52, 0),
+    ('/', 53, 0),
+    ('0', 11, 0),
+    ('1', 2, 0),
+    ('2', 3, 0),
+    ('3', 4, 0),
+    ('4', 5, 0),
+    ('5', 6, 0),
+    ('6', 7, 0),
+    ('7', 8, 0),
+    ('8', 9, 0),
+    ('9', 10, 0),
+    (':', 39, MOD_SHIFT),
+    (';', 39, 0),
+    ('<', 51, MOD_SHIFT),
+    ('=', 13, 0),
+    ('>', 52, MOD_SHIFT),
+    ('?', 53, MOD_SHIFT),
+    ('@', 3, MOD_SHIFT),
+    ('A', 30, MOD_SHIFT),
+    ('B', 48, MOD_SHIFT),
+    ('C', 46, MOD_SHIFT),
+    ('D', 32, MOD_SHIFT),
+    ('E', 18, MOD_SHIFT),
+    ('F', 33, MOD_SHIFT),
+    ('G', 34, MOD_SHIFT),
+    ('H', 35, MOD_SHIFT),
+    ('I', 23, MOD_SHIFT),
+    ('J', 36, MOD_SHIFT),
+    ('K', 37, MOD_SHIFT),
+    ('L', 38, MOD_SHIFT),
+    ('M', 50, MOD_SHIFT),
+    ('N', 49, MOD_SHIFT),
+    ('O', 24, MOD_SHIFT),
+    ('P', 25, MOD_SHIFT),
+    ('Q', 16, MOD_SHIFT),
+    ('R', 19, MOD_SHIFT),
+    ('S', 31, MOD_SHIFT),
+    ('T', 20, MOD_SHIFT),
+    ('U', 22, MOD_SHIFT),
+    ('V', 47, MOD_SHIFT),
+    ('W', 17, MOD_SHIFT),
+    ('X', 45, MOD_SHIFT),
+    ('Y', 21, MOD_SHIFT),
+    ('Z', 44, MOD_SHIFT),
+    ('[', 26, 0),
+    ('\\', 43, 0),
+    (']', 27, 0),
+    ('^', 7, MOD_SHIFT),
+    ('_', 12, MOD_SHIFT),
+    ('`', 41, 0),
+    ('a', 30, 0),
+    ('b', 48, 0),
+    ('c', 46, 0),
+    ('d', 32, 0),
+    ('e', 18, 0),
+    ('f', 33, 0),
+    ('g', 34, 0),
+    ('h', 35, 0),
+    ('i', 23, 0),
+    ('j', 36, 0),
+    ('k', 37, 0),
+    ('l', 38, 0),
+    ('m', 50, 0),
+    ('n', 49, 0),
+    ('o', 24, 0),
+    ('p', 25, 0),
+    ('q', 16, 0),
+    ('r', 19, 0),
+    ('s', 31, 0),
+    ('t', 20, 0),
+    ('u', 22, 0),
+    ('v', 47, 0),
+    ('w', 17, 0),
+    ('x', 45, 0),
+    ('y', 21, 0),
+    ('z', 44, 0),
+    ('{', 26, MOD_SHIFT),
+    ('|', 43, MOD_SHIFT),
+    ('}', 27, MOD_SHIFT),
+    ('~', 41, MOD_SHIFT),
+];
 
 /// Compute the (keycode, mods) needed to deliver `c` through
 /// `zwp_virtual_keyboard_v1::key()` or uinput. Tries Vietnamese custom
@@ -570,6 +630,11 @@ mod tests {
             s,
             EmitSpec { keycode: base, mods: MOD_SHIFT | MOD_LEVEL3 | MOD_LEVEL5 }
         );
+    }
+
+    #[test]
+    fn ascii_evdev_is_sorted_for_binary_search() {
+        assert!(ASCII_EVDEV.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
     #[test]
