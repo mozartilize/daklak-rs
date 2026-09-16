@@ -112,16 +112,23 @@ where
     let mut args = raw_args.into_iter().peekable();
 
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--ibus" => cli.overrides.ibus = true,
-            "--help" | "-h" | "help" => cli.command = Some(Command::Help),
-            "toggle" => set_command(&mut cli.command, Command::Toggle, &arg)?,
-            "enable" => set_command(&mut cli.command, Command::Enable, &arg)?,
-            "disable" => set_command(&mut cli.command, Command::Disable, &arg)?,
-            "status" => set_command(&mut cli.command, Command::Status, &arg)?,
-            "gen-keymap" => set_command(&mut cli.command, Command::GenKeymap, &arg)?,
+        let (flag, inline) = split_flag(&arg);
+        match flag {
+            "--ibus" => {
+                reject_inline(&arg)?;
+                cli.overrides.ibus = true;
+            }
+            "--help" | "-h" | "help" => {
+                reject_inline(&arg)?;
+                cli.command = Some(Command::Help);
+            }
+            "toggle" => set_command(&mut cli.command, Command::Toggle, flag)?,
+            "enable" => set_command(&mut cli.command, Command::Enable, flag)?,
+            "disable" => set_command(&mut cli.command, Command::Disable, flag)?,
+            "status" => set_command(&mut cli.command, Command::Status, flag)?,
+            "gen-keymap" => set_command(&mut cli.command, Command::GenKeymap, flag)?,
             "backend" => {
-                set_command(&mut cli.command, Command::Backend, &arg)?;
+                set_command(&mut cli.command, Command::Backend, flag)?;
                 if let Some(next) = args.peek() {
                     if !next.starts_with('-') {
                         let Some(raw) = args.next() else {
@@ -138,41 +145,34 @@ where
                     }
                 }
             }
-            "--symbols" => cli.gen_keymap_symbols = true,
-            "--rules" => cli.gen_keymap_rules = true,
+            "--symbols" => {
+                reject_inline(&arg)?;
+                cli.gen_keymap_symbols = true;
+            }
+            "--rules" => {
+                reject_inline(&arg)?;
+                cli.gen_keymap_rules = true;
+            }
             "--config" | "-c" => {
-                cli.overrides.config_path = Some(PathBuf::from(next_value(&mut args, "--config")?));
-            }
-            _ if arg.starts_with("--config=") || arg.starts_with("-c=") => {
                 cli.overrides.config_path =
-                    Some(PathBuf::from(value_after_equals(&arg, "--config")?));
+                    Some(PathBuf::from(take_value(&mut args, inline, "--config")?));
             }
-            "--log-level" => cli.overrides.log_level = Some(next_value(&mut args, "--log-level")?),
-            _ if arg.starts_with("--log-level=") => {
-                cli.overrides.log_level = Some(value_after_equals(&arg, "--log-level")?);
+            "--log-level" => {
+                cli.overrides.log_level = Some(take_value(&mut args, inline, "--log-level")?)
             }
-            "--log-path" => cli.overrides.log_path = Some(next_value(&mut args, "--log-path")?),
-            _ if arg.starts_with("--log-path=") => {
-                cli.overrides.log_path = Some(value_after_equals(&arg, "--log-path")?);
+            "--log-path" => {
+                cli.overrides.log_path = Some(take_value(&mut args, inline, "--log-path")?)
             }
-            "--log-module" => cli
-                .overrides
-                .log_modules
-                .push(next_value(&mut args, "--log-module")?),
-            _ if arg.starts_with("--log-module=") => {
+            "--log-module" => {
                 cli.overrides
                     .log_modules
-                    .push(value_after_equals(&arg, "--log-module")?);
+                    .push(take_value(&mut args, inline, "--log-module")?)
             }
-            "--log-modules" => cli
-                .overrides
-                .log_modules
-                .extend(parse_csv_list(&next_value(&mut args, "--log-modules")?)),
-            _ if arg.starts_with("--log-modules=") => {
-                cli.overrides
-                    .log_modules
-                    .extend(parse_csv_list(&value_after_equals(&arg, "--log-modules")?));
-            }
+            "--log-modules" => cli.overrides.log_modules.extend(parse_csv_list(&take_value(
+                &mut args,
+                inline,
+                "--log-modules",
+            )?)),
             other if other.starts_with('-') => {
                 return Err(anyhow::anyhow!("daklak: unknown option {other:?}"));
             }
@@ -216,18 +216,36 @@ fn set_command(slot: &mut Option<Command>, command: Command, arg: &str) -> Resul
     Ok(())
 }
 
-fn next_value(
-    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
-    flag: &str,
-) -> Result<String> {
-    args.next()
-        .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
+fn reject_inline(arg: &str) -> Result<()> {
+    if arg.starts_with('-') && arg.contains('=') {
+        return Err(anyhow::anyhow!("daklak: unknown option {arg:?}"));
+    }
+    Ok(())
 }
 
-fn value_after_equals(arg: &str, flag: &str) -> Result<String> {
-    arg.split_once('=')
-        .map(|(_, value)| value.to_owned())
-        .filter(|value| !value.is_empty())
+fn split_flag(arg: &str) -> (&str, Option<String>) {
+    if arg.starts_with('-') {
+        match arg.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (arg, None),
+        }
+    } else {
+        (arg, None)
+    }
+}
+
+fn take_value(
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+    inline: Option<String>,
+    flag: &str,
+) -> Result<String> {
+    if let Some(value) = inline {
+        if value.is_empty() {
+            return Err(anyhow::anyhow!("missing value for {flag}"));
+        }
+        return Ok(value);
+    }
+    args.next()
         .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
 }
 
@@ -456,6 +474,27 @@ mod cli_tests {
 
         let cli = parse_from(&["backend", "toggle"]).unwrap();
         assert_eq!(cli.backend_arg, Some(BackendTarget::Toggle));
+    }
+
+    #[test]
+    fn parses_inline_flag_values_and_rejects_junk_on_switches() {
+        let cli = parse_from(&["--config=/tmp/x"]).unwrap();
+        assert_eq!(
+            cli.overrides.config_path,
+            Some(PathBuf::from("/tmp/x"))
+        );
+
+        let cli = parse_from(&["--log-level=debug"]).unwrap();
+        assert_eq!(cli.overrides.log_level.as_deref(), Some("debug"));
+
+        let cli = parse_from(&["--log-modules=a,b"]).unwrap();
+        assert_eq!(cli.overrides.log_modules, ["a".to_string(), "b".to_string()]);
+
+        assert!(parse_from(&["--config="]).is_err());
+        assert!(parse_from(&["--ibus=yes"]).is_err());
+        assert!(parse_from(&["-h=lol"]).is_err());
+        assert!(parse_from(&["--symbols=1"]).is_err());
+        assert!(parse_from(&["--rules="]).is_err());
     }
 
     #[tokio::test]

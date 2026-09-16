@@ -143,8 +143,12 @@ impl AdapterHandler for Daemon {
             // the word at cursor); otherwise the gate decides via the one-char
             // / recent-action heuristics. On gedit/KWin the returned repair
             // undoes a raw-forwarded tone key the fused frame just revealed.
-            let repair =
-                w.observe_surrounding_bytes(text, ByteCursor(*cursor), ByteCursor(*anchor), activate);
+            let repair = w.observe_surrounding_bytes(
+                text,
+                ByteCursor(*cursor),
+                ByteCursor(*anchor),
+                activate,
+            );
             if let Some(repair) = repair {
                 let serial = ctx.serial();
                 let raw_mods = ctx.raw_mods();
@@ -187,63 +191,46 @@ impl AdapterHandler for Daemon {
         let repeat = ctx.is_repeat();
 
         if !repeat {
-            if let Some(w) = self.router.composer.as_mut() {
+            self.with_composer(|w| {
                 w.check_idle_reset();
-            }
+            });
         }
 
-        let now_enabled = self.enabled.load(Ordering::Acquire);
-        if !repeat {
-            if self.router.last_enabled && !now_enabled {
-                if let Some(w) = self.router.composer.as_mut() {
-                    w.full_reset();
-                }
-            }
-            self.router.last_enabled = now_enabled;
-        }
-        if !now_enabled {
+        let enabled = if repeat {
+            self.enabled.load(Ordering::Acquire)
+        } else {
+            self.sync_enabled_edge()
+        };
+        if !enabled {
             return KeyDecision::ForwardRaw;
         }
 
         // When the supervisor has layered evdev on top (suspended=true),
         // pass all keys through raw — the evdev grab owns the keyboard.
         if self.suspended.load(Ordering::Acquire) {
-            if let Some(w) = self.router.composer.as_mut() {
-                w.full_reset();
-            }
+            self.with_composer(|w| w.full_reset());
             return KeyDecision::ForwardRaw;
         }
 
-        let shortcut_mods = ModifierState::CTRL | ModifierState::ALT | ModifierState::SUPER;
-        if self.router.modifiers.intersects(shortcut_mods) {
-            tracing::debug!(key, mods = ?self.router.modifiers,
-                "modifier shortcut → bypass engine + forward");
-            // Same rationale as NAV: shortcuts (Ctrl+V paste, Ctrl+A select,
-            // etc.) end the current composition. Roll the action clock back so
-            // the next surrounding frame can re-seed from whatever word the
-            // cursor lands on. (A repeat already did this on the initial press.)
-            if !repeat {
-                if let Some(w) = self.router.composer.as_mut() {
-                    w.reset_composition_preserving_surrounding();
-                    w.defer_action();
-                }
+        let shortcut = self
+            .router
+            .modifiers
+            .intersects(ModifierState::CTRL | ModifierState::ALT | ModifierState::SUPER);
+        if shortcut || NAV_KEYS.contains(&key) {
+            if shortcut {
+                tracing::debug!(key, mods = ?self.router.modifiers,
+                    "modifier shortcut → bypass engine + forward");
+            } else {
+                tracing::debug!(key, "key: nav → reset shadow + forward");
             }
-            ctx.vk_key_press_unstamped(time, key);
-            return KeyDecision::Consumed;
-        }
-
-        if NAV_KEYS.contains(&key) {
-            tracing::debug!(key, "key: nav → reset shadow + forward");
-            // Roll the action clock back so the next surrounding frame bypasses
-            // the recent-action gate and re-seeds. NAV ends the current
-            // composition — the cursor is now elsewhere and the next char
-            // should compose against whatever word the cursor lands on (killer
-            // feature, multi-hop: "bò bo|" → arrows → "bò bof|" → composes).
+            // Shortcuts and NAV both end composition. Roll the action clock
+            // so the next surrounding frame re-seeds from the word at the new
+            // cursor. Repeats already did this on the initial press.
             if !repeat {
-                if let Some(w) = self.router.composer.as_mut() {
+                self.with_composer(|w| {
                     w.reset_composition_preserving_surrounding();
                     w.defer_action();
-                }
+                });
             }
             ctx.vk_key_press_unstamped(time, key);
             return KeyDecision::Consumed;

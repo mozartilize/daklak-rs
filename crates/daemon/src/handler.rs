@@ -150,11 +150,10 @@ impl Daemon {
 
     /// Apply the enabled on→off edge and report whether the IME is currently
     /// enabled. When daklak is toggled off mid-word this resets the in-flight
-    /// composition so the next enable starts clean. Shared by the evdev and
-    /// ibus transports: both must forward keys raw while disabled instead of
-    /// continuing to compose. (The wayland path inlines the same logic with an
-    /// extra key-repeat guard.)
-    #[cfg_attr(not(any(feature = "ibus", feature = "evdev_grab")), allow(dead_code))]
+    /// composition so the next enable starts clean. Shared by the evdev, ibus,
+    /// and wayland transports: all must forward keys raw while disabled instead
+    /// of continuing to compose. Wayland skips this on key-repeat so the
+    /// enabled edge is not observed twice.
     pub(crate) fn sync_enabled_edge(&mut self) -> bool {
         let now_enabled = self.enabled.load(Ordering::Acquire);
         if self.router.last_enabled && !now_enabled {
@@ -164,6 +163,12 @@ impl Daemon {
         }
         self.router.last_enabled = now_enabled;
         now_enabled
+    }
+
+    pub(crate) fn with_composer(&mut self, f: impl FnOnce(&mut Composer)) {
+        if let Some(w) = self.router.composer.as_mut() {
+            f(w);
+        }
     }
 
     /// Poll the config-change channel and apply pending changes (method,
