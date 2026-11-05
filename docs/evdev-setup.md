@@ -110,77 +110,60 @@ writes to `/etc` on your behalf.
 
 The engine commits precomposed characters (`ấ`, `ầ`, …) that don't exist in the
 `us` xkb layout. Uinput emits raw keycodes; the compositor maps them through its
-active layout. Without a layout that knows Vietnamese precomposed chars at the
-slot keycodes daklak picks, those commits would render as the keycode's default
-keysym (a Japanese IME function, an F13+ keysym, etc).
+active layout. Without a layout that knows Vietnamese precomposed chars, those
+commits would render as whatever the emitted key normally types.
 
 Daklak generates the same synthetic keymap the Wayland ForwardKey
-virtual-keyboard channel uploads to `zwp_virtual_keyboard_v1` — 17 `EIGHT_LEVEL`
-custom slots over evdev keycodes ≤ 255 so XWayland clients receive them too:
+virtual-keyboard channel uploads to `zwp_virtual_keyboard_v1`. It puts the
+Vietnamese letters on **levels 5-8 of ordinary typing keys** — the 26 letter
+keys plus `; ' [ ] , . / \` — and leaves levels 1-4 to the user's layout:
 
-- **IME zone** (kc 85,86,89-94 with 92 reserved): `<ZEHA>`, `<LSGT>`, `<AB11>`,
-  `<KATA>`, `<HIRA>`, `<HKTG>`, `<MUHE>`, `<AE13>` (KEY_YEN) — 8 slots.
-- **F13-F19** (kc 183-189): `<FK13>..<FK19>` — 7 slots.
-- **Korean IME** (kc 122, 123): `<HNGL>` (KEY_HANGEUL), `<HJCV>` (KEY_HANJA) —
-  2 slots.
+| Level | Modifiers              | Content                 |
+|-------|------------------------|-------------------------|
+| 1-4   | (layout's own)         | untouched (`o O`, …)    |
+| 5 / 6 | LevelFive (+ Shift)    | first letter / upper    |
+| 7 / 8 | LevelThree + LevelFive (+ Shift) | second letter / upper |
 
-`<AE13>` (KEY_YEN, kc 124) carries slot 7 instead of `<JPCM>` (KEY_KPJPCOMMA,
-kc 95): Chromium/Electron clients (e.g. VSCode) have no DomCode for evdev 95,
-so keysyms bound there never turn into text in those apps — the i-family (ì í ỉ
-ĩ) would silently vanish while every other composition rendered. KEY_YEN maps
-to Chromium's live `IntlYen` DomCode, so it works in Chromium and native clients
-alike.
+Each family's base vowel key carries two letters of that family (`â ă` on A,
+`ê è` on E, `ô ơ` on O, `ư ù` on U, `đ` on D, …), so a client that ignores
+levels 5-8 degrades to the plain base letter for the most common letters. The
+full table is `SLOTS` in [`crates/keymap/src/lib.rs`](../crates/keymap/src/lib.rs).
 
-F20/F21 (kc 190/191) are deliberately skipped — they were observed silently
-filtered on at least one xfce4 X11 session (the event reached the uinput cap and
-the xkb keymap had the right keysym bound, but `xev` never saw the KeyPress).
-The source of the filter wasn't pinned down, so we route around it.
+**Why ordinary typing keys.** Keycodes nobody types (Japanese/Korean IME keys,
+F13+, Sun editing keys) each mean something different to some client:
+Chromium/Electron drop evdev codes missing from their DomCode table, desktop
+daemons grab others, and terminals that encode by *physical* key send escape
+sequences instead of the produced text — Ghostty ≥ 1.4 turns physical F13-F25
+into `CSI 25~`…, so `ô` placed on F14 showed up as `~` in the shell. Letter and
+punctuation keys are the most-exercised input path of every toolkit and only
+ever mean text. They also sit far below the X11 8-bit keycode ceiling, so
+XWayland clients receive them too.
 
-Slot 92 (`KEY_HENKAN`, `<HENK>`) is reserved as the `ISO_Level5_Shift` modifier
-carrier so the keymap can address levels 5-8 via Mod3. Daklak never physically
-presses `<HENK>` — it sets the Mod3 bit synthetically before pressing the slot
-keycode. The keymap applies **per-device** to daklak's own uinput device so the
-user's other keyboards are unaffected.
+**Level selectors.** Level 5 is selected by Mod3 (`ISO_Level5_Shift`): the
+stock `pc` symbols map the virtual `<LVL5>` key to Mod3, and daklak's keymap also
+binds `<HENK>` (`KEY_HENKAN`, kc 92) so evdev mode has a real key to press
+through uinput. Level 3 is selected by Mod5 via `<RALT>` (`ISO_Level3_Shift`).
+GTK does not report Mod3 to applications, so apps see plain text, not a
+shortcut. The keymap applies **per-device** to daklak's own uinput device on
+sway, so the user's other keyboards are unaffected.
 
-The slot keycodes and names live in
-[`crates/keymap/src/lib.rs`](../crates/keymap/src/lib.rs) (`SAFE_KEYCODES` /
-`SAFE_KEYCODE_NAMES`, with the L5 carrier as `LEVEL5_SHIFT_EVDEV`).
+**Caps Lock.** Slot keys use the stock `EIGHT_LEVEL` type, which leaves Caps
+Lock to libxkbcommon's capitalization transform: Caps + `o` → `O`, Caps + `ô`
+→ `Ô`, Caps + `,` → `,`.
 
-### XWayland compatibility
+### Known limitation: old X11 apps
 
-Slot keycodes deliberately stay ≤ 255 so the X11 8-bit keycode field can carry
-them. Firefox-X11, JetBrains IDEs, and any other Xorg-only client receives
-Vietnamese precomposed chars the same way native Wayland clients (foot,
-Chromium-Wayland, kate-Wayland) do. Each emit triggers an X11 `MappingNotify`
-storm as the compositor re-pushes the seat keymap on device switch — observable
-in `xev` but harmless in practice (clients typically lazy-cache xkb state).
+**Old X11 apps that only support up to 4 xkb levels** — notably **urxvt** —
+ignore levels 5-8 and type the key's level-1 symbol instead. With the
+family-on-base-key layout that is the plain base letter for `â ă ê è ô ơ ư ù ì
+í ỳ ý đ` (`ô` → `o`), and an unrelated letter or punctuation for the
+remaining tone-marked letters. Native Wayland clients (foot, ghostty, Firefox
+Wayland, kate) and modern XWayland clients (Chromium, Firefox X11, JetBrains,
+OnlyOffice, Steam) handle all 8 levels.
 
-### Known limitation: EIGHT_LEVEL and old X11 apps
-
-The synth keymap uses `EIGHT_LEVEL` xkb type to pack 4 Vietnamese
-character pairs per keycode (17 keycodes for 134 keysyms). Levels 5-8
-require `ISO_Level5_Shift` (bound to `<HENK>`/Mod3). **Old X11 apps
-that only support up to 4 xkb levels** — notably **urxvt** — silently
-ignore levels 5-8 and produce the level-1 character instead, yielding
-wrong output for roughly half the Vietnamese inventory.
-
-Native Wayland clients (foot, ghostty, Firefox Wayland, kate) and
-modern XWayland clients (Chromium, Firefox X11, JetBrains, OnlyOffice,
-Steam) handle all 8 levels correctly.
-
-Switching to `FOUR_LEVEL` (2 pairs per key) would fix urxvt but
-requires 34 keycodes instead of 17. The remaining safe keycodes with
-Chromium DomCode support do not provide the 17 additional slots this
-would require. Since
-xkb ties Shift to level selection (Shift IS level 2, not an
-independent case modifier), uppercase cannot be decoupled from the
-level count — each character pair (lower + Shift→upper) always
-consumes 2 levels.
-
-This is accepted as a known limitation: old X11 terminal emulators
-that lack full xkb level support are not a target platform. Users on
-urxvt can switch to a Wayland-native terminal or use the Wayland
-transport (text-input-v3 / input-method-v1) instead of evdev grab.
+Old X11 terminal emulators that lack full xkb level support are not a target
+platform. Users on urxvt can switch to a Wayland-native terminal or use the
+Wayland transport (text-input-v3 / input-method-v1) instead of evdev grab.
 
 ## Generating the keymap
 
@@ -191,14 +174,14 @@ is the user's responsibility (one `swaymsg` / `xkbcomp` / `kwriteconfig6` /
 
 - `daklak gen-keymap` — the **full keymap blob** (`xkb_keymap { … }`). For the
   per-device / session-wide blob paths (`swaymsg … xkb_file`, `xkbcomp`).
-- `daklak gen-keymap --symbols` — the standalone `xkb_symbols` fragment, with
-  **two sections**: `basic` (self-contained: includes `pc+us+inet(evdev)` then
-  applies the daklak overrides — for selecting `daklak_vn` as a layout) and
-  `overlay` (the daklak overrides *only*, no base include — for applying daklak
-  as an xkb **option** on KDE/GNOME Wayland; see below).
+- `daklak gen-keymap --symbols` — the standalone `xkb_symbols` file, with
+  **three sections**: `basic` (self-contained: includes `pc+us+inet(evdev)` then
+  adds the daklak levels — for selecting `daklak_vn` as a layout),
+  `level_mods` (the `<RALT>`/`<HENK>` level selectors) and `overlay` (the
+  Vietnamese levels 5-8 *only*). The last two are what the xkb **option** used
+  on KDE/GNOME Wayland applies; see below.
 - `daklak gen-keymap --rules` — the user-local **rules overlay** that pulls in
-  the stock `evdev` ruleset and registers the `daklak:vn` option mapping to
-  `daklak_vn(overlay)`.
+  the stock `evdev` ruleset and registers the `daklak:vn` option.
 
 ```
 daklak gen-keymap          > /tmp/daklak.xkb                      # blob
@@ -218,8 +201,8 @@ also installs `daklak_vn` system-wide under `/usr/share/X11/xkb/symbols/` for
 the `setxkbmap daklak_vn` *layout* path. The built-in hooks consume these
 installed files instead of running `daklak gen-keymap` at runtime.
 
-Verify it parses cleanly (optional — the slot/name table is checked at compile
-time via a `const` assertion, so this is just for hand-editing or CI):
+Verify it parses cleanly (optional — the crate's tests compile the blob and the
+option against several layouts, so this is just for hand-editing or CI):
 
 ```
 xkbcomp -I/usr/share/X11/xkb -xkb /tmp/daklak.xkb /tmp/daklak.xkm
@@ -229,8 +212,8 @@ Harmless warnings to expect (both `xkbcomp -xkb …` and `xkbcomp … $DISPLAY`
 flows):
 
 - `Keycodes above 256 (e.g. <I256>) are not supported by X and are ignored` —
-  X11 wire keycodes cap at 8 bits. Daklak slots all sit under 200, but
-  `evdev+aliases(qwerty)` declares keys past that.
+  X11 wire keycodes cap at 8 bits. Daklak's slot keys are ordinary typing
+  keys, but `evdev+aliases(qwerty)` declares keys past that.
 - `<I###> not found in evdev_daklak keycodes` / `No symbols defined for <I###>`
   — same root cause. The include declares names daklak doesn't bind symbols for.
   Non-fatal.
@@ -240,11 +223,10 @@ flows):
   include ships this way.
 
 Real failures look different: parse errors, `Maximum code (X) must be >= …`, or
-"not found" warnings naming `<FK13..21>`, `<ZEHA>`, `<HKTG>`, `<LSGT>`,
-`<KATA>`, `<HIRA>`, `<MUHE>`, `<AE13>`, `<AB11>`, or `<HENK>` — those are
-daklak's own slot names. If you see those, the keycode naming in
-[`crates/keymap/src/lib.rs`](../crates/keymap/src/lib.rs) (`SAFE_KEYCODE_NAMES`)
-has drifted from the system's evdev keycodes file.
+"not found" warnings naming `<HENK>`, `<RALT>` or a letter/punctuation key
+(`<AD09>`, `<AB08>`, …). If you see those, the key names in `SLOTS`
+([`crates/keymap/src/lib.rs`](../crates/keymap/src/lib.rs)) have drifted from
+the system's evdev keycodes file.
 
 ## sway / scroll (per-device)
 
@@ -284,29 +266,34 @@ Per-device raw-keymap APIs aren't standard on these. Daklak itself still runs
 and emits as before — only the compositor-side keymap mapping is applied
 manually, session-wide.
 
-Applying daklak's slots session-wide is harmless even though it touches every
-device's keymap: daklak grabs the physical keyboards, so the compositor only
-ever sees daklak's own uinput emits traverse the session keymap. And the overlay
-is purely *additive* — the base layout (`us`, …) is untouched for ordinary keys;
-daklak only redefines the high IME / F13-F19 / Korean slot keycodes that normal
-typing never produces.
+Applying daklak's levels session-wide is harmless even though it touches every
+device's keymap: the overlay is purely *additive*. It only fills levels 5-8 that
+the user's layout leaves empty, in every configured layout, and never replaces
+a symbol the layout defines — layouts that already use level 5 (`de(neo)`,
+`fr(bepo_afnor)`, …) keep theirs. The only other change is `<RALT>` →
+`ISO_Level3_Shift` and `<HENK>` → `ISO_Level5_Shift`.
 
 ### Why an xkb *option*, not a *layout* (Wayland)
 
-The intuitive approach — install `daklak_vn` as a layout and select it — is
-broken on KDE/GNOME by xkb rules composition. Selecting it as a layout composes
-`pc+daklak_vn+inet(evdev)`, and `inet(evdev)` is appended **last**, re-defining 8
-of daklak's 17 slots (`<ZEHA>` → the `à/á/ả/ã` family, and `<FK13>`-`<FK19>` →
-the `o`/`u` families). Result: `hà` → `h;2~`, `hơn` → `hn`.
-
-Applied as an xkb **option** instead, daklak's symbols are merged *after*
-`inet(evdev)`, so the daklak overrides win and all 17 slots survive. That's what
-the `overlay` symbols variant + the `--rules` file are for. Both compositors
-read `~/.config/xkb` first (KWin via libxkbcommon defaults; Mutter explicitly —
-see [`meta-keymap-utils.c`](https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/936)),
+Selecting `daklak_vn` as a *layout* replaces the user's layout with daklak's
+`pc+us` base. Applied as an xkb **option**, daklak's symbols are merged *after*
+the user's layout and the model's `inet(evdev)`, on top of every configured
+layout (`us,ru` gets the Vietnamese levels in both groups). The `--rules` file
+registers the option through the classic per-layout `layout[N] option` rule
+sections, so it works with every libxkbcommon version. Both compositors read
+`~/.config/xkb` first (KWin via libxkbcommon defaults; Mutter explicitly — see
+[`meta-keymap-utils.c`](https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/936)),
 so no system files are edited.
 
-Drop the two user-local files once (shared by KDE and GNOME):
+The option matters for the **Wayland input-method-v1 path on KWin** too: there
+daklak sends keysyms and KWin resolves each one against the *session* keymap
+(lowest keycode that has the keysym at any level). With the option set, `ô`
+resolves to KEY_O + Mod3. A keysym missing from the session keymap goes through
+KWin's temporary one-key keymap on a scratch keycode instead (KEY_F24 since KWin
+6.8), which physical-key terminals such as Ghostty ≥ 1.4 encode as `CSI 24~`.
+
+Drop the two user-local files once (shared by KDE and GNOME), and regenerate
+them after upgrading daklak:
 
 ```
 daklak gen-keymap --symbols > ~/.config/xkb/symbols/daklak_vn
@@ -394,11 +381,11 @@ xkbcomp -i "$ID" /tmp/daklak.xkb $DISPLAY
 ```
 
 Verify daklak's slave keyboard actually has the right keymap (look for
-`EIGHT_LEVEL` Vietnamese keysyms on `<ZEHA>` / `<LSGT>` etc.):
+Vietnamese keysyms on levels 5-8 of the letter keys):
 
 ```
 xkbcomp -i "$ID" $DISPLAY /tmp/daklak_device.xkb
-grep -A2 "key <ZEHA>" /tmp/daklak_device.xkb   # expect agrave at level 1
+grep -A3 "key <AD09>" /tmp/daklak_device.xkb   # expect o, O, …, ocircumflex, Ocircumflex, ohorn, Ohorn
 ```
 
 This `xkbcomp` flow changes the layout for **every** input device. Physical
@@ -481,8 +468,8 @@ X11 (if you applied `xkbcomp` manually): `setxkbmap us` to reset.
 
 KDE/GNOME (option overlay): nothing to recover — the `daklak:vn` option persists
 in `kxkbrc` / `gsettings` across a daklak crash, and is harmless while daklak is
-stopped (it only redefines high IME slot keycodes that normal typing never
-emits). Re-launch daklak and it works again; clear the option with the revert
+stopped (it only fills levels 5-8, which normal typing never selects).
+Re-launch daklak and it works again; clear the option with the revert
 command above if you want it gone.
 
 ## Setup hooks
@@ -580,8 +567,8 @@ ls -l /dev/uinput   # expected: root uinput, mode crw-rw----
 
 Log out and back in after changing group membership.
 
-**Vietnamese commits appear as F13/F14… or Japanese IME glyphs.** Keymap not
-applied — slots fell through to their default evdev keysym. Check `swaymsg -t
+**Vietnamese commits appear as plain letters or punctuation (`ô` → `o`).** Keymap
+not applied — slot keys fell through to their level-1 symbol. Check `swaymsg -t
 get_inputs | grep -A5 daklak` for `xkb_active_layout_name = "Daklak Vietnamese"`.
 If absent, the `swaymsg input … xkb_file` step in your setup didn't run or failed
 — re-run it manually.

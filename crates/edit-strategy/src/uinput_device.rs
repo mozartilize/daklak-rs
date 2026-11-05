@@ -78,12 +78,9 @@ impl UinputDevice {
             KeyCode::KEY_F1, KeyCode::KEY_F2, KeyCode::KEY_F3, KeyCode::KEY_F4,
             KeyCode::KEY_F5, KeyCode::KEY_F6, KeyCode::KEY_F7, KeyCode::KEY_F8,
             KeyCode::KEY_F9, KeyCode::KEY_F10, KeyCode::KEY_F11, KeyCode::KEY_F12,
-            // F13-F19 host part of daklak's EIGHT_LEVEL Vietnamese slots.
-            // They're also added below by the daklak_slot_keycodes()
-            // loop; listing them here too keeps the cap bitmap explicit
-            // (and lets `evtest` show recognizable names). F20/F21 are
-            // intentionally absent — observed silently dropped on xfce4
-            // X11 sessions, see crates/keymap SAFE_KEYCODES doc.
+            // F13-F19 pass through real extended keyboards. daklak's
+            // Vietnamese slots are ordinary typing keys (listed above, and
+            // re-added below by the daklak_slot_keycodes() loop).
             KeyCode::KEY_F13, KeyCode::KEY_F14, KeyCode::KEY_F15, KeyCode::KEY_F16,
             KeyCode::KEY_F17, KeyCode::KEY_F18, KeyCode::KEY_F19,
             KeyCode::KEY_NUMLOCK, KeyCode::KEY_SCROLLLOCK,
@@ -117,7 +114,7 @@ impl UinputDevice {
         // non-contiguous: skips codes systemd-logind / brightness daemons
         // / display managers grab system-wide (e.g. KEY_SUSPEND=205,
         // KEY_BRIGHTNESSDOWN=224, KEY_SWITCHVIDEOMODE=227).
-        for &code in viet_ime_keymap::daklak_slot_keycodes() {
+        for code in viet_ime_keymap::daklak_slot_keycodes() {
             keys.insert(KeyCode::new(code));
         }
         let dev = VirtualDevice::builder()?

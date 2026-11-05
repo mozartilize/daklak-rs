@@ -43,7 +43,7 @@ channels (see below).
     `zwp_input_method_context_v1::keysym`;
   - **virtual-keyboard synthetic keymap** — im-v2/vk emits each replacement
     char as a keycode against daklak's synthesized xkb keymap (Vietnamese
-    precomposed chars at spare keycodes). This is the channel that reaches
+    precomposed chars on levels 5-8 of the letter keys). This is the channel that reaches
     clients with **no usable text-input at all** (some Qt apps, XWayland apps
     such as OnlyOffice, wlroots terminals such as Ghostty). Such clients never
     fire an `Activate`, so daklak synthesizes a ForwardKey session from focus

@@ -16,134 +16,131 @@
 //!   `keymap_text()` to `zwp_virtual_keyboard_v1.keymap()` via memfd).
 //! - `viet-ime-daemon` evdev mode (writes `keymap_text()` to a
 //!   `.xkb` file, points sway/scroll at it via `swaymsg input … xkb_file`).
+//! - KWin / Mutter sessions, through the `daklak:vn` xkb option
+//!   (`symbols_text()` + `rules_text()`), where the compositor resolves the
+//!   keysyms daklak sends against the session keymap.
 //!
-//! Vietnamese precomposed chars live in custom slots packed across 17
-//! evdev keycodes (all ≤ 255 so XWayland clients can receive them; see
-//! `SAFE_KEYCODES`) using **EIGHT_LEVEL** xkb type. Each slot holds 4
-//! Vietnamese lowercase letters interleaved with their uppercase mirrors:
+//! Vietnamese precomposed chars live on **levels 5-8 of ordinary typing
+//! keys** (letters plus a few punctuation keys; see `SLOTS`). Levels 1-4 stay
+//! whatever the user's layout puts there. Each slot key holds two Vietnamese
+//! lowercase letters and their uppercase forms:
 //!
-//! | Level | Modifier            | Wayland mod bits  |
-//! |-------|---------------------|-------------------|
-//! | 1     | (none)              | 0                 |
-//! | 2     | Shift               | 0x01              |
-//! | 3     | LevelThree (AltGr)  | 0x80 (Mod5)       |
-//! | 4     | Shift + LevelThree  | 0x81              |
-//! | 5     | LevelFive           | 0x20 (Mod3)       |
-//! | 6     | Shift + LevelFive   | 0x21              |
-//! | 7     | LevelThree+LevelFive| 0xa0              |
-//! | 8     | Shift+L3+L5         | 0xa1              |
+//! | Level | Modifier             | Wayland mod bits | Content          |
+//! |-------|----------------------|------------------|------------------|
+//! | 1-4   | (layout's own)       |                  | untouched        |
+//! | 5     | LevelFive            | 0x20 (Mod3)      | first lowercase  |
+//! | 6     | Shift + LevelFive    | 0x21             | first uppercase  |
+//! | 7     | LevelThree+LevelFive | 0xa0             | second lowercase |
+//! | 8     | Shift+L3+L5          | 0xa1             | second uppercase |
 //!
-//! Standard QWERTY layout is preserved via `include "pc+us+inet(evdev)"`,
-//! so daklak can emit plain ASCII via standard evdev codes through the
-//! same keymap.
+//! **Why ordinary typing keys.** Earlier designs parked the letters on
+//! keycodes nobody types (Japanese/Korean IME keys, F13-F19, Sun editing
+//! keys). Every client has its own idea of what such keys are: Chromium
+//! drops codes missing from its DomCode table, physical-key terminals
+//! (Ghostty ≥ 1.4) encode F13+ as escape sequences instead of the produced
+//! text, desktop daemons grab others. Letter and punctuation keys are the
+//! most-exercised path in every toolkit and never mean anything but text.
+//!
+//! **Key type.** Slot keys use the stock `EIGHT_LEVEL` type: Lock is not
+//! consumed, so Caps Lock reaches clients as libxkbcommon's capitalization
+//! transform (Caps + `ô` → `Ô`, Caps + `,` → `,`). That is correct for both
+//! letters and for punctuation that sits on a "letter" position in other
+//! layouts (AZERTY `,` on `<AB07>`, Dvorak `'` on `<AD01>`). The one
+//! difference from an alphabetic key type: Shift + Caps Lock on a slot key
+//! yields uppercase instead of lowercase.
 
 pub mod xkb;
 
-/// First evdev keycode in the slot inventory. Kept as a stable symbol
-/// for tests + telemetry; the actual keycode of slot N is
-/// `SAFE_KEYCODES[N]` (non-contiguous mapping).
-pub const BASE_EVDEV: u32 = SAFE_KEYCODES[0] as u32;
+/// One Vietnamese slot: an ordinary typing key whose levels 5 and 7 carry
+/// two lowercase letters (levels 6 and 8 carry their uppercase forms).
+struct Slot {
+    /// xkb key name (`evdev+aliases(qwerty)`).
+    name: &'static str,
+    /// Linux evdev keycode of that key.
+    keycode: u16,
+    /// Lowercase letters at level 5 and level 7.
+    lower: [Option<char>; 2],
+}
 
-/// Evdev keycodes for the 17 Vietnamese precomposed EIGHT_LEVEL slots.
+const fn slot(name: &'static str, keycode: u16, l5: char, l7: char) -> Slot {
+    Slot { name, keycode, lower: [Some(l5), Some(l7)] }
+}
+
+/// The Vietnamese slot table.
 ///
-/// **Why all ≤ 255**: fits the X11 8-bit keycode field, so XWayland
-/// clients (firefox-x11, IntelliJ, anything Xorg-only) receive the
-/// keysyms our custom keymap binds. The previous KEY_MACRO range
-/// (656-699) silently dropped on the XWayland boundary; verified via
-/// `tools/xkb-probe/probe-eight-level.{xkb,py}` and `vk_xkb_probe_eight`.
+/// Each family's base vowel key carries two letters of that family
+/// (`â ă` on A, `ô ơ` on O, `ư ù` on U, `đ` on D, …), so anything that
+/// ignores levels 5-8 degrades to the plain base letter for the most
+/// common letters. The remaining tone-marked letters fill the other letter
+/// keys in inventory order, then eight punctuation keys (`; ' [ ] , . / \`).
 ///
-/// **Why this kc set**: two zones with no userspace handler and no
-/// presence on US/EU keyboards:
+/// Constraints every slot key satisfies:
 ///
-/// - **IME zone** (kc 85,86,89-94): `KEY_ZENKAKUHANKAKU`, `KEY_102ND`,
-///   `KEY_RO`, `KEY_KATAKANA`, `KEY_HIRAGANA`, `KEY_KATAKANAHIRAGANA`,
-///   `KEY_MUHENKAN`. `KEY_HENKAN` (92) is reserved below as the
-///   `ISO_Level5_Shift` modifier_map binding. `KEY_KPJPCOMMA` (95) is
-///   deliberately avoided — Chromium/Electron clients (e.g. VSCode) have
-///   no DomCode for evdev 95, so keysyms bound there never become text
-///   there (see the `SAFE_KEYCODES` slot-7 note).
-///
-/// - **International/Korean** (kc 122,123,124): `KEY_HANGEUL`,
-///   `KEY_HANJA`, `KEY_YEN`. No US keyboard produces them and no system
-///   daemon listens; all three have live Chromium DomCode entries.
-///
-/// - **F13-F21** (kc 183-191): extended-function range. Default
-///   desktops have no bindings. F22-F24 (192-194) intentionally
-///   excluded for users with extended keyboards.
-///
-/// **Hostile-code dodge** (still relevant — only the rationale shifted
-/// from "above 255" to "skip these specific kc"):
-///
-/// - 205 `KEY_SUSPEND` → systemd-logind hibernates the host.
-/// - 224/225 `KEY_BRIGHTNESS{DOWN,UP}` → screen brightness.
-/// - 227 `KEY_SWITCHVIDEOMODE` → display swap.
-/// - 236 `KEY_BATTERY` → upower power query.
-/// - 237 `KEY_BLUETOOTH` → bluez radio toggle.
-/// - 238 `KEY_WLAN` → NetworkManager/rfkill disables WiFi.
-/// - 245 `KEY_DISPLAY_OFF` → DPMS blank.
-/// - 246 `KEY_WWAN`, 247 `KEY_RFKILL` → wireless toggles.
-///
-/// **Tradeoff — real-keyboard collision**: Japanese keyboards produce
-/// kc 85-94 and 122-124; some EU keyboards have `KEY_102ND` (86);
-/// extended kbs have F13+. If a user fires one of these on their real
-/// device, the
-/// real-kb's keymap decodes it (their pc+us+inet etc., NOT daklak's
-/// per-device keymap). Daklak's emit windows are guarded by EVIOCGRAB
-/// (evdev mode) or the wayland keyboard grab (wayland mode), so
-/// no race during commit.
-pub const SAFE_KEYCODES: &[u16] = &[
-    // IME zone (kc 85,86,89-94 with 92=HENKAN reserved for L5 mod binding).
-    // Slot 7 uses KEY_YEN (124) rather than KEY_KPJPCOMMA (95): Chromium/
-    // Electron (e.g. VSCode) has no DomCode for evdev 95 — it lives on the
-    // commented-out INTERNATIONAL6 line in Chromium's dom_code_data.inc, so
-    // keysyms bound to it never become text in Chromium clients (native xkb
-    // clients like foot/gedit read the keysym directly and are unaffected).
-    // KEY_YEN maps to Chromium's live IntlYen DomCode, like KEY_RO (89) and
-    // KEY_102ND (86), so the i-family (ì í ỉ ĩ) renders everywhere.
-    85, 86, 89, 90, 91, 93, 94, 124,
-    // F13-F19 = 183..189. F20 (190) and F21 (191) excluded — empirically
-    // some X11 sessions (observed on xfce4) silently filter X11 keycode
-    // 198/199 even when a matching keysym is bound. We don't know which
-    // daemon swallows them, so we steer clear; the slot count budget is
-    // still met using two non-F slots below.
-    183, 184, 185, 186, 187, 188, 189,
-    // KEY_HANGEUL (122) and KEY_HANJA (123) — Korean IME keys, no US
-    // keyboard produces them, no system daemon listens. Replace the
-    // dropped F20/F21 slots one-for-one. (KEY_YEN=124 is used above for
-    // slot 7; all three are the international/Korean zone.)
-    122, 123,
+/// - **Standard typing key** present on every PC keyboard, with a stable
+///   Chromium DomCode and no physical-key encoding in terminals.
+/// - **evdev kc ≤ 247** so XWayland (8-bit X11 keycodes) can deliver it.
+/// - **Not a digit key**: some layouts (AZERTY) put digits on Shift, and
+///   digits carry layout-specific Caps Lock semantics.
+/// - Not `<HENK>`, which is reserved for `ISO_Level5_Shift`.
+const SLOTS: &[Slot] = &[
+    // Family base keys.
+    slot("AC01", 30, 'â', 'ă'), // a
+    slot("AD03", 18, 'ê', 'è'), // e
+    slot("AD08", 23, 'ì', 'í'), // i
+    slot("AD09", 24, 'ô', 'ơ'), // o
+    slot("AD07", 22, 'ư', 'ù'), // u
+    slot("AD06", 21, 'ỳ', 'ý'), // y
+    Slot { name: "AC03", keycode: 32, lower: [Some('đ'), None] }, // d
+    // Remaining letters on the other letter keys.
+    slot("AD01", 16, 'à', 'á'), // q
+    slot("AD02", 17, 'ả', 'ã'), // w
+    slot("AD04", 19, 'ạ', 'ầ'), // r
+    slot("AD05", 20, 'ấ', 'ẩ'), // t
+    slot("AD10", 25, 'ẫ', 'ậ'), // p
+    slot("AC02", 31, 'ằ', 'ắ'), // s
+    slot("AC04", 33, 'ẳ', 'ẵ'), // f
+    slot("AC05", 34, 'ặ', 'é'), // g
+    slot("AC06", 35, 'ẻ', 'ẽ'), // h
+    slot("AC07", 36, 'ẹ', 'ề'), // j
+    slot("AC08", 37, 'ế', 'ể'), // k
+    slot("AC09", 38, 'ễ', 'ệ'), // l
+    slot("AB01", 44, 'ỉ', 'ĩ'), // z
+    slot("AB02", 45, 'ị', 'ò'), // x
+    slot("AB03", 46, 'ó', 'ỏ'), // c
+    slot("AB04", 47, 'õ', 'ọ'), // v
+    slot("AB05", 48, 'ồ', 'ố'), // b
+    slot("AB06", 49, 'ổ', 'ỗ'), // n
+    slot("AB07", 50, 'ộ', 'ờ'), // m
+    // Punctuation keys.
+    slot("AC10", 39, 'ớ', 'ở'), // ;
+    slot("AC11", 40, 'ỡ', 'ợ'), // '
+    slot("AD11", 26, 'ú', 'ủ'), // [
+    slot("AD12", 27, 'ũ', 'ụ'), // ]
+    slot("AB08", 51, 'ừ', 'ứ'), // ,
+    slot("AB09", 52, 'ử', 'ữ'), // .
+    slot("AB10", 53, 'ự', 'ỷ'), // /
+    slot("BKSL", 43, 'ỹ', 'ỵ'), // \
 ];
 
-/// Standard xkb key names for each slot in `SAFE_KEYCODES`, parallel by
-/// index. The `evdev+aliases(qwerty)` include already binds these names
-/// at the same X11 keycodes — we use them directly in `xkb_symbols`
-/// (overriding the include's default bindings) instead of inventing new
-/// `<DK##>` aliases. Reusing the existing names avoids the redefinition
-/// warnings `xkbcomp … $DISPLAY` emits when loading session-wide on X11.
-pub const SAFE_KEYCODE_NAMES: &[&str] = &[
-    "ZEHA", "LSGT", "AB11", "KATA", "HIRA", "HKTG", "MUHE", "AE13",
-    "FK13", "FK14", "FK15", "FK16", "FK17", "FK18", "FK19",
-    "HNGL", "HJCV",
-];
-
-const _: () = assert!(SAFE_KEYCODES.len() == SAFE_KEYCODE_NAMES.len());
+/// Evdev keycode of the first slot. Kept as a stable symbol for downstream
+/// re-exports and telemetry.
+pub const BASE_EVDEV: u32 = SLOTS[0].keycode as u32;
 
 /// Evdev keycode bound to `ISO_Level5_Shift` in our keymap via
-/// `modifier_map Mod3 { <HENK> }`. Daklak never physically presses this
-/// — wayland mode addresses Mod3 via `vk.modifiers(0x20, …)`, evdev
-/// mode emits a synthetic press of this kc through uinput before the
-/// slot keycode. Reserved to avoid SAFE_KEYCODES collision.
+/// `modifier_map Mod3 { <HENK> }` (KEY_HENKAN). Wayland mode addresses Mod3
+/// via `vk.modifiers(0x20, …)`; evdev mode emits a synthetic press of this kc
+/// through uinput before the slot keycode. Never a slot key.
 pub const LEVEL5_SHIFT_EVDEV: u16 = 92; // KEY_HENKAN
 
 /// Wayland modifier bits (mods_depressed) used to address xkb levels.
 pub const MOD_SHIFT: u32 = 0x01;
-/// LevelThree is bound to Mod5 (AltGr) by the standard `pc+us+inet(evdev)`
-/// layout we include. Setting this bit selects xkb level 3.
+/// LevelThree is bound to Mod5 (AltGr) by the standard `pc` symbols we
+/// include. Setting this bit selects xkb level 3.
 pub const MOD_LEVEL3: u32 = 0x80;
-/// LevelFive is bound to Mod3 in our keymap via `LEVEL5_SHIFT_EVDEV` →
-/// `ISO_Level5_Shift`. Setting this bit selects xkb level 5+ in our
-/// EIGHT_LEVEL custom slots. Real-keyboard apps generally do not use
-/// Mod3, so it stays free for daklak.
+/// LevelFive is bound to Mod3 (`<LVL5>` in `pc`, plus `<HENK>` in our
+/// symbols). Setting this bit selects xkb level 5+ on the slot keys. Real
+/// keyboard apps generally do not use Mod3, and GTK does not report it, so
+/// clients see plain text, not a shortcut.
 pub const MOD_LEVEL5: u32 = 0x20;
 
 /// Specification for emitting `c` through `zwp_virtual_keyboard_v1::key()`
@@ -156,8 +153,7 @@ pub struct EmitSpec {
     pub mods: u32,
 }
 
-/// Vietnamese lowercase precomposed inventory. Order is stable — index N
-/// determines (slot, level) in the synthesized keymap.
+/// Vietnamese lowercase precomposed inventory.
 const VN_LOWER: &[char] = &[
     // a-family
     'à', 'á', 'ả', 'ã', 'ạ',
@@ -200,26 +196,11 @@ const VN_UPPER: &[char] = &[
 
 const _: () = assert!(VN_LOWER.len() == VN_UPPER.len());
 
-/// Number of EIGHT_LEVEL slots needed to pack all Vietnamese chars.
-/// `ceil(VN_LOWER.len() / 4)` since each slot holds 4 lowercase letters
-/// (at L1, L3, L5, L7) plus their uppercase mirrors (L2, L4, L6, L8).
-pub const fn slots_needed() -> usize {
-    VN_LOWER.len().div_ceil(4)
-}
-
-const _: () = assert!(SAFE_KEYCODES.len() == slots_needed());
-
-/// Evdev keycode for slot `slot`. Indexes into `SAFE_KEYCODES`.
-#[inline]
-pub const fn slot_keycode(slot: usize) -> u16 {
-    SAFE_KEYCODES[slot]
-}
-
 /// Every evdev keycode daklak emits for Vietnamese chars. `UinputDevice`
 /// passes each through `UI_SET_KEYBIT` — kernel drops emits for codes
 /// not in the device capability set.
-pub fn daklak_slot_keycodes() -> &'static [u16] {
-    SAFE_KEYCODES
+pub fn daklak_slot_keycodes() -> impl Iterator<Item = u16> {
+    SLOTS.iter().map(|s| s.keycode)
 }
 
 /// Mods to set on `vk.modifiers()` to address level `lv` (1..=8).
@@ -237,21 +218,27 @@ const fn level_mods(lv: u8) -> u32 {
     }
 }
 
-/// Locate `c` in the Vietnamese inventory and return (slot index, level).
-/// Packing: 4 lowercase chars per slot at L1, L3, L5, L7 (odd levels),
-/// uppercase mirrors at L2, L4, L6, L8 (even levels).
-fn locate_vn(c: char) -> Option<(usize, u8)> {
-    if let Some(i) = VN_LOWER.iter().position(|&x| x == c) {
-        let slot = i / 4;
-        let level: u8 = ((i % 4) as u8) * 2 + 1; // 1, 3, 5, 7
-        Some((slot, level))
-    } else if let Some(i) = VN_UPPER.iter().position(|&x| x == c) {
-        let slot = i / 4;
-        let level: u8 = ((i % 4) as u8) * 2 + 2; // 2, 4, 6, 8
-        Some((slot, level))
-    } else {
-        None
+/// Uppercase form of a Vietnamese lowercase letter from the inventory.
+fn vn_upper(lower: char) -> Option<char> {
+    let i = VN_LOWER.iter().position(|&x| x == lower)?;
+    VN_UPPER.get(i).copied()
+}
+
+/// Locate `c` in the slot table and return (slot, level 5..=8).
+fn locate_vn(c: char) -> Option<(&'static Slot, u8)> {
+    for slot in SLOTS {
+        for (j, lower) in slot.lower.iter().enumerate() {
+            let Some(lower) = *lower else { continue };
+            let base = 5 + (j as u8) * 2; // 5 or 7
+            if c == lower {
+                return Some((slot, base));
+            }
+            if Some(c) == vn_upper(lower) {
+                return Some((slot, base + 1));
+            }
+        }
     }
+    None
 }
 
 /// Map plain ASCII to its evdev keycode in the standard pc/us layout.
@@ -363,13 +350,13 @@ const ASCII_EVDEV: &[(char, u32, u32)] = &[
 ];
 
 /// Compute the (keycode, mods) needed to deliver `c` through
-/// `zwp_virtual_keyboard_v1::key()` or uinput. Tries Vietnamese custom
-/// slots first, then falls through to the standard ASCII layout. `None`
-/// only for chars outside both inventories.
+/// `zwp_virtual_keyboard_v1::key()` or uinput. Tries Vietnamese slots
+/// first, then falls through to the standard ASCII layout. `None` only for
+/// chars outside both inventories.
 pub fn char_to_emit(c: char) -> Option<EmitSpec> {
     if let Some((slot, level)) = locate_vn(c) {
         return Some(EmitSpec {
-            keycode: slot_keycode(slot) as u32,
+            keycode: slot.keycode as u32,
             mods: level_mods(level),
         });
     }
@@ -391,129 +378,125 @@ pub fn vn_pairs() -> usize {
 pub fn keymap_text() -> String {
     let mut s = String::with_capacity(16 * 1024);
     s.push_str("xkb_keymap {\n");
-    // ── keycodes — reuse the standard evdev keycode names ────────────────
-    // No new keycodes are declared: every slot in SAFE_KEYCODES reuses an
-    // xkb name already defined by `evdev+aliases(qwerty)` (see
-    // SAFE_KEYCODE_NAMES). The symbols block below overrides those keys
-    // with our EIGHT_LEVEL Vietnamese bindings.
+    // No new keycodes: every slot is a standard key name already defined by
+    // `evdev+aliases(qwerty)`.
     s.push_str("  xkb_keycodes \"evdev+daklak\" {\n");
     s.push_str("    include \"evdev+aliases(qwerty)\"\n");
     s.push_str("  };\n");
-    // ── xkb types & compat (LevelThree+LevelFive bindings via complete) ───
+    // ── xkb types & compat (EIGHT_LEVEL + LevelFive come from complete) ───
     s.push_str("  xkb_types \"complete\" { include \"complete\" };\n");
     s.push_str("  xkb_compat \"complete\" { include \"complete\" };\n");
-    // ── symbols — standard pc+us layout + EIGHT_LEVEL custom slots ────────
-    append_symbols_section(&mut s, "  ", "pc+us+daklak", true);
+    // ── symbols — standard pc+us layout + Vietnamese levels 5-8 ──────────
+    s.push_str("  xkb_symbols \"pc+us+daklak\" {\n");
+    append_basic_body(&mut s, "  ");
+    s.push_str("  };\n");
     s.push_str("};\n");
     s
 }
 
-/// Build a standalone xkb_symbols fragment for installation under
+/// Build a standalone xkb_symbols file for installation under
 /// `<xkb base>/symbols/daklak_vn` (system `<datadir>/X11/xkb/symbols/` or
 /// user-local `~/.config/xkb/symbols/`).
 ///
-/// Emits two sections:
+/// Emits three sections:
 /// - **`basic`** (default): self-contained — includes `pc+us+inet(evdev)`
-///   then applies the daklak overrides. Used when `daklak_vn` is selected
-///   as a *layout* (and by the standalone keymap blob path).
-/// - **`overlay`**: the daklak overrides *only*, with no base include. Used
-///   when daklak is applied as an xkb *option* (`daklak:vn`) on top of an
-///   existing base layout. This is the path that survives KDE/libxkbcommon's
-///   rules composition: option-supplied symbols are merged *after* the
-///   model's `inet(evdev)`, so the daklak slot overrides win instead of
-///   being re-clobbered by `inet`'s `<ZEHA>`/`<FK13>`-`<FK19>` definitions.
+///   then applies the daklak additions. Used when `daklak_vn` is selected
+///   as a *layout*.
+/// - **`level_mods`**: binds `<RALT>` to `ISO_Level3_Shift` and `<HENK>` to
+///   `ISO_Level5_Shift`, the physical keys evdev mode presses through uinput
+///   to select levels 3 and 5. Merged in *override* mode by the `daklak:vn`
+///   option.
+/// - **`overlay`**: the Vietnamese levels 5-8 only. Merged in *augment*
+///   mode by the `daklak:vn` option, so it fills the empty levels of the
+///   user's own layout and never replaces a symbol the layout defines.
 pub fn symbols_text() -> String {
     let mut s = String::with_capacity(12 * 1024);
-    s.push_str("default partial alphanumeric_keys\n");
-    append_symbols_section(&mut s, "", "basic", true);
-    s.push('\n');
+    s.push_str("default partial alphanumeric_keys modifier_keys\n");
+    s.push_str("xkb_symbols \"basic\" {\n");
+    append_basic_body(&mut s, "");
+    s.push_str("};\n\n");
+    s.push_str("partial modifier_keys\n");
+    s.push_str("xkb_symbols \"level_mods\" {\n");
+    append_level_mods(&mut s, "");
+    s.push_str("};\n\n");
     s.push_str("partial alphanumeric_keys\n");
-    append_symbols_section(&mut s, "", "overlay", false);
+    s.push_str("xkb_symbols \"overlay\" {\n");
+    append_slot_rows(&mut s, "");
+    s.push_str("};\n");
     s
 }
 
 /// Build the user-local xkb rules overlay for installation at
 /// `~/.config/xkb/rules/evdev`. It pulls in the stock `evdev` ruleset and
-/// registers the `daklak:vn` option, which maps to the `overlay` symbols
-/// variant. Applying daklak via this option (rather than as a layout)
-/// places its overrides after `inet(evdev)` in the composed keymap, which
-/// is what makes all 17 Vietnamese slots survive on KDE/Wayland without
-/// editing any system files.
+/// registers the `daklak:vn` option (see `append_option_rules`). Works with
+/// every libxkbcommon version.
 pub fn rules_text() -> String {
-    let mut s = String::with_capacity(128);
+    let mut s = String::with_capacity(768);
     s.push_str("// daklak xkb rules overlay — install at ~/.config/xkb/rules/evdev\n");
     s.push_str("// Pulls in the stock evdev ruleset, then registers the daklak:vn option.\n");
     s.push_str("! include %S/evdev\n");
-    s.push('\n');
-    s.push_str("! option = symbols\n");
-    s.push_str("  daklak:vn  =  +daklak_vn(overlay)\n");
+    append_option_rules(&mut s);
     s
 }
 
-/// Append one `xkb_symbols "<section>"` block. When `include_base` is true
-/// the block opens with `include "pc+us+inet(evdev)"` (self-contained
-/// layout); when false it emits the daklak overrides only (overlay variant
-/// meant to be merged onto an existing base layout via an xkb option).
-fn append_symbols_section(s: &mut String, indent: &str, section: &str, include_base: bool) {
-    s.push_str(&format!("{indent}xkb_symbols \"{section}\" {{\n"));
-    if include_base {
-        s.push_str(&format!("{indent}  include \"pc+us+inet(evdev)\"\n"));
+/// The `daklak:vn` option: applies `level_mods` (override) and `overlay`
+/// (augment) to **every** configured layout, using the classic per-layout
+/// `layout[N] option` sections (the same mechanism xkeyboard-config uses for
+/// `misc:typo`). Option symbols are merged after the model's `inet(evdev)`,
+/// so nothing re-clobbers them.
+fn append_option_rules(s: &mut String) {
+    s.push('\n');
+    s.push_str("! layout option = symbols\n");
+    s.push_str("  *  daklak:vn  =  +daklak_vn(level_mods)|daklak_vn(overlay)\n");
+    for n in 1..=4 {
+        s.push('\n');
+        s.push_str(&format!("! layout[{n}] option = symbols\n"));
+        s.push_str(&format!(
+            "  *  daklak:vn  =  +daklak_vn(level_mods):{n}|daklak_vn(overlay):{n}\n"
+        ));
     }
+}
+
+/// Body of the self-contained `basic` section (also used by the keymap
+/// blob): the us base layout, a group name, the level selectors and the
+/// Vietnamese levels.
+fn append_basic_body(s: &mut String, indent: &str) {
+    s.push_str(&format!("{indent}  include \"pc+us+inet(evdev)\"\n"));
     // Group name override — lets evdev mode probe whether scroll/sway
     // actually loaded our keymap (vs falling back to its default "English
     // (US)" for daklak's uinput device).
     s.push_str(&format!("{indent}  name[Group1] = \"Daklak Vietnamese\";\n"));
-    // Bake lv3:ralt_switch into the keymap so RightAlt selects Level3
-    // (Mod5). The standard us-evdev include binds RALT to Mod1 (= Alt),
-    // which makes daklak's emit dance for Vietnamese L3 chars appear to
-    // apps as Alt+keycode (a hotkey) instead of selecting L3 of the
-    // EIGHT_LEVEL DK slot. Without this, 'â', 'á', 'ấ', etc. silently
-    // drop because the compositor never enters Level3 mode for the emit.
+    append_level_mods(s, indent);
+    append_slot_rows(s, indent);
+}
+
+fn append_level_mods(s: &mut String, indent: &str) {
+    // RightAlt selects Level3 (Mod5). The us layout binds RALT to Alt_R
+    // (Mod1), which would make evdev mode's level-7/8 emit look like
+    // Alt+key (a hotkey) instead of selecting level 3.
     s.push_str(&format!("{indent}  replace key <RALT> {{ type[Group1] = \"ONE_LEVEL\", [ ISO_Level3_Shift ] }};\n"));
     s.push_str(&format!("{indent}  modifier_map Mod5 {{ <RALT> }};\n"));
     // LevelFive selector — HENK (KEY_HENKAN, evdev kc 92) is bound to
-    // ISO_Level5_Shift and routed to Mod3. Daklak addresses levels 5-8
-    // via Mod3 (= 0x20 in vk.modifiers depressed mask), or by pressing
-    // <HENK> through uinput before pressing the slot keycode in
-    // evdev mode. Real users with Japanese keyboards may hit
-    // KEY_HENKAN physically — that fires through their real-kb keymap,
-    // which doesn't have this binding.
+    // ISO_Level5_Shift and routed to Mod3, so evdev mode can press it
+    // through uinput. (`pc` already maps the virtual `<LVL5>` key to Mod3.)
     s.push_str(&format!("{indent}  replace key <HENK> {{ type[Group1] = \"ONE_LEVEL\", [ ISO_Level5_Shift ] }};\n"));
     s.push_str(&format!("{indent}  modifier_map Mod3 {{ <HENK> }};\n"));
-    append_symbol_rows(s, indent);
-    s.push_str(&format!("{indent}}};\n"));
 }
 
-fn append_symbol_rows(s: &mut String, indent: &str) {
-    for (i, &kc_name) in SAFE_KEYCODE_NAMES.iter().take(slots_needed()).enumerate() {
-        let base = i * 4;
-        // Collect up to 4 lower/upper pairs, padding shortfall with VoidSymbol.
-        let mut keysyms: [u32; 8] = [0xFFFFFF; 8];
-        for j in 0..4 {
-            let idx = base + j;
-            if idx < VN_LOWER.len() {
-                keysyms[j * 2] = VN_LOWER[idx] as u32;
-                keysyms[j * 2 + 1] = VN_UPPER[idx] as u32;
+/// One `key` row per slot: `NoSymbol` on levels 1-4 (keeps the layout's own
+/// symbols in every merge mode) and the Vietnamese pairs on levels 5-8.
+fn append_slot_rows(s: &mut String, indent: &str) {
+    for slot in SLOTS {
+        let mut row = String::from("NoSymbol, NoSymbol, NoSymbol, NoSymbol");
+        for lower in slot.lower {
+            match lower.and_then(|l| Some((l, vn_upper(l)?))) {
+                Some((l, u)) => row.push_str(&format!(", U{:04X}, U{:04X}", l as u32, u as u32)),
+                None => row.push_str(", NoSymbol, NoSymbol"),
             }
         }
-        // Format each keysym slot: VoidSymbol for the padding sentinel,
-        // U+XXXX literal otherwise.
-        let mut row = String::with_capacity(96);
-        for (k, &sym) in keysyms.iter().enumerate() {
-            if k > 0 {
-                row.push_str(", ");
-            }
-            if sym == 0xFFFFFF {
-                row.push_str("VoidSymbol");
-            } else {
-                row.push_str(&format!("U{sym:04X}"));
-            }
-        }
-        // `override` ensures the include's default symbol (e.g. F13 for
-        // <FK13>) is replaced rather than merged — without it xkbcomp
-        // emits "Multiple symbols for level 1/group 1" warnings.
         s.push_str(&format!(
-            "{indent}  replace key <{kc_name}> {{ type[Group1] = \"EIGHT_LEVEL\", [ {row} ] }};\n"
+            "{indent}  key <{}> {{ type[Group1] = \"EIGHT_LEVEL\", symbols[Group1] = [ {row} ] }};\n",
+            slot.name
         ));
     }
 }
@@ -538,98 +521,238 @@ pub fn plan_mod_dance(dep: u32, spec_mods: u32) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use xkbcommon::xkb::{
+        self as x, Context, Keycode, Keymap, State, CONTEXT_NO_DEFAULT_INCLUDES,
+        CONTEXT_NO_FLAGS, KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1,
+    };
 
-    #[test]
-    fn slots_under_kernel_key_max() {
-        // KEY_MAX = 0x2FF = 767 in <linux/input-event-codes.h>.
-        let max_kc = *SAFE_KEYCODES.iter().max().unwrap() as u32;
-        assert!(max_kc <= 767,
-            "Vietnamese slots overflowed KEY_MAX: max kc = {max_kc}");
+    /// Every lowercase + uppercase Vietnamese char.
+    fn all_vn() -> impl Iterator<Item = char> {
+        VN_LOWER.iter().chain(VN_UPPER.iter()).copied()
     }
 
     #[test]
-    fn safe_keycodes_skip_known_hostile_codes() {
-        // Every code below 255 has a userspace handler that grabs it
-        // independent of xkb. We sidestep all of them by living in the
-        // KEY_MACRO range; this test guards against accidental fallback.
-        for hostile in [
-            116u16, 142, 143, // power/sleep/wakeup
-            205,              // suspend
-            224, 225,         // brightness
-            227,              // switch video
-            236, 237, 238, 239, // battery / bluetooth / wlan / uwb
-            245, 246, 247,    // display-off / wwan / rfkill
+    fn slots_cover_inventory_exactly_once() {
+        let mut seen = BTreeSet::new();
+        for slot in SLOTS {
+            for l in slot.lower.iter().flatten() {
+                assert!(VN_LOWER.contains(l), "{l} is not in the inventory");
+                assert!(seen.insert(*l), "{l} assigned twice");
+            }
+        }
+        assert_eq!(seen.len(), VN_LOWER.len(), "every Vietnamese letter has a slot");
+    }
+
+    #[test]
+    fn slot_keys_are_unique_ordinary_typing_keys() {
+        // Letter rows (QWERTY…ASDF…ZXCV) plus `[ ] ; ' , . / \`. No digits,
+        // no function/editing/IME keys, nothing above the X11 8-bit ceiling.
+        let typing: BTreeSet<u16> = (16..=27).chain(30..=40).chain(43..=53).collect();
+        let mut codes = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        for slot in SLOTS {
+            assert!(typing.contains(&slot.keycode), "{} kc {} is not a typing key", slot.name, slot.keycode);
+            assert_ne!(slot.keycode, LEVEL5_SHIFT_EVDEV);
+            assert!(codes.insert(slot.keycode), "kc {} used twice", slot.keycode);
+            assert!(names.insert(slot.name), "{} used twice", slot.name);
+        }
+    }
+
+    // ── compiled keymap checks (need the system xkeyboard-config data) ──
+
+    const LOCK: u32 = 0x02;
+
+    fn sym_char(state: &State, kc: u32) -> Option<char> {
+        char::from_u32(x::keysym_to_utf32(state.key_get_one_sym(Keycode::new(kc + 8))))
+            .filter(|c| *c != '\0')
+    }
+
+    fn type_char(keymap: &Keymap, kc: u32, depressed: u32, locked: u32, group: u32) -> Option<char> {
+        let mut state = State::new(keymap);
+        state.update_mask(depressed, 0, locked, 0, 0, group);
+        sym_char(&state, kc)
+    }
+
+    fn blob_keymap() -> Keymap {
+        let ctx = Context::new(CONTEXT_NO_FLAGS);
+        Keymap::new_from_string(&ctx, keymap_text(), KEYMAP_FORMAT_TEXT_V1, KEYMAP_COMPILE_NO_FLAGS)
+            .expect("keymap_text() compiles")
+    }
+
+    #[test]
+    fn blob_delivers_every_char_from_its_emit_spec() {
+        let keymap = blob_keymap();
+        for c in all_vn().chain("az09AZ;'[],./\\".chars()) {
+            let spec = char_to_emit(c).unwrap();
+            assert_eq!(type_char(&keymap, spec.keycode, spec.mods, 0, 0), Some(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn blob_keeps_us_levels_and_caps_lock() {
+        let keymap = blob_keymap();
+        assert_eq!(type_char(&keymap, 24, 0, 0, 0), Some('o'));
+        assert_eq!(type_char(&keymap, 24, MOD_SHIFT, 0, 0), Some('O'));
+        assert_eq!(type_char(&keymap, 51, MOD_SHIFT, 0, 0), Some('<'));
+        // Caps Lock: letters capitalise, punctuation is untouched.
+        assert_eq!(type_char(&keymap, 24, 0, LOCK, 0), Some('O'));
+        assert_eq!(type_char(&keymap, 51, 0, LOCK, 0), Some(','));
+        // Vietnamese levels follow the same capitalization transform.
+        assert_eq!(type_char(&keymap, 24, MOD_LEVEL5, LOCK, 0), Some('Ô'));
+        assert_eq!(type_char(&keymap, 24, MOD_SHIFT | MOD_LEVEL5, LOCK, 0), Some('Ô'));
+    }
+
+    /// Install `daklak gen-keymap --symbols/--rules` into a scratch xkb root
+    /// and compile `layout(variant)` + `daklak:vn` through the real rules.
+    struct OptionRoot(std::path::PathBuf);
+
+    impl OptionRoot {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "daklak-keymap-test-{}-{tag}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(root.join("symbols")).unwrap();
+            std::fs::create_dir_all(root.join("rules")).unwrap();
+            std::fs::write(root.join("symbols/daklak_vn"), symbols_text()).unwrap();
+            std::fs::write(root.join("rules/evdev"), rules_text()).unwrap();
+            Self(root)
+        }
+
+        fn compile(&self, layout: &str, variant: &str, options: Option<String>) -> Keymap {
+            let mut ctx = Context::new(CONTEXT_NO_DEFAULT_INCLUDES);
+            assert!(ctx.include_path_append(&self.0));
+            // System xkb paths only: the developer's own ~/.config/xkb or
+            // ~/.xkb (possibly holding an older daklak install) must not leak
+            // into the result.
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let defaults = Context::new(CONTEXT_NO_FLAGS);
+            for path in defaults.include_paths() {
+                let path = std::path::Path::new(path);
+                if home.as_deref().is_none_or(|h| !path.starts_with(h)) {
+                    assert!(ctx.include_path_append(path));
+                }
+            }
+            Keymap::new_from_names(&ctx, "evdev", "pc105", layout, variant, options, KEYMAP_COMPILE_NO_FLAGS)
+                .unwrap_or_else(|| panic!("{layout}({variant}) compiles"))
+        }
+    }
+
+    impl Drop for OptionRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// KWin's `Xkb::keycodeFromKeysym`: first key (by keycode, then level)
+    /// in `group` whose symbols contain `sym`.
+    fn kwin_lookup(keymap: &Keymap, group: u32, sym: x::Keysym) -> Option<(u32, u32)> {
+        let min = keymap.min_keycode().raw();
+        let max = keymap.max_keycode().raw();
+        (min..max).find_map(|kc| {
+            let key = Keycode::new(kc);
+            (0..keymap.num_levels_for_key(key, group)).find_map(|level| {
+                keymap
+                    .key_get_syms_by_level(key, group, level)
+                    .contains(&sym)
+                    .then_some((kc - 8, level))
+            })
+        })
+    }
+
+    fn levels(keymap: &Keymap, kc: u32, group: u32, n: u32) -> Vec<Vec<x::Keysym>> {
+        let key = Keycode::new(kc + 8);
+        (0..n).map(|l| keymap.key_get_syms_by_level(key, group, l).to_vec()).collect()
+    }
+
+    #[test]
+    fn option_reaches_every_char_in_every_layout_and_keeps_user_levels() {
+        option_layouts_check(&OptionRoot::new("layouts"));
+    }
+
+    fn option_layouts_check(root: &OptionRoot) {
+        for (layout, variant) in [
+            ("us", ""),
+            ("fr", ""),
+            ("de", ""),
+            ("gb", ""),
+            ("es", ""),
+            ("us", "dvorak"),
+            ("us", "colemak"),
+            ("us,ru", ""),
+            ("ru,us", ""),
+            ("de,fr,us", ""),
         ] {
-            assert!(
-                !SAFE_KEYCODES.contains(&hostile),
-                "hostile keycode {hostile} leaked into SAFE_KEYCODES"
-            );
+            let plain = root.compile(layout, variant, None);
+            let daklak = root.compile(layout, variant, Some("daklak:vn".into()));
+            for group in 0..daklak.num_layouts() {
+                let what = format!("{layout}({variant}) group {group}");
+                for slot in SLOTS {
+                    let kc = slot.keycode as u32;
+                    assert_eq!(
+                        levels(&plain, kc, group, 4),
+                        levels(&daklak, kc, group, 4),
+                        "{what}: {} levels 1-4 changed",
+                        slot.name
+                    );
+                }
+                for c in all_vn() {
+                    let sym = xkb::commit_keysym(c).unwrap();
+                    let found = kwin_lookup(&daklak, group, sym)
+                        .unwrap_or_else(|| panic!("{what}: {c} not in keymap"));
+                    // Our slot, or a key of the layout's own that already
+                    // produces the char (fr `à`, `é`, …) — whichever comes
+                    // first in keycode order, exactly as KWin picks.
+                    let spec = char_to_emit(c).unwrap();
+                    let level = if spec.mods & MOD_LEVEL3 != 0 { 6 } else { 4 }
+                        + u32::from(spec.mods & MOD_SHIFT != 0);
+                    let ours = (spec.keycode, level);
+                    let own = kwin_lookup(&plain, group, sym);
+                    assert!(found == ours || Some(found) == own, "{what}: {c} at {found:?}");
+                }
+            }
         }
     }
 
     #[test]
-    fn safe_keycodes_under_x11_8bit_ceiling() {
-        // The whole point of B3: every slot kc must fit the X11 keycode
-        // field (8 bits, so kc + 8 ≤ 255). With max evdev kc = 191
-        // (F21), XWayland kc = 199, comfortably under.
-        for &kc in SAFE_KEYCODES {
-            assert!(
-                kc <= 247,
-                "keycode {kc} exceeds X11 8-bit reachable range (kc+8 must be ≤ 255)"
-            );
+    fn option_never_replaces_existing_level5_symbols() {
+        // de(neo) already uses levels 5-8 on letter keys; augment mode must
+        // keep them (only empty levels get Vietnamese letters).
+        let root = OptionRoot::new("neo");
+        let plain = root.compile("de", "neo", None);
+        let daklak = root.compile("de", "neo", Some("daklak:vn".into()));
+        for slot in SLOTS {
+            let kc = slot.keycode as u32;
+            let before = levels(&plain, kc, 0, 8);
+            let after = levels(&daklak, kc, 0, 8);
+            for (l, (b, a)) in before.iter().zip(&after).enumerate() {
+                if !b.is_empty() {
+                    assert_eq!(b, a, "{} level {} replaced", slot.name, l + 1);
+                }
+            }
         }
     }
 
     #[test]
-    fn safe_keycodes_in_expected_zones() {
-        // IME zone (85-94 excluding 92), F13-F19 (183-189), or the
-        // international/Korean group (KEY_HANGEUL=122, KEY_HANJA=123,
-        // KEY_YEN=124). F20/F21 and KEY_KPJPCOMMA=95 deliberately dropped
-        // — see SAFE_KEYCODES doc.
-        for &kc in SAFE_KEYCODES {
-            let in_ime = (85..=94).contains(&kc) && kc != 92;
-            let in_f_keys = (183..=189).contains(&kc);
-            let in_intl = kc == 122 || kc == 123 || kc == 124;
-            assert!(
-                in_ime || in_f_keys || in_intl,
-                "keycode {kc} outside expected IME / F13-F19 / international safe zones"
+    fn option_binds_level_selector_keys() {
+        let root = OptionRoot::new("mods");
+        let keymap = root.compile("us,ru", "", Some("daklak:vn".into()));
+        for group in 0..2 {
+            assert_eq!(
+                levels(&keymap, 100, group, 1),
+                vec![vec![x::Keysym::ISO_Level3_Shift]],
+                "RALT group {group}"
+            );
+            assert_eq!(
+                levels(&keymap, LEVEL5_SHIFT_EVDEV as u32, group, 1),
+                vec![vec![x::Keysym::ISO_Level5_Shift]],
+                "HENK group {group}"
             );
         }
-    }
-
-    #[test]
-    fn level5_shift_evdev_not_in_safe_keycodes() {
-        // The Mod3/ISO_Level5_Shift binding kc must NOT also be a viet slot.
-        assert!(
-            !SAFE_KEYCODES.contains(&LEVEL5_SHIFT_EVDEV),
-            "LEVEL5_SHIFT_EVDEV ({LEVEL5_SHIFT_EVDEV}) leaked into SAFE_KEYCODES"
-        );
-    }
-
-    #[test]
-    fn vietnamese_lookup_returns_correct_level() {
-        // Slot 0 packs VN_LOWER[0..4] at levels 1, 3, 5, 7. Verify each
-        // level dispatches to the correct mod mask.
-        let base = BASE_EVDEV;
-        let s = char_to_emit(VN_LOWER[0]).unwrap();
-        assert_eq!(s, EmitSpec { keycode: base, mods: 0 });
-        let s = char_to_emit(VN_UPPER[0]).unwrap();
-        assert_eq!(s, EmitSpec { keycode: base, mods: MOD_SHIFT });
-        let s = char_to_emit(VN_LOWER[1]).unwrap();
-        assert_eq!(s, EmitSpec { keycode: base, mods: MOD_LEVEL3 });
-        let s = char_to_emit(VN_UPPER[1]).unwrap();
-        assert_eq!(s, EmitSpec { keycode: base, mods: MOD_SHIFT | MOD_LEVEL3 });
-        let s = char_to_emit(VN_LOWER[2]).unwrap();
-        assert_eq!(s, EmitSpec { keycode: base, mods: MOD_LEVEL5 });
-        let s = char_to_emit(VN_UPPER[2]).unwrap();
-        assert_eq!(s, EmitSpec { keycode: base, mods: MOD_SHIFT | MOD_LEVEL5 });
-        let s = char_to_emit(VN_LOWER[3]).unwrap();
-        assert_eq!(s, EmitSpec { keycode: base, mods: MOD_LEVEL3 | MOD_LEVEL5 });
-        let s = char_to_emit(VN_UPPER[3]).unwrap();
-        assert_eq!(
-            s,
-            EmitSpec { keycode: base, mods: MOD_SHIFT | MOD_LEVEL3 | MOD_LEVEL5 }
-        );
+        // The Wayland modifier bits daklak uses select the intended levels.
+        assert_eq!(type_char(&keymap, 24, MOD_LEVEL5, 0, 0), Some('ô'));
+        assert_eq!(type_char(&keymap, 24, MOD_LEVEL3 | MOD_LEVEL5, 0, 1), Some('ơ'));
     }
 
     #[test]
@@ -638,23 +761,15 @@ mod tests {
     }
 
     #[test]
-    fn ascii_lowercase_uses_standard_evdev() {
-        let s = char_to_emit('a').unwrap();
-        assert_eq!(s, EmitSpec { keycode: 30, mods: 0 });
-        let s = char_to_emit('n').unwrap();
-        assert_eq!(s, EmitSpec { keycode: 49, mods: 0 });
-        let s = char_to_emit('t').unwrap();
-        assert_eq!(s, EmitSpec { keycode: 20, mods: 0 });
-        let s = char_to_emit(' ').unwrap();
-        assert_eq!(s, EmitSpec { keycode: 57, mods: 0 });
-    }
-
-    #[test]
-    fn ascii_uppercase_uses_shift() {
-        let s = char_to_emit('A').unwrap();
-        assert_eq!(s, EmitSpec { keycode: 30, mods: MOD_SHIFT });
-        let s = char_to_emit('N').unwrap();
-        assert_eq!(s, EmitSpec { keycode: 49, mods: MOD_SHIFT });
+    fn symbols_and_keymap_share_slot_rows() {
+        fn slot_rows(text: &str) -> BTreeSet<String> {
+            text.lines()
+                .map(str::trim_start)
+                .filter(|l| l.starts_with("key <") || l.starts_with("replace key <"))
+                .map(str::to_owned)
+                .collect()
+        }
+        assert_eq!(slot_rows(&keymap_text()), slot_rows(&symbols_text()));
     }
 
     const SHIFT: u32 = 0x01;
@@ -721,19 +836,6 @@ mod tests {
     }
 
     #[test]
-    fn telex_coverage_under_x11_ceiling() {
-        // Every Vietnamese char engine commits in common Telex words must
-        // resolve to a keycode XWayland can deliver. With B3 low-kc, the
-        // X11 keycode field (8 bits, so evdev kc + 8 ≤ 255) covers
-        // every slot in SAFE_KEYCODES — XWayland clients now receive
-        // these chars alongside native-Wayland ones.
-        for c in ['à', 'ầ', 'ế', 'ờ', 'ữ', 'ặ', 'đ', 'Ầ', 'Ế', 'Đ'] {
-            let s = char_to_emit(c).unwrap_or_else(|| panic!("missing: {c}"));
-            assert!(s.keycode <= 247, "{c} keycode {} > 247 (X11 ceiling)", s.keycode);
-        }
-    }
-
-    #[test]
     fn dance_l5_levelfive_with_no_user_mods() {
         assert_eq!(plan_mod_dance(0, LEVEL5), Some((LEVEL5, 0)));
     }
@@ -749,46 +851,4 @@ mod tests {
         assert_eq!(plan_mod_dance(CTRL, LEVEL5), Some((CTRL | LEVEL5, CTRL)));
     }
 
-    #[test]
-    fn symbols_text_contains_the_expected_wrapper() {
-        let text = symbols_text();
-        assert!(text.starts_with("default partial alphanumeric_keys\n"));
-        assert!(text.contains("xkb_symbols \"basic\" {\n"));
-        assert!(text.contains("name[Group1] = \"Daklak Vietnamese\";"));
-        // The overlay variant (for the daklak:vn option path) must also be
-        // present, and unlike `basic` it must NOT re-include the base.
-        assert!(text.contains("xkb_symbols \"overlay\" {\n"));
-        let overlay = text
-            .split("xkb_symbols \"overlay\" {")
-            .nth(1)
-            .expect("overlay section present");
-        assert!(
-            !overlay.contains("include \"pc+us+inet(evdev)\""),
-            "overlay must not re-include the base layout"
-        );
-    }
-
-    #[test]
-    fn rules_text_registers_daklak_option() {
-        let text = rules_text();
-        assert!(text.contains("! include %S/evdev"));
-        assert!(text.contains("! option = symbols"));
-        assert!(text.contains("daklak:vn"));
-        assert!(text.contains("+daklak_vn(overlay)"));
-    }
-
-    #[test]
-    fn symbols_and_keymap_share_slot_rows() {
-        use std::collections::BTreeSet;
-        fn slot_rows(text: &str) -> BTreeSet<String> {
-            text.lines()
-                .map(str::trim_start)
-                .filter(|l| l.starts_with("replace key <"))
-                .map(str::to_owned)
-                .collect()
-        }
-        // symbols_text() now carries two sections (basic + overlay) whose
-        // override rows are identical, so compare the unique row sets.
-        assert_eq!(slot_rows(&keymap_text()), slot_rows(&symbols_text()));
-    }
 }

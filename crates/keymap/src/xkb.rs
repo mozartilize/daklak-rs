@@ -6,6 +6,26 @@ use xkbcommon::xkb::{
     KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1, MOD_INVALID,
 };
 
+/// The keysym daklak sends for `c` on keysym channels (KWin
+/// `zwp_input_method_context_v1.keysym`), or `None` when `c` has no keysym.
+///
+/// Latin-1 chars keep their legacy keysym (= codepoint). Chars whose legacy
+/// keysym lies above Latin-1 (`ă` = `abreve` 0x1e3, `đ` = `dstroke` 0x1f0, …)
+/// are sent in Unicode form (`0x0100_0000 | codepoint`). KWin matches keysyms
+/// by exact value, and daklak's keymap spells those chars in Unicode form, so
+/// this resolves to daklak's slot rather than to a legacy-keysym key some
+/// user layouts define.
+pub fn commit_keysym(c: char) -> Option<Keysym> {
+    let sym = xkbcommon::xkb::utf32_to_keysym(c as u32);
+    if sym == Keysym::NoSymbol {
+        None
+    } else if sym.raw() > 0xFF && sym.raw() < 0x0100_0000 {
+        Some(Keysym::new(0x0100_0000 | c as u32))
+    } else {
+        Some(sym)
+    }
+}
+
 /// xkbcommon wrapper for hardware keycode → UTF-8 char conversion.
 /// Initialized from the Keymap fd received via the keyboard grab
 /// (ZwpInputMethodKeyboardGrabV2 Keymap event).

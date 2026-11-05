@@ -44,7 +44,7 @@ fn print_help() {
          \x20                daklak gen-keymap > /tmp/daklak.xkb\n\
          \x20                swaymsg input <viet-ime-id> xkb_file /tmp/daklak.xkb\n\
          \x20              Add --symbols to print the installable xkb_symbols fragment
-         \x20              (basic + overlay variants), or --rules to print the
+         \x20              (basic, level_mods + overlay variants), or --rules to print the
          \x20              ~/.config/xkb/rules/evdev overlay that registers the
          \x20              daklak:vn option for KDE/Wayland."
     );
