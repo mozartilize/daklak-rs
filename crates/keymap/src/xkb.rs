@@ -3,7 +3,7 @@ use std::os::fd::OwnedFd;
 use anyhow::{Context, Result};
 use xkbcommon::xkb::{
     Context as XkbContext, Keycode, Keymap, Keysym, State, CONTEXT_NO_FLAGS,
-    KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1, MOD_INVALID,
+    KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1, MOD_INVALID, STATE_LAYOUT_EFFECTIVE,
 };
 
 /// The keysym daklak sends for `c` on keysym channels (KWin
@@ -172,6 +172,24 @@ impl XkbState {
         char::from_u32(utf32)
     }
 
+    /// The evdev keycode a compositor picks to deliver `sym` when it resolves
+    /// keysyms against this keymap: the lowest keycode whose symbols contain
+    /// `sym` at **any** level of the effective layout (KWin's
+    /// `Xkb::keycodeFromKeysym`). Unlike `char_to_keycode`, the current
+    /// modifier state does not matter — `ô` on level 5 of `<AD09>` resolves
+    /// to KEY_O.
+    pub fn keysym_keycode(&self, sym: Keysym) -> Option<u32> {
+        let layout = self.state.serialize_layout(STATE_LAYOUT_EFFECTIVE);
+        let min = self.keymap.min_keycode().raw();
+        let max = self.keymap.max_keycode().raw();
+        (min..max).find_map(|kc| {
+            let key = Keycode::new(kc);
+            (0..self.keymap.num_levels_for_key(key, layout))
+                .any(|level| self.keymap.key_get_syms_by_level(key, layout, level).contains(&sym))
+                .then(|| kc - 8)
+        })
+    }
+
     /// Reverse lookup: find an evdev keycode that produces the given character
     /// under the current modifier state. Used by the evdev path to emit
     /// composed strings via uinput.
@@ -223,6 +241,27 @@ mod tests {
         xkb.update_modifiers(0x1, 0, 0, 0);
         assert_eq!(xkb.key_to_char(38), Some('L'), "shift raises decode level");
         assert_eq!(xkb.base_char(38), Some('l'), "base_char ignores shift");
+    }
+
+    #[test]
+    fn keysym_keycode_finds_any_level_like_kwin() {
+        // The prelude release must match the keycode KWin picks: `ô` sits on
+        // level 5 of KEY_O in daklak's keymap, `A` on level 2 of KEY_A.
+        let ctx = XkbContext::new(CONTEXT_NO_FLAGS);
+        let keymap = Keymap::new_from_string(
+            &ctx,
+            crate::keymap_text(),
+            KEYMAP_FORMAT_TEXT_V1,
+            KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        let xkb = XkbState::from_keymap(keymap);
+        let kc = |c| xkb.keysym_keycode(commit_keysym(c).unwrap());
+        assert_eq!(kc('ô'), Some(24));
+        assert_eq!(kc('Ơ'), Some(24));
+        assert_eq!(kc('ă'), Some(30));
+        assert_eq!(kc('A'), Some(30));
+        assert_eq!(xkb.char_to_keycode('ô'), None, "current level only");
     }
 
     #[test]

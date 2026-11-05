@@ -355,47 +355,33 @@ impl AdapterSink<'_> {
             // commit_string split — mixed key/text-input replacement is not
             // a coherent edit for KWin terminals.
 
-            // Tail-char-drop fix: for mapped ASCII chars whose
-            // physical keycode the user is still holding, emit a
-            // prelude key-release through the forward channel so
-            // KWin's forwardKeySym pressedKeys dedup doesn't drop
-            // the synthetic keysym press.
-            if !is_unmapped {
-                if let Some(kc) = self.xkb.and_then(|xkb| xkb.char_to_keycode(c)) {
-                    if self.held_user_kc == Some(kc) {
-                        tracing::debug!(
-                            kc,
-                            char = %c,
-                            "commit_via_keysym: prelude release for still-held user key (tail-char-drop fix)"
-                        );
-                        self.forward_emitter.emit_key(time, kc, 0);
-                    }
+            // Latin-2+ legacy keysyms (e.g. ă=0x1E3, đ=0x1F0) are sent in
+            // Unicode form so KWin resolves them to daklak's own slot (see
+            // `commit_keysym`). Latin-1 chars keep their legacy keysyms.
+            let Some(sym) = viet_ime_keymap::xkb::commit_keysym(c) else {
+                tracing::debug!(c = %c, "commit_via_keysym: no keysym for char, falling back");
+                return false;
+            };
+
+            // Tail-char-drop fix: KWin ignores a press for a keycode it
+            // already considers pressed. If the keycode KWin will pick for
+            // this keysym (any level: `ô` lives on level 5 of KEY_O) is the
+            // physical key the user is still holding, release it through
+            // the forward channel first so the synthetic press is not
+            // dropped.
+            if let Some(kc) = self.xkb.and_then(|xkb| xkb.keysym_keycode(sym)) {
+                if self.held_user_kc == Some(kc) {
+                    tracing::debug!(
+                        kc,
+                        char = %c,
+                        "commit_via_keysym: prelude release for still-held user key (tail-char-drop fix)"
+                    );
+                    self.forward_emitter.emit_key(time, kc, 0);
                 }
             }
 
-            // Latin-2+ legacy keysyms (e.g. ă=0x1E3, đ=0x1F0) may exist
-            // in the user's xkb layout, causing KWin's keycodeFromKeysym to
-            // take the "mapped" forwardKeySym path which double-outputs on
-            // Ghostty+pi due to a modifier-change + key-event race. Force
-            // Unicode keysym encoding (0x01000000 | codepoint) for these so
-            // KWin always takes the unmapped/temp-keymap path (kc 247).
-            //
-            // Latin-1 chars (ú=0xFA, ó=0xF3, etc.) MUST keep their legacy
-            // keysyms (= codepoint): KWin's mapped path works correctly for
-            // them, and the temp-keymap path doubles on Ghostty+pi.
-            let sym = xkbcommon::xkb::utf32_to_keysym(c as u32);
-            let sym = if sym.raw() > 0xFF && sym.raw() < 0x0100_0000 {
-                // Legacy Latin-2+ keysym — override to Unicode encoding
-                xkbcommon::xkb::Keysym::new(0x0100_0000 | c as u32)
-            } else {
-                sym
-            };
-            if sym.raw() == 0 {
-                tracing::debug!(c = %c, "commit_via_keysym: no keysym for char, falling back");
-                return false;
-            }
             // Per-char keysym barrier: KWin's forwardKeySym installs a
-            // per-sym temp keymap (kc 247) for unmapped keysyms → foot
+            // per-sym temp keymap (scratch keycode) for unmapped keysyms → foot
             // recompiles xkb. Flush + sleep so foot finishes before the
             // next char or forwarded physical key arrives.
             let guard_modifiers = v1_keysym_needs_modifier_guard(

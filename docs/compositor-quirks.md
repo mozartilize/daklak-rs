@@ -14,6 +14,7 @@ not re-litigate or add ad-hoc workarounds beyond what's described here.
 - [KWin / gedit: delayed surrounding cursor updates](#kwin--gedit-delayed-surrounding-cursor-updates)
 - [Firefox contenteditable: stale-echo delete bypass](#firefox-contenteditable-stale-echo-delete-bypass)
 - [Tail-drop after tone + space](#tail-drop-after-tone--space)
+- [KWin: keysym on a still-held key](#kwin-keysym-on-a-still-held-key)
 - [Preedit rendering of forwarded keys](#preedit-rendering-of-forwarded-keys)
 
 ## GNOME / IBus ForwardKeyEvent fails in Mutter
@@ -146,10 +147,24 @@ against per-keysym keycode installation, dropping the tail of the edit.
 **Resolution:** The KWin keysym path (`commit_via_keysym_v1` in
 `crates/wayland-adapter/src/sink.rs`) inserts a per-char Wayland `conn.flush()`
 after every keysym pair so each char's keymap dance fully settles before the
-next event. A modifier guard avoids the kc 247 temp-keymap swap for mapped
+next event. A modifier guard avoids the scratch-keycode temp-keymap swap for mapped
 keysyms, eliminating the race for common telex tails. No wall-clock sleep is
 needed — the Wayland round-trip barrier is sufficient. There is no post-apply
 barrier; the per-char flush + guard handles it.
+
+## KWin: keysym on a still-held key
+
+**Behavior:** KWin resolves an input-method keysym to the lowest keycode that
+carries it at any level of the session keymap and sends a press/release of that
+keycode. It ignores a press for a keycode it already considers pressed. With
+daklak's keymap, `ô` lives on level 5 of KEY_O, so fast rollover (`o` still held
+while `w` turns `o` into `ơ`) would make KWin drop the synthetic press.
+
+**Resolution:** Before each keysym, `commit_via_keysym_v1` looks up the keycode
+KWin will pick (`XkbState::keysym_keycode`, same any-level search) and, if it is
+the physical key the user is still holding, emits a release for it through the
+forward channel first. The virtual-keyboard path does the same with the
+keycode from `char_to_emit`.
 
 ## Preedit rendering of forwarded keys
 
