@@ -37,18 +37,22 @@ channels (see below).
   forward backspaces as key events, then emit the replacement as one whole
   string through a single channel. It has three possible replacement channels,
   chosen by the sink, never split within one replacement:
-  - **whole `commit_string`** — for clients with a working text-input commit
-    (e.g. foot on wlroots/im-v2, where `commit_string_functional` is true);
+  - **whole `commit_string`** — IBus (`CommitText`), and chars missing from
+    daklak's synthetic keymap;
   - **keysym channel** — KWin/im-v1 emits the whole replacement through
     `zwp_input_method_context_v1::keysym`;
   - **virtual-keyboard synthetic keymap** — im-v2/vk emits each replacement
     char as a keycode against daklak's synthesized xkb keymap (Vietnamese
-    precomposed chars on levels 5-8 of the letter keys). This is the channel that reaches
-    clients with **no usable text-input at all** (some Qt apps, XWayland apps
-    such as OnlyOffice, wlroots terminals such as Ghostty). Such clients never
-    fire an `Activate`, so daklak synthesizes a ForwardKey session from focus
-    metadata with `commit_string_functional = false`, which forces this
-    channel. IBus uses one whole `CommitText` after the forwarded deletes.
+    precomposed chars on levels 5-8 of the letter keys). im-v2 ForwardKey
+    always uses this channel, also when the client has a live text-input
+    session: the forwarded Backspaces are key events too, and GTK applies
+    text-input commits on arrival but queues key events, so a `commit_string`
+    would overtake its own Backspace (Ghostty: `la` + `à` → `la`). It is
+    also the channel that reaches clients with **no usable text-input at all**
+    (some Qt apps, XWayland apps such as OnlyOffice, Ghostty before its first
+    refocus); those never fire an `Activate`, so daklak synthesizes a
+    ForwardKey session from focus metadata. IBus uses one whole `CommitText`
+    after the forwarded deletes.
 
 ## Selection logic
 

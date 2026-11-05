@@ -35,8 +35,8 @@ pub fn apply(
             sink.commit(serial);
         }
     } else if !sink.commit_via_keysym(serial, time, commit) {
-        // Normal path: whole commit_string where that is the working
-        // channel (e.g. foot on wlroots/IMv2 with commit_string_functional=true).
+        // Normal path: the sink's key channel (im-v1 keysym, im-v2 virtual
+        // keyboard); whole commit_string only when the sink has none.
         sink.commit_string(commit);
         sink.commit(serial);
     }

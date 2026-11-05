@@ -254,19 +254,22 @@ impl OutputSink for AdapterSink<'_> {
         match &self.text_ops {
             // ── ImV2 path: emit via virtual keyboard ──────────────────────
             //
-            // ImV2 has no ctx.keysym(). Non-terminal clients (Firefox /
-            // Google Docs) ignore text-input-v3 commit_string, so the
-            // ForwardKey fallback to commit_string silently drops the
-            // entire commit. Route every char through the virtual
-            // keyboard instead: vk_commit_char uses the synth keymap
-            // (Vietnamese precomposed chars at levels 2-4, ASCII at
-            // base level) and already includes the held_user_kc
-            // prelude-release fix from emit_char_impl.
+            // ImV2 has no ctx.keysym(). Every replacement goes through the
+            // virtual keyboard's synthetic keymap (`vk_commit_char`, which
+            // includes the held_user_kc prelude-release fix), even when the
+            // client has a live text-input-v3 session:
             //
-            // Clients with a working commit_string (commit_string_functional
-            // = true, e.g. foot) keep the commit_string fallback below — they
-            // honor text-input-v3 and don't need the synth keymap path.
-            TextOpsTarget::V2 { .. } if !self.commit_string_functional => {
+            // - Non-terminal clients (Firefox / Google Docs) ignore
+            //   text-input-v3 commit_string in this path.
+            // - The ForwardKey Backspaces and every unconsumed user key are
+            //   vk key events. GTK queues key events but applies text-input
+            //   events on arrival, so a commit_string would land *before* the
+            //   queued Backspace (Ghostty: `la` + `à`, then BS → `la`).
+            //   Keeping the replacement on the key channel keeps the edit in
+            //   order.
+            //
+            // commit_string remains only for chars outside the synth keymap.
+            TextOpsTarget::V2 { .. } => {
                 tracing::trace!(text = %text, "commit_via_keysym: enter (v2 vk path)");
                 let mut fallback_buf = String::new();
                 for c in text.chars() {
@@ -294,9 +297,6 @@ impl OutputSink for AdapterSink<'_> {
 
             // ── ImV1 path: emit via ctx.keysym() ─────────────────────────
             TextOpsTarget::V1 { ctx, .. } => self.commit_via_keysym_v1(ctx, serial, time, text),
-            // ImV2 with working commit_string: no keysym path, let
-            // forward_key fall back to commit_string.
-            TextOpsTarget::V2 { .. } => false,
         }
     }
 

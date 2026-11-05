@@ -66,6 +66,16 @@ with no delete, no surrounding-text delete ever reaches the PTY, so there is no
 self-emit-loop or dropped commit. On wlroots, terminals (foot, Ghostty) send no
 surrounding-text at all and resolve directly to `ForwardKey`.
 
+**GTK ordering on wlroots (Ghostty).** Ghostty only enables text-input after its
+first focus change, so a session starts synthetic and later becomes a real
+im-v2 `ForwardKey` session. GDK applies `zwp_text_input_v3.commit_string` as
+soon as it arrives but queues `wl_keyboard.key` events, so a replacement sent
+as `commit_string` overtakes the Backspace sent just before it on the virtual
+keyboard: `la` + `à` → `laà` → Backspace → `la`, i.e. every word comes out as
+plain letters. im-v2 ForwardKey therefore always emits the replacement on the
+virtual keyboard (same channel as the Backspaces); `commit_string` is only the
+fallback for chars outside daklak's synthetic keymap.
+
 ## KWin / gedit: delayed surrounding cursor updates
 
 **Behavior:** With KWin's input-method-v1 path, gedit can process a forwarded

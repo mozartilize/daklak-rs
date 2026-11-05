@@ -89,13 +89,15 @@ distinct compositor families through two input-method protocol versions.
 - Has a real **virtual keyboard**, so Tier 2 (`ForwardKey`) can drive both the
   synthesized backspaces and the virtual-keyboard synthetic-keymap replacement
   channel.
-- Commits text via the commit-string path when that channel is healthy;
-  daklak's own commit acknowledges the frame (the v2 client does not heartbeat
-  `done` on its own). When ForwardKey must avoid a stale or absent text-input
-  channel (`commit_string_functional = false`), replacement text instead goes
-  through the virtual keyboard's synthetic keymap as one whole key-channel
-  replacement. Clients that never enable text-input get a ForwardKey session
-  synthesized from focus metadata, which uses exactly this channel.
+- Tier 1 (`SurroundingText`) commits via `delete_surrounding_text` +
+  `commit_string`; daklak's own commit acknowledges the frame (the v2 client
+  does not heartbeat `done` on its own). Tier 2 (`ForwardKey`) sends both the
+  Backspaces and the replacement through the virtual keyboard's synthetic
+  keymap, so the whole edit stays on one ordered channel — GTK clients apply
+  text-input commits ahead of queued key events, so mixing the two reorders
+  the edit. `commit_string` is only the fallback for chars outside the
+  synthetic keymap. Clients that never enable text-input get a ForwardKey
+  session synthesized from focus metadata, which uses the same channel.
 
 ### Input-method v1 (KWin / Plasma)
 
