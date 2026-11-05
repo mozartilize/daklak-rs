@@ -80,6 +80,17 @@ meson setup build --buildtype=debug -Dkde=true
 meson install -C build
 ```
 
+The install also puts the `daklak:vn` xkb option files where libxkbcommon
+(≥ 1.13) finds them: its XKB extensions directory
+(`/usr/share/xkeyboard-config.d/daklak`) for system prefixes, or
+`~/.config/xkb` when `--prefix` is inside your home directory. Enable the option once so KWin can resolve every Vietnamese
+character to a key ([why](evdev-setup.md#why-an-xkb-option-not-a-layout-wayland)):
+
+```sh
+kwriteconfig6 --notify --file kxkbrc --group Layout --key Options daklak:vn
+kwriteconfig6 --notify --file kxkbrc --group Layout --key ResetOldOptions true
+```
+
 ### GNOME / IBus
 
 Build/install the IBus component, refresh IBus, then add Daklak as an input

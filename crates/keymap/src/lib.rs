@@ -17,7 +17,7 @@
 //! - `viet-ime-daemon` evdev mode (writes `keymap_text()` to a
 //!   `.xkb` file, points sway/scroll at it via `swaymsg input … xkb_file`).
 //! - KWin / Mutter sessions, through the `daklak:vn` xkb option
-//!   (`symbols_text()` + `rules_text()`), where the compositor resolves the
+//!   (`symbols_text()` + `rules_text()` / `rules_post_text()`), where the compositor resolves the
 //!   keysyms daklak sends against the session keymap.
 //!
 //! Vietnamese precomposed chars live on **levels 5-8 of ordinary typing
@@ -439,6 +439,17 @@ pub fn rules_text() -> String {
     s
 }
 
+/// Build the composable rules file `rules/evdev.post` for an XKB
+/// extensions directory (libxkbcommon ≥ 1.13 appends every include path's
+/// `evdev.post` to the main `evdev` ruleset). Same option rules as
+/// `rules_text()`, without the `! include`.
+pub fn rules_post_text() -> String {
+    let mut s = String::with_capacity(768);
+    s.push_str("// daklak xkb rules — appended to the evdev ruleset; registers the daklak:vn option.\n");
+    append_option_rules(&mut s);
+    s
+}
+
 /// The `daklak:vn` option: applies `level_mods` (override) and `overlay`
 /// (augment) to **every** configured layout, using the classic per-layout
 /// `layout[N] option` sections (the same mechanism xkeyboard-config uses for
@@ -603,12 +614,14 @@ mod tests {
         assert_eq!(type_char(&keymap, 24, MOD_SHIFT | MOD_LEVEL5, LOCK, 0), Some('Ô'));
     }
 
-    /// Install `daklak gen-keymap --symbols/--rules` into a scratch xkb root
-    /// and compile `layout(variant)` + `daklak:vn` through the real rules.
+    /// Install daklak's symbols + rules into a scratch xkb root and compile
+    /// `layout(variant)` + `daklak:vn` through the real rules. `post` picks
+    /// the extensions-directory form (`rules/evdev.post`) over the
+    /// `~/.config/xkb` form (`rules/evdev`).
     struct OptionRoot(std::path::PathBuf);
 
     impl OptionRoot {
-        fn new(tag: &str) -> Self {
+        fn new(tag: &str, post: bool) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "daklak-keymap-test-{}-{tag}",
                 std::process::id()
@@ -616,7 +629,11 @@ mod tests {
             std::fs::create_dir_all(root.join("symbols")).unwrap();
             std::fs::create_dir_all(root.join("rules")).unwrap();
             std::fs::write(root.join("symbols/daklak_vn"), symbols_text()).unwrap();
-            std::fs::write(root.join("rules/evdev"), rules_text()).unwrap();
+            if post {
+                std::fs::write(root.join("rules/evdev.post"), rules_post_text()).unwrap();
+            } else {
+                std::fs::write(root.join("rules/evdev"), rules_text()).unwrap();
+            }
             Self(root)
         }
 
@@ -668,7 +685,9 @@ mod tests {
 
     #[test]
     fn option_reaches_every_char_in_every_layout_and_keeps_user_levels() {
-        option_layouts_check(&OptionRoot::new("layouts"));
+        for post in [false, true] {
+            option_layouts_check(&OptionRoot::new(&format!("layouts-{post}"), post));
+        }
     }
 
     fn option_layouts_check(root: &OptionRoot) {
@@ -719,7 +738,7 @@ mod tests {
     fn option_never_replaces_existing_level5_symbols() {
         // de(neo) already uses levels 5-8 on letter keys; augment mode must
         // keep them (only empty levels get Vietnamese letters).
-        let root = OptionRoot::new("neo");
+        let root = OptionRoot::new("neo", true);
         let plain = root.compile("de", "neo", None);
         let daklak = root.compile("de", "neo", Some("daklak:vn".into()));
         for slot in SLOTS {
@@ -736,7 +755,7 @@ mod tests {
 
     #[test]
     fn option_binds_level_selector_keys() {
-        let root = OptionRoot::new("mods");
+        let root = OptionRoot::new("mods", true);
         let keymap = root.compile("us,ru", "", Some("daklak:vn".into()));
         for group in 0..2 {
             assert_eq!(

@@ -44,9 +44,10 @@ fn print_help() {
          \x20                daklak gen-keymap > /tmp/daklak.xkb\n\
          \x20                swaymsg input <viet-ime-id> xkb_file /tmp/daklak.xkb\n\
          \x20              Add --symbols to print the installable xkb_symbols fragment
-         \x20              (basic, level_mods + overlay variants), or --rules to print the
+         \x20              (basic, level_mods + overlay variants), --rules to print the
          \x20              ~/.config/xkb/rules/evdev overlay that registers the
-         \x20              daklak:vn option for KDE/Wayland."
+         \x20              daklak:vn option for KDE/Wayland, or --rules-post for the
+         \x20              rules/evdev.post file of an XKB extensions directory."
     );
     println!();
     println!("With no subcommand, runs the input-method daemon.");
@@ -97,6 +98,7 @@ struct Cli {
     overrides: CliOverrides,
     gen_keymap_symbols: bool,
     gen_keymap_rules: bool,
+    gen_keymap_rules_post: bool,
     backend_arg: Option<backend::BackendTarget>,
 }
 
@@ -153,6 +155,10 @@ where
                 reject_inline(&arg)?;
                 cli.gen_keymap_rules = true;
             }
+            "--rules-post" => {
+                reject_inline(&arg)?;
+                cli.gen_keymap_rules_post = true;
+            }
             "--config" | "-c" => {
                 cli.overrides.config_path =
                     Some(PathBuf::from(take_value(&mut args, inline, "--config")?));
@@ -182,19 +188,19 @@ where
         }
     }
 
-    if cli.gen_keymap_symbols && !matches!(cli.command, Some(Command::GenKeymap)) {
-        return Err(anyhow::anyhow!(
-            "daklak: --symbols is only valid with gen-keymap"
-        ));
+    let gen_flags = [
+        ("--symbols", cli.gen_keymap_symbols),
+        ("--rules", cli.gen_keymap_rules),
+        ("--rules-post", cli.gen_keymap_rules_post),
+    ];
+    for (flag, set) in gen_flags {
+        if set && !matches!(cli.command, Some(Command::GenKeymap)) {
+            return Err(anyhow::anyhow!("daklak: {flag} is only valid with gen-keymap"));
+        }
     }
-    if cli.gen_keymap_rules && !matches!(cli.command, Some(Command::GenKeymap)) {
+    if gen_flags.iter().filter(|(_, set)| *set).count() > 1 {
         return Err(anyhow::anyhow!(
-            "daklak: --rules is only valid with gen-keymap"
-        ));
-    }
-    if cli.gen_keymap_symbols && cli.gen_keymap_rules {
-        return Err(anyhow::anyhow!(
-            "daklak: --symbols and --rules are mutually exclusive"
+            "daklak: --symbols, --rules and --rules-post are mutually exclusive"
         ));
     }
 
@@ -417,7 +423,9 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::GenKeymap) => {
-            if cli.gen_keymap_rules {
+            if cli.gen_keymap_rules_post {
+                print!("{}", viet_ime_keymap::rules_post_text());
+            } else if cli.gen_keymap_rules {
                 print!("{}", viet_ime_keymap::rules_text());
             } else if cli.gen_keymap_symbols {
                 print!("{}", viet_ime_keymap::symbols_text());
@@ -495,6 +503,8 @@ mod cli_tests {
         assert!(parse_from(&["-h=lol"]).is_err());
         assert!(parse_from(&["--symbols=1"]).is_err());
         assert!(parse_from(&["--rules="]).is_err());
+        assert!(parse_from(&["gen-keymap", "--rules-post="]).is_err());
+        assert!(parse_from(&["gen-keymap", "--rules-post"]).unwrap().gen_keymap_rules_post);
     }
 
     #[tokio::test]

@@ -201,6 +201,22 @@ also installs `daklak_vn` system-wide under `/usr/share/X11/xkb/symbols/` for
 the `setxkbmap daklak_vn` *layout* path. The built-in hooks consume these
 installed files instead of running `daklak gen-keymap` at runtime.
 
+With `-Dkde=true`, Meson also installs the option files into libxkbcommon's
+**XKB extensions directory** (libxkbcommon ≥ 1.13; the path comes from its
+pkg-config variable `xkb_unversioned_extensions_path`, typically
+`/usr/share/xkeyboard-config.d/daklak/`): `symbols/daklak_vn` and
+`rules/evdev.post`. libxkbcommon adds that directory to its include path and
+appends every `evdev.post` to the stock `evdev` ruleset, so no per-user copy is
+needed — only the `kxkbrc` option below. That location is fixed by
+libxkbcommon, not by daklak's `--prefix`. For a user install (`--prefix` inside
+`$HOME`, e.g. `~/.local`) Meson installs the same two files into
+`${XDG_CONFIG_HOME:-~/.config}/xkb` instead, since no root is available. With
+an older libxkbcommon, Meson prints a warning and skips these files; use the
+manual `~/.config/xkb` copies below instead. A `~/.config/xkb/rules/evdev` left
+from a manual setup shadows the stock ruleset and registers the option a second
+time; delete it (and a stale `symbols/daklak_vn`) after switching to the Meson
+install.
+
 Verify it parses cleanly (optional — the crate's tests compile the blob and the
 option against several layouts, so this is just for hand-editing or CI):
 
@@ -292,8 +308,9 @@ resolves to KEY_O + Mod3. A keysym missing from the session keymap goes through
 KWin's temporary one-key keymap on a scratch keycode instead (KEY_F24 since KWin
 6.8), which physical-key terminals such as Ghostty ≥ 1.4 encode as `CSI 24~`.
 
-Drop the two user-local files once (shared by KDE and GNOME), and regenerate
-them after upgrading daklak:
+A Meson install with `-Dkde=true` already provides the two files in the XKB
+extensions directory (see above). Otherwise, drop them user-local once (shared by KDE and
+GNOME), and regenerate them after upgrading daklak:
 
 ```
 daklak gen-keymap --symbols > ~/.config/xkb/symbols/daklak_vn

@@ -19,6 +19,26 @@ xkbcommon_dep = dependency('xkbcommon', required: true)
 # dbus-1 is informational only: checked so the build summary reflects runtime requirements.
 dbus_dep = dependency('dbus-1', required: false)
 
+# Where the daklak:vn xkb option files go. libxkbcommon (≥ 1.13, which also
+# composes rules/evdev.post) only reads fixed directories, not our prefix:
+# - system installs: the XKB extensions directory — packages install their xkb
+#   files under <dir>/<package>/ and libxkbcommon adds that to its include path;
+# - user installs (prefix inside $HOME, no root): the per-user ~/.config/xkb.
+xkb_extensions_dir = xkbcommon_dep.get_variable(
+  pkgconfig: 'xkb_unversioned_extensions_path',
+  default_value: '',
+)
+home_dir = run_command('sh', '-c', 'printf %s "$HOME"', check: true).stdout()
+xkb_user_dir = run_command('sh', '-c', 'printf %s "${XDG_CONFIG_HOME:-$HOME/.config}/xkb"', check: true).stdout()
+is_user_install = home_dir != '' and get_option('prefix').startswith(home_dir + '/')
+if not get_option('kde') or xkb_extensions_dir == ''
+  xkb_option_dir = ''
+elif is_user_install
+  xkb_option_dir = xkb_user_dir
+else
+  xkb_option_dir = xkb_extensions_dir / 'daklak'
+endif
+
 buildtype = get_option('buildtype')
 is_dev_install = buildtype == 'debug'
 cargo_profile = buildtype == 'debug' ? 'debug' : 'release'
@@ -43,6 +63,7 @@ summary({
   'kde support': get_option('kde'),
   'ibus/GNOME support': get_option('ibus'),
   'evdev grab': get_option('evdev_grab'),
+  'xkb option dir': xkb_option_dir != '' ? xkb_option_dir : 'not installed',
   'xkbcommon': xkbcommon_dep.version(),
   'app indicator': 'ksni (StatusNotifierItem, pure-Rust zbus)',
   'dbus-1 (runtime)': dbus_dep.found() ? dbus_dep.version() : 'not found (informational)',
@@ -145,8 +166,20 @@ daklak_bin = custom_target(
   install_mode: 'rwxr-xr-x',
 )
 
-if get_option('evdev_grab')
+if get_option('kde') or get_option('evdev_grab')
   xkb_artifact_generator = find_program('scripts/generate-xkb-symbols.sh')
+endif
+
+if xkb_option_dir != ''
+  subdir('res/xkb/option')
+  meson.add_install_script('scripts/meson-xkb-postinst.sh', xkb_option_dir, xkb_user_dir)
+elif get_option('kde')
+  warning('xkbcommon < 1.13 has no XKB extensions directory; the daklak:vn ' +
+    'option files are not installed. Generate them into ~/.config/xkb with ' +
+    '`daklak gen-keymap --symbols` and `daklak gen-keymap --rules`.')
+endif
+
+if get_option('evdev_grab')
   daklak_xkb_symbols = custom_target(
     'daklak-xkb-symbols',
     output: 'daklak_vn',

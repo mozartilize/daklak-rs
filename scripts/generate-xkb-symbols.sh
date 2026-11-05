@@ -16,6 +16,9 @@ case "$mode" in
     rules)
         "$build_dir/daklak" gen-keymap --rules >"$output"
         ;;
+    rules-post)
+        "$build_dir/daklak" gen-keymap --rules-post >"$output"
+        ;;
     *)
         echo "unknown xkb artifact mode: $mode" >&2
         exit 2
