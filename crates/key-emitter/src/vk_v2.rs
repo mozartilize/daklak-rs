@@ -26,7 +26,11 @@ impl KeyEmitter for VkV2Emitter<'_> {
         self.vk.modifiers(depressed, latched, locked, group);
     }
 
+    /// Compositors skip the IM keyboard grab for a virtual keyboard owned by
+    /// the grabbing client (wlroots `keyboard_get_im_grab`, Hyprland
+    /// `shouldIgnoreVirtualKeyboard`, Smithay `input_forward_bypassing_grab`),
+    /// so synthetic `modifiers` never echo back as grab `Modifiers` events.
     fn modifier_echo_through_grab(&self) -> bool {
-        true
+        false
     }
 }

@@ -56,18 +56,21 @@ pub use viet_ime_keymap::{
 ///
 /// Modifier echo path semantics vary per impl:
 ///
-/// - `VkV2Emitter` / `VkV1Emitter`: events round-trip through the IM
-///   keyboard grab. Callers that mutate the grab-visible modifier mask
-///   (`emit_char`) must track a "synthetic echo pending" counter so the
-///   round-tripped `Modifiers` event isn't double-applied to local
-///   state.
+/// - `VkV1Emitter`: KWin applies `context.modifiers` to the seat xkb state
+///   and re-sends it on the IM keyboard grab. Callers that mutate the
+///   grab-visible modifier mask (`emit_char`) must track a "synthetic echo
+///   pending" counter so the round-tripped `Modifiers` event isn't
+///   double-applied to local state.
+/// - `VkV2Emitter`: wlroots (Sway), Hyprland and Smithay/niri route a
+///   virtual keyboard owned by the grabbing IME client straight to the
+///   focused client, bypassing the grab. No round-trip. No counter.
 /// - `UinputEmitter`: kernel-level. No grab round-trip. No counter.
 pub trait KeyEmitter {
     fn emit_key(&mut self, time: u32, keycode: u32, value: u32);
     fn emit_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32);
 
     /// True iff emits from this backend round-trip through the IME's
-    /// own `zwp_input_method_keyboard_grab_v2`. Drives the
+    /// own keyboard grab. Drives the
     /// synthetic-mods-pending bookkeeping inside `emit_char`.
     fn modifier_echo_through_grab(&self) -> bool {
         false
