@@ -1,0 +1,20 @@
+{
+  "name": "daklak-typing-race-editors",
+  "private": true,
+  "description": "Rich-text editors served by browser_page.py; built into editors.bundle.js",
+  "scripts": {
+    "build": "esbuild src/main.js --bundle --minify --conditions=production --format=iife --target=es2020 --outfile=../editors.bundle.js"
+  },
+  "devDependencies": {
+    "@lexical/history": "0.53.0",
+    "@lexical/rich-text": "0.53.0",
+    "esbuild": "0.28.2",
+    "lexical": "0.53.0",
+    "prosemirror-commands": "1.7.2",
+    "prosemirror-history": "1.5.1",
+    "prosemirror-keymap": "1.2.3",
+    "prosemirror-schema-basic": "1.2.5",
+    "prosemirror-state": "1.4.4",
+    "prosemirror-view": "1.42.9"
+  }
+}

@@ -87,3 +87,18 @@ Favor unit tests that don't need a live compositor — the `TransportProfile`
 capability matrix and `detect_method` tier selection are both designed to be
 testable in isolation. Prefer adding a profile/selection test over a manual
 end-to-end check where possible.
+
+For real-key browser reproductions, the local harness in
+[`tools/typing-race-e2e`](../tools/typing-race-e2e/README.md) provides native,
+ProseMirror and Lexical editors. Browser runs require mounted/settled editor
+readiness and associate Enter reports by iteration ID. `--browser-trace`
+captures bounded event/model diagnostics for failures without changing editor
+input or clearing rules; it can affect timing, so also replay without tracing.
+Do not add warm-up typing that hides fresh-editor failures.
+
+The harness orchestration has standalone tests:
+
+```sh
+python3 -m unittest discover -s tools/typing-race-e2e -p 'test_*.py'
+node --test tools/typing-race-e2e/test_browser_harness.cjs
+```
