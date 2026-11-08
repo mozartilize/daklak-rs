@@ -16,6 +16,7 @@
 mod reversal;
 mod telex;
 
+use vnkey_engine::input::CharType;
 use vnkey_engine::{Engine, InputMethod as VnkeyIm};
 
 /// Vietnamese input method.
@@ -58,10 +59,32 @@ fn decode_engine_output(output: Vec<u8>) -> String {
     }
 }
 
+/// Longest Vietnamese word on screen (`nghiêng`). A longer word is not
+/// Vietnamese, so it is restored to the keys typed and no longer composed.
+const MAX_WORD_CHARS: usize = 7;
+
+/// Keys one word may feed vnkey before its history is compacted to keys that
+/// reproduce the word on screen. Tone toggling grows vnkey's key history while the word
+/// stays short (`hanh` + `jf`×70 still shows `hành`), and vnkey's own
+/// non-Vietnamese restore copies that history into a fixed 128-entry buffer.
+const MAX_WORD_KEYS: usize = 32;
+
 /// Per-window engine state. One instance per window/text-input the daemon
 /// is tracking.
 pub struct EngineState {
     engine: Engine,
+    /// The current word as shown on screen, from this engine's own output.
+    word: String,
+    /// Keys fed to vnkey for the current word: typed keys, or the keys a
+    /// seed or compaction replaced them with. Equal to vnkey's own key
+    /// history, which is how its non-Vietnamese restore is recognised, and
+    /// tells `keys_for` the order the user typed.
+    word_raw: String,
+    /// Keys fed to vnkey for the current word.
+    word_keys: usize,
+    /// The current word grew past `MAX_WORD_CHARS`: pass keys through
+    /// unchanged until the next word break.
+    raw_word: bool,
     /// Kept so the render-gate can spin up a throwaway engine with the same
     /// configuration to round-trip-check a reconstructed seed.
     method: InputMethod,
@@ -85,6 +108,10 @@ impl EngineState {
         let modern_style = engine.options.modern_style;
         Self {
             engine,
+            word: String::new(),
+            word_raw: String::new(),
+            word_keys: 0,
+            raw_word: false,
             method,
             bracket_shortcuts,
             modern_style,
@@ -117,11 +144,59 @@ impl EngineState {
     /// composition; arbitrary chars are forwarded to vnkey-engine which
     /// will treat non-ASCII as word-break).
     pub fn process_key(&mut self, ch: char) -> ProcessResult {
+        let word_break = matches!(
+            self.engine.input.get_char_type(ch as u32),
+            CharType::WordBreak | CharType::Reset
+        );
+        if self.raw_word {
+            if word_break {
+                self.reset();
+            }
+            return ProcessResult::forward();
+        }
+        if word_break {
+            self.word.clear();
+            self.word_raw.clear();
+            self.word_keys = 0;
+            return self.engine_key(ch);
+        }
+        if self.word_keys >= MAX_WORD_KEYS {
+            let keys = self.keys_for(&self.word);
+            if !self.engine.feed_context(&keys) {
+                self.engine.reset();
+            }
+            self.word_keys = keys.chars().count();
+            self.word_raw = keys;
+        }
+        let before = self.word.clone();
+        let result = self.engine_key(ch);
+        self.word_keys += 1;
+        self.word_raw.push(ch);
+        apply_to_word(&mut self.word, &result, ch);
+        if self.word.chars().count() <= MAX_WORD_CHARS {
+            return result;
+        }
+        // Longer than any Vietnamese word: put back the keys typed for it and
+        // stop composing until the word ends.
+        let raw = std::mem::take(&mut self.word_raw);
+        self.engine.reset();
+        self.word.clear();
+        self.raw_word = true;
+        if raw == format!("{before}{ch}") {
+            return ProcessResult::forward();
+        }
+        ProcessResult {
+            backspaces: before.chars().count(),
+            commit: raw,
+            consumed: true,
+        }
+    }
+
+    fn engine_key(&mut self, ch: char) -> ProcessResult {
         let r = self.engine.process(ch as u32);
-        let commit = decode_engine_output(r.output);
         ProcessResult {
             backspaces: r.backspaces,
-            commit,
+            commit: decode_engine_output(r.output),
             consumed: r.processed,
         }
     }
@@ -130,24 +205,42 @@ impl EngineState {
     /// to (or instead of) forwarding the backspace to the app.
     pub fn process_backspace(&mut self) -> ProcessResult {
         let r = self.engine.process_backspace();
-        let commit = decode_engine_output(r.output);
-        ProcessResult {
+        let result = ProcessResult {
             backspaces: r.backspaces,
-            commit,
+            commit: decode_engine_output(r.output),
             consumed: r.processed,
+        };
+        if result.consumed {
+            apply_to_word(&mut self.word, &result, '\0');
+        } else {
+            self.word.pop();
         }
+        // Which typed keys a deleted letter came from is unknown; keep keys
+        // that reproduce what is left on screen.
+        self.word_raw = self.keys_for(&self.word);
+        result
+    }
+
+    /// Keys that rebuild composed `text`, for seeding this engine. Only the
+    /// last form of each glyph is kept, never undone tone toggles.
+    fn keys_for(&self, text: &str) -> String {
+        context_from_surrounding(text, self.method).0
     }
 
     /// Reset engine state. Call on focus loss, click, navigation key, or
     /// any signal that the cursor moved outside the daemon's control.
     pub fn reset(&mut self) {
         self.engine.reset();
+        self.word.clear();
+        self.word_raw.clear();
+        self.word_keys = 0;
+        self.raw_word = false;
     }
 
     /// Change the active input method at runtime. Resets composition state
     /// (the new method has different keystroke semantics).
     pub fn set_input_method(&mut self, method: InputMethod) {
-        self.engine.reset();
+        self.reset();
         self.engine.set_input_method(method.to_vnkey());
         self.engine.options.modern_style = self.modern_style;
         self.method = method;
@@ -173,10 +266,13 @@ impl EngineState {
     /// diacritics for the engine's active input method), so callers seeding
     /// from raw accumulated keystrokes use it directly. Callers seeding from
     /// *composed surrounding text* should use [`feed_context_gated`], which
-    /// round-trip-checks the reconstruction.
+    /// round-trip-checks the reconstruction. A word longer than any
+    /// Vietnamese word is not seeded; the following keys pass through
+    /// unchanged until the next word break.
     pub fn feed_context(&mut self, text: &str) -> bool {
-        let (context, _) = context_from_surrounding(text, self.method);
-        self.engine.feed_context(&context)
+        let context = self.keys_for(text);
+        let screen = self.render(&context);
+        self.seed(&context, screen)
     }
 
     /// Seed from **composed** surrounding text, with a render-gate.
@@ -190,13 +286,34 @@ impl EngineState {
     /// mismatch — the engine stays untouched and the caller treats the word
     /// as foreign text (retroactive editing disabled for it). For real
     /// Vietnamese single syllables the reconstruction is faithful and the gate
-    /// is inert. Returns `true` only if the seed round-tripped AND was fed.
+    /// is inert. A word longer than any Vietnamese word is never seeded and
+    /// switches the engine to pass-through until the next word break.
+    /// Returns `true` only if the seed round-tripped AND was fed.
     pub fn feed_context_gated(&mut self, text: &str) -> bool {
-        let (context, _) = context_from_surrounding(text, self.method);
-        if self.render(&context) != text {
+        let context = self.keys_for(text);
+        let screen = self.render(&context);
+        if screen.chars().count() <= MAX_WORD_CHARS && screen != text {
             return false;
         }
-        self.engine.feed_context(&context)
+        self.seed(&context, screen)
+    }
+
+    fn seed(&mut self, keys: &str, screen: String) -> bool {
+        if screen.chars().count() > MAX_WORD_CHARS {
+            self.reset();
+            self.raw_word = true;
+            return false;
+        }
+        let fed = self.engine.feed_context(keys);
+        if fed {
+            self.word = screen;
+            self.word_raw = keys.to_owned();
+            self.word_keys = keys.chars().count();
+            self.raw_word = false;
+        } else {
+            self.reset();
+        }
+        fed
     }
 
     /// Returns true if the engine has no pending composition state — i.e.
@@ -216,6 +333,28 @@ pub fn telex_context_from_surrounding(text: &str) -> (String, Vec<u8>) {
 /// VNI method. Returns the keystroke string and a per-glyph byte-width vector.
 pub fn vni_context_from_surrounding(text: &str) -> (String, Vec<u8>) {
     context_from_surrounding(text, InputMethod::Vni)
+}
+
+impl ProcessResult {
+    fn forward() -> Self {
+        Self {
+            backspaces: 0,
+            commit: String::new(),
+            consumed: false,
+        }
+    }
+}
+
+/// Update the on-screen `word` the way the daemon applies `result` for `ch`.
+fn apply_to_word(word: &mut String, result: &ProcessResult, ch: char) {
+    if result.consumed {
+        for _ in 0..result.backspaces {
+            word.pop();
+        }
+        word.push_str(&result.commit);
+    } else {
+        word.push(ch);
+    }
 }
 
 fn context_from_surrounding(text: &str, method: InputMethod) -> (String, Vec<u8>) {
@@ -270,6 +409,90 @@ mod tests {
             // daemon forwards BS to app
             buf.pop();
         }
+    }
+
+    // ===== Word-length cap =====
+
+    #[test]
+    fn longest_vietnamese_word_still_composes_with_corrections() {
+        // `nghiêng` is the longest word (7 letters). A tone correction takes
+        // it to 10 keys, so a keystroke cap of 9 would wrongly restore it.
+        for (method, keys, want) in [
+            (InputMethod::Telex, "nghieengx", "nghiễng"),
+            (InputMethod::Telex, "nghieengxf", "nghiềng"),
+            (InputMethod::Vni, "nghie6ng42", "nghiềng"),
+        ] {
+            let mut eng = EngineState::new(method);
+            assert_eq!(type_str(&mut eng, keys), want, "{method:?} {keys}");
+        }
+    }
+
+    #[test]
+    fn eighth_letter_restores_the_typed_keys_until_word_break() {
+        // `đ` + consonants has no vowel, so vnkey never restores it itself;
+        // only the length cap can.
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert_eq!(type_str(&mut eng, "ddbcdghk"), "đbcdghk");
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert_eq!(type_str(&mut eng, "ddbcdghkl"), "ddbcdghkl");
+        // Raw until the word ends (`dd` stays `dd`), then composing resumes.
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert_eq!(type_str(&mut eng, "ddbcdghkldd as"), "ddbcdghkldd á");
+    }
+
+    #[test]
+    fn long_tone_toggling_word_does_not_crash_the_engine() {
+        // Previously: `hanh` + `jf`x70 kept showing 4 letters, and the next
+        // non-Vietnamese key made vnkey copy all 144 keys into its 128-entry
+        // buffer (index out of bounds).
+        let mut eng = EngineState::new(InputMethod::Telex);
+        let toggled = format!("hanh{}", "jf".repeat(70));
+        assert_eq!(type_str(&mut eng, &toggled), "hành");
+        type_str(&mut eng, "k");
+        assert_eq!(type_str(&mut eng, " hanhj"), " hạnh");
+        // Same for a long word typed live (crashed at key 131): vnkey
+        // restores it to the keys typed, and the rest passes through.
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert_eq!(type_str(&mut eng, &"as".repeat(66)), "as".repeat(66));
+    }
+
+    #[test]
+    fn deleting_a_word_boundary_keeps_composition() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        let mut visible = type_str(&mut eng, "la ");
+        do_backspace(&mut eng, &mut visible);
+        let r = eng.process_key('f');
+        assert!(r.consumed);
+        assert_eq!((r.backspaces, r.commit.as_str()), (1, "à"));
+    }
+
+    #[test]
+    fn seed_longer_than_any_word_passes_keys_through_until_word_break() {
+        for method in [InputMethod::Telex, InputMethod::Vni, InputMethod::Viqr] {
+            let mut eng = EngineState::new(method);
+            // A 427-character URL seeded from a URL bar used to crash.
+            let url = format!("https://example.test/{}", "as".repeat(203));
+            assert!(!eng.feed_context_gated(&url));
+            assert!(!eng.feed_context(&url));
+        }
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert!(!eng.feed_context_gated("abcdefgh"));
+        // A fresh engine would compose `as` → `á`; this is still the long word.
+        assert_eq!(type_str(&mut eng, "as as"), "as á");
+    }
+
+    #[test]
+    fn seven_letter_seed_still_composes() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert!(eng.feed_context_gated("nghiêng"));
+        let r = eng.process_key('f');
+        assert!(r.consumed);
+        let mut screen = String::from("nghiêng");
+        for _ in 0..r.backspaces {
+            screen.pop();
+        }
+        screen.push_str(&r.commit);
+        assert_eq!(screen, "nghiềng");
     }
 
     // ===== Telex basic =====

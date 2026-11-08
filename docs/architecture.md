@@ -190,6 +190,16 @@ failure, or an abort inside a dependency.
 Wraps the vendored vnkey engine and exposes the linguistic operations the
 Composer needs. No I/O, no Wayland, no transport policy.
 
+A word longer than 7 letters on screen, the length of the longest Vietnamese
+word (`nghiêng`; corrections such as a changed tone do not count against it),
+is not Vietnamese: the wrapper restores it to the keys typed for it and passes
+keys through unchanged until vnkey's next word break. Seeding a word longer
+than the cap passes keys through the same way. Separately, one word may
+feed vnkey at most 32 keys before its key history is compacted to keys that
+reproduce the word on screen: vnkey's non-Vietnamese restore copies the whole
+history into a fixed 128-entry buffer, so tone toggling on a short word would
+otherwise overflow it.
+
 ### `edit-strategy`
 The policy layer, independent of any transport:
 - `BackspaceMethod` enum and `detect_method()` — tier selection.
