@@ -85,6 +85,12 @@ pub struct EngineState {
     /// The current word grew past `MAX_WORD_CHARS`: pass keys through
     /// unchanged until the next word break.
     raw_word: bool,
+    /// The word on screen when it differs from `word`, vnkey's rendering of
+    /// `word_raw`. Set after a backspace into raw letters that vnkey would
+    /// render differently (`thoong`, left of a restored `thoongh`, renders
+    /// `thông`): the screen keeps `thoong` until the next key, whose result
+    /// is then written over it as if `thoong` plus that key had been typed.
+    screen_word: Option<String>,
     /// Kept so the render-gate can spin up a throwaway engine with the same
     /// configuration to round-trip-check a reconstructed seed.
     method: InputMethod,
@@ -112,6 +118,7 @@ impl EngineState {
             word_raw: String::new(),
             word_keys: 0,
             raw_word: false,
+            screen_word: None,
             method,
             bracket_shortcuts,
             modern_style,
@@ -158,6 +165,7 @@ impl EngineState {
             self.word.clear();
             self.word_raw.clear();
             self.word_keys = 0;
+            self.screen_word = None;
             return self.engine_key(ch);
         }
         if self.word_keys >= MAX_WORD_KEYS {
@@ -178,7 +186,10 @@ impl EngineState {
         let vnkey_restored =
             result.consumed && self.word == self.word_raw && self.word != format!("{before}{ch}");
         if !vnkey_restored && self.word.chars().count() <= MAX_WORD_CHARS {
-            return result;
+            return match self.screen_word.take() {
+                Some(screen) => replace_word(&screen, &self.word, ch),
+                None => result,
+            };
         }
         // Not Vietnamese (vnkey restored it, or it is longer than any
         // Vietnamese word): put back keys reproducing the word as it was on
@@ -187,15 +198,16 @@ impl EngineState {
         // and replaced tones (`hanhjf` shows `hành`, so `p` gives `hanhfp`).
         // Then stop composing until the word ends.
         let raw = format!("{}{ch}", self.raw_form(&before));
+        let screen = self.screen_word.take().unwrap_or(before);
         self.word_raw.clear();
         self.engine.reset();
         self.word.clear();
         self.raw_word = true;
-        if raw == format!("{before}{ch}") {
+        if raw == format!("{screen}{ch}") {
             return ProcessResult::forward();
         }
         ProcessResult {
-            backspaces: before.chars().count(),
+            backspaces: screen.chars().count(),
             commit: raw,
             consumed: true,
         }
@@ -213,6 +225,17 @@ impl EngineState {
     /// Process a backspace. Returns what the daemon should do *in addition*
     /// to (or instead of) forwarding the backspace to the app.
     pub fn process_backspace(&mut self) -> ProcessResult {
+        if let Some(mut screen) = self.screen_word.take() {
+            // vnkey's word is not what is on screen, and its own backspace
+            // can rewrite it (`doén` minus `n` moves the tone: `dóe`). Let
+            // the app delete one screen letter; the caller reseeds from
+            // what is left.
+            screen.pop();
+            self.engine.reset();
+            self.word_raw = screen.clone();
+            self.word = screen;
+            return ProcessResult::forward();
+        }
         let r = self.engine.process_backspace();
         let result = ProcessResult {
             backspaces: r.backspaces,
@@ -238,6 +261,13 @@ impl EngineState {
     /// as `doesn` stays `doesn`, so `t` restores `doesnt`). Either way only
     /// the last form is kept, never undone tone toggles.
     fn keys_for(&self, text: &str) -> String {
+        // The user's own spelling, shorthands included (`ửo` typed as `wor`),
+        // when it still types `text`.
+        if let Some(typed) = self.typed_spelling(text) {
+            if self.render(&typed) == text {
+                return typed;
+            }
+        }
         let by_glyph = context_from_surrounding(text, self.method).0;
         if is_subsequence(&by_glyph, &self.word_raw) {
             by_glyph
@@ -254,15 +284,30 @@ impl EngineState {
     /// while shorthands survive (`sưi` typed as `swi` is `swi`). Unlike
     /// `keys_for`, the result need not re-type `text` in this method.
     fn raw_form(&self, text: &str) -> String {
+        self.typed_spelling(text)
+            .unwrap_or_else(|| self.keys_for(text))
+    }
+
+    /// `text` spelled glyph by glyph as the user could have typed it: a
+    /// spelling that is a subsequence of the keys typed for the current word
+    /// (`word_raw`), keeping as many of them as the glyphs account for (a
+    /// bare `u`/`o` also matches `nguoiwf`, but would drop its `w`). Ties go
+    /// to the earlier key order below. `None` if no spelling matches.
+    fn typed_spelling(&self, text: &str) -> Option<String> {
         let typed: Vec<char> = self.word_raw.chars().collect();
-        for tone_last in [false, true] {
-            let groups = spelling_groups(text, self.method, tone_last);
+        let mut best: Option<String> = None;
+        for (tone_last, w_last) in [(false, false), (true, false), (true, true), (false, true)] {
+            let groups = spelling_groups(text, self.method, tone_last, w_last);
             let mut keys = String::new();
-            if pick_typed_spelling(&groups, &typed, 0, &mut keys) {
-                return keys;
+            if pick_typed_spelling(&groups, &typed, 0, &mut keys)
+                && best
+                    .as_ref()
+                    .is_none_or(|b| keys.chars().count() > b.chars().count())
+            {
+                best = Some(keys);
             }
         }
-        self.keys_for(text)
+        best
     }
 
     /// Reset engine state. Call on focus loss, click, navigation key, or
@@ -273,6 +318,7 @@ impl EngineState {
         self.word_raw.clear();
         self.word_keys = 0;
         self.raw_word = false;
+        self.screen_word = None;
     }
 
     /// Change the active input method at runtime. Resets composition state
@@ -343,9 +389,22 @@ impl EngineState {
     /// `hanhjph` minus `jph` composes `hạnh` on the next `j` like freshly
     /// typed `hanh`. A word that cannot be reproduced is not composed: keys
     /// pass through until the next word break.
+    ///
+    /// Raw letters left of a restored word (`thoong`, after deleting the `h`
+    /// of `thoongh`) do not reproduce themselves: they render `thông`. They
+    /// are still exactly the keys typed for them, so they are seeded as typed
+    /// keys and the next key acts as if they had just been typed: `s` gives
+    /// `thống`. See `screen_word`.
     pub fn reseed_after_delete(&mut self, word: &str) -> bool {
         if self.feed_context_gated(word) {
             return true;
+        }
+        if !word.is_empty() && word.chars().all(|ch| ch.is_ascii_alphabetic()) {
+            let screen = self.render(word);
+            if self.seed(word, screen) {
+                self.screen_word = Some(word.to_owned());
+                return true;
+            }
         }
         self.reset();
         self.raw_word = !word.is_empty();
@@ -359,6 +418,7 @@ impl EngineState {
             return false;
         }
         let fed = self.engine.feed_context(keys);
+        self.screen_word = None;
         if fed {
             self.word = screen;
             self.word_raw = keys.to_owned();
@@ -411,6 +471,24 @@ fn apply_to_word(word: &mut String, result: &ProcessResult, ch: char) {
     }
 }
 
+/// The edit turning on-screen word `screen` into `word`, after typing `ch`.
+/// A pure append of `ch` is left to the app (forwarded).
+fn replace_word(screen: &str, word: &str, ch: char) -> ProcessResult {
+    if *word == format!("{screen}{ch}") {
+        return ProcessResult::forward();
+    }
+    let common = screen
+        .chars()
+        .zip(word.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    ProcessResult {
+        backspaces: screen.chars().count() - common,
+        commit: word.chars().skip(common).collect(),
+        consumed: true,
+    }
+}
+
 fn context_from_surrounding(text: &str, method: InputMethod) -> (String, Vec<u8>) {
     let mut result = String::with_capacity(text.len());
     let mut widths = Vec::with_capacity(text.chars().count());
@@ -432,25 +510,41 @@ fn chars_from_composed(ch: char, method: InputMethod) -> &'static str {
 /// Telex horn/breve glyphs also list shorthands: `ư` as `uw`, `w` or `u` (the
 /// `w` of `uow` horns both vowels), `ơ`/`ă` as `ow`/`aw` or bare. With
 /// `tone_last`, each word's tone key is its own group after its letters.
-fn spelling_groups(text: &str, method: InputMethod, tone_last: bool) -> Vec<Vec<String>> {
+/// With `w_last`, the horn/breve `w` is typed once after the word's letters
+/// (`người` as `nguoiwf`), before its tone key.
+fn spelling_groups(
+    text: &str,
+    method: InputMethod,
+    tone_last: bool,
+    w_last: bool,
+) -> Vec<Vec<String>> {
     let mut groups = Vec::new();
     let mut tone = None;
-    let flush = |groups: &mut Vec<Vec<String>>, tone: Option<char>| {
-        if let Some(key) = tone {
+    let mut w = None;
+    let flush = |groups: &mut Vec<Vec<String>>, w: Option<char>, tone: Option<char>| {
+        for key in [w, tone].into_iter().flatten() {
             groups.push(vec![key.to_string()]);
         }
     };
     for ch in text.chars() {
         let mut keys = chars_from_composed(ch, method).to_owned();
         if !ch.is_alphabetic() {
-            flush(&mut groups, tone.take());
+            flush(&mut groups, w.take(), tone.take());
             groups.push(vec![keys]);
             continue;
+        }
+        if w_last && method == InputMethod::Telex && !ch.is_ascii() {
+            if let Some(at) = keys.find(['w', 'W']) {
+                w = w.or(keys[at..].chars().next());
+                keys.remove(at);
+            }
         }
         if tone_last {
             if let Some((at, key)) = keys.char_indices().last() {
                 if at > 0 && is_tone_key(key, method) {
-                    flush(&mut groups, tone.replace(key));
+                    if let Some(prev) = tone.replace(key) {
+                        flush(&mut groups, w.take(), Some(prev));
+                    }
                     keys.truncate(at);
                 }
             }
@@ -468,7 +562,7 @@ fn spelling_groups(text: &str, method: InputMethod, tone_last: bool) -> Vec<Vec<
         }
         groups.push(spellings);
     }
-    flush(&mut groups, tone);
+    flush(&mut groups, w, tone);
     groups
 }
 
@@ -633,12 +727,62 @@ mod tests {
             ("Osin", "Osin"),
             ("OSIN", "OSIN"),
             ("Doesnt", "Doesnt"),
+            // A `w` typed after the vowels (`nguoiwf` shows `người`) counts.
+            ("nguoiwfk", "nguoiwfk"),
+            ("nuocwsk", "nuocwsk"),
             // Nothing undone: every key typed comes back as before.
             ("tuwjd", "tuwjd"),
             ("doesnt", "doesnt"),
         ] {
             let mut eng = EngineState::new(InputMethod::Telex);
             assert_eq!(type_str(&mut eng, keys), expected, "{keys}");
+        }
+    }
+
+    #[test]
+    fn reseed_keys_retype_the_word_even_when_typed_keys_do_not() {
+        // `thuoww` shows `thươ` (the second `w` is literal-escaped back);
+        // its typed spelling `thuow` would not retype it, so seeding falls
+        // back to keys that do.
+        let mut eng = EngineState::new(InputMethod::Telex);
+        let screen = type_str(&mut eng, "thuoww");
+        assert!(eng.feed_context_gated(&screen), "{screen}");
+    }
+
+    #[test]
+    fn raw_letters_left_by_a_delete_compose_like_fresh_typing() {
+        // `thoong` is what is left of a restored `thoongh`: the screen shows
+        // raw letters that vnkey renders `thông`.
+        let diverged = || {
+            let mut eng = EngineState::new(InputMethod::Telex);
+            assert!(eng.reseed_after_delete("thoong"));
+            eng
+        };
+        // The next key is written over the raw letters: `thoongs` is `thống`.
+        let r = diverged().process_key('s');
+        assert_eq!((r.backspaces, r.commit.as_str()), (4, "ống"));
+
+        // A word break ends it: the next word starts clean.
+        let mut eng = diverged();
+        assert_eq!(eng.process_key(' ').backspaces, 0);
+        assert_eq!(eng.process_key('a').backspaces, 0);
+
+        // A backspace is left to the app: vnkey would edit its own word (in
+        // the old tone style `doén` minus `n` moves the tone back: `dóe`),
+        // not the screen's `doesn`. The caller reseeds from what is left.
+        for modern in [true, false] {
+            let mut eng = EngineState::new(InputMethod::Telex);
+            eng.set_modern_style(modern);
+            assert!(eng.reseed_after_delete("doesn"));
+            let r = eng.process_backspace();
+            assert!(!r.consumed, "modern={modern} {r:?}");
+            assert!(eng.reseed_after_delete("does"));
+            let r = eng.process_key('n');
+            assert_eq!(
+                (r.backspaces, r.commit.as_str()),
+                (2, "én"),
+                "modern={modern}"
+            );
         }
     }
 

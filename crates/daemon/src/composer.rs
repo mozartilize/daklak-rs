@@ -810,6 +810,11 @@ impl Composer {
             // backspace re-exposed, the same on every tier.
             let word = self.current_shadow_word().to_owned();
             self.retroactive_context = self.engine.reseed_after_delete(&word);
+            tracing::debug!(
+                word,
+                seeded = self.retroactive_context,
+                "reseed after backspace"
+            );
             self.last_keystroke_at = Instant::now();
             KeyDecision::ForwardRaw
         }
@@ -4189,18 +4194,26 @@ mod tests {
         assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
         c.observe_surrounding_bytes("wo", ByteCursor(2), ByteCursor(2), false);
 
+        // `wo` is what is left of the typed keys, so `rd` behaves as typing
+        // `word` from scratch: `r` shows `ửo`, `d` restores `word`. The
+        // deleted `rk` never comes back.
         c.mark_action();
-        assert!(matches!(c.feed_key('r'), KeyDecision::ForwardRaw));
-        c.observe_surrounding_bytes("wor", ByteCursor(3), ByteCursor(3), false);
-        c.mark_action();
-        match c.feed_key('d') {
-            KeyDecision::ForwardRaw => {}
+        match c.feed_key('r') {
             KeyDecision::Apply {
                 backspaces, commit, ..
             } => {
-                panic!("expected raw 'd', got edit bs={backspaces} commit={commit:?}");
+                assert_eq!((backspaces, commit.as_str()), (2, "ửo"));
+                c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
             }
-            KeyDecision::Consumed => panic!("expected raw 'd', got consumed"),
+            _ => panic!("expected r to compose like fresh typing"),
+        }
+        c.observe_surrounding_bytes("ửo", ByteCursor(4), ByteCursor(4), false);
+        c.mark_action();
+        match c.feed_key('d') {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => assert_eq!((backspaces, commit.as_str()), (2, "word")),
+            _ => panic!("expected d to restore the typed word"),
         }
     }
 
@@ -4232,8 +4245,16 @@ mod tests {
                 }
                 KeyDecision::Consumed => {}
             }
-            let cursor = visible.len() as u32;
-            c.observe_surrounding_bytes(&visible, ByteCursor(cursor), ByteCursor(cursor), false);
+            // ForwardKey clients (terminals) send no surrounding text.
+            if c.method() == BackspaceMethod::SurroundingText {
+                let cursor = visible.len() as u32;
+                c.observe_surrounding_bytes(
+                    &visible,
+                    ByteCursor(cursor),
+                    ByteCursor(cursor),
+                    false,
+                );
+            }
         }
         visible
     }
@@ -4249,6 +4270,41 @@ mod tests {
             let mut c = Composer::new(InputMethod::Telex, method, false);
             let visible = type_echoed(&mut c, "", "hanhjph<<<j ");
             assert_eq!(visible, "hạnh ", "{method:?}");
+        }
+    }
+
+    #[test]
+    fn deleting_into_restored_raw_letters_acts_like_fresh_typing() {
+        // A stray letter restores the word to raw keys (`thoongh`); deleting
+        // it leaves `thoong`, which Telex would show as `thông`. The next
+        // key acts as if `thoong` plus that key had been typed fresh.
+        for (keys, expected) in [
+            ("thoongh<s ", "thống "),
+            ("Hoongh<f ", "Hồng "),
+            ("nuwowch<s ", "nước "),
+            ("Ddanhsph<<<s ", "Đánh "),
+            // Word break right after: the raw letters stay as they are.
+            ("thoongh< ", "thoong "),
+            // Deleting further keeps working from what is left.
+            ("thoongh<<<s ", "thố "),
+            // Already-raw English still ends as typed, shorthands included.
+            ("doesnt<<<snt ", "doesnt "),
+            ("work<<rd ", "word "),
+        ] {
+            for method in [
+                BackspaceMethod::SurroundingText,
+                BackspaceMethod::ForwardKey,
+            ] {
+                for modern in [true, false] {
+                    let mut c = Composer::new(InputMethod::Telex, method, false);
+                    c.set_modern_style(modern);
+                    assert_eq!(
+                        type_echoed(&mut c, "", keys),
+                        expected,
+                        "{keys} {method:?} modern={modern}"
+                    );
+                }
+            }
         }
     }
 

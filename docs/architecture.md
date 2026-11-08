@@ -127,11 +127,21 @@ A seed is fed via `feed_context_gated` and is **render-gated**: the
 reconstruction (composed glyphs → method keystrokes) is replayed and must
 round-trip back to the original glyphs before it is trusted. A word that does
 not round-trip (e.g. English `wor`, which telex-reads as a Vietnamese vowel) is
-never seeded as garbage: on a cursor jump it is left unseeded and typed fresh;
-after a backspace, keys pass through unchanged until the next word break, so
-no new syllable starts mid-word. The reconstruction follows the order the user
-typed the word: the tone key last (`hạnh` → `hanhj`) unless it was typed right
-after the vowel (`doén` typed as `doesn`).
+never seeded as garbage: on a cursor jump it is left unseeded and typed fresh.
+
+After a backspace, raw letters left of a restored word are the keys the user
+typed, even when they do not reproduce themselves (`thoongh` minus `h` leaves
+`thoong`, which Telex shows as `thông`). They are seeded as typed keys, and the
+next key acts as if they had just been typed: its result is written over the
+raw letters (`thoong` + `s` → `thống`, `goon` + `g` → `gông`). Until then the
+screen keeps the raw letters, and a further backspace is left to the app rather
+than to vnkey, whose own backspace would edit its composed word. A word that is
+not raw letters and does not round-trip passes keys through unchanged until the
+next word break, so no new syllable starts mid-word.
+
+Reconstructed keys follow the user's own spelling when it retypes the word:
+shorthands survive (`ửo` typed as `wor`), and the tone key goes where it was
+typed (`hạnh` → `hanhj`, `doén` typed as `doesn`).
 
 ## Composer transitions
 
