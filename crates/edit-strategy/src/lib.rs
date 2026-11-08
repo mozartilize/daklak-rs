@@ -41,11 +41,11 @@ pub enum KeyDecision {
     /// Engine consumed the key; no emit needed.
     Consumed,
     /// Engine did not consume; adapter forwards the key as-is (vk.key
-    /// press on wayland, raw uinput passthrough on evdev) and stamps
-    /// `last_forwarded_key` where applicable.
+    /// press on wayland, raw uinput passthrough on evdev) and marks the key
+    /// held where applicable.
     ForwardRaw,
-    /// Engine consumed and produced an edit. Adapter computes `held_user_kc`
-    /// (tail-char-drop fix) before passing it to the handler.
+    /// Engine consumed and produced an edit. The adapter's sink releases any
+    /// still-held user key the edit re-presses (tail-char-drop fix).
     Apply {
         method: BackspaceMethod,
         backspaces: usize,

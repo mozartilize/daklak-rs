@@ -90,8 +90,8 @@ pub struct EvdevAdapter {
     /// when emit_string is about to press a key the user is still
     /// holding, libxkbcommon (in the focused client) treats the
     /// second press as a no-op duplicate. We emit a prelude release
-    /// to clear that state. Same fix as `keymap::emit_char`'s
-    /// `held_user_kc` path on the wayland side.
+    /// to clear that state. Same fix as `key_emitter::emit_char`'s
+    /// `HeldKeys` path on the wayland side.
     held_physical: HashSet<u32>,
     /// Physical keycodes currently held whose *press* was forwarded raw
     /// (ForwardRaw / shortcut / non-printable). Only these have their

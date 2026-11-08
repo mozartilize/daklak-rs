@@ -68,6 +68,7 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV1, ()> for WaylandAdapter<H> {
                 state.state.im_ctx_v1 = None;
                 state.state.v1_keyboard = None;
                 state.state.client_repeat.cancel();
+                state.state.held_forwarded.clear();
                 state.state.apply_event(crate::frame::FrameEvent::Deactivate);
                 // Deactivate has no trailing CommitState — fire immediately.
                 state.apply_done_frame();

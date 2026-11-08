@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use viet_ime_edit_strategy::{KeyState, OutputSink};
-use viet_ime_key_emitter::KeyEmitter;
+use viet_ime_key_emitter::{HeldKeys, KeyEmitter};
 use viet_ime_keymap::xkb::XkbState;
 
 use wayland_protocols::wp::input_method::zv1::client::zwp_input_method_context_v1::ZwpInputMethodContextV1;
@@ -99,14 +99,11 @@ pub struct AdapterSink<'a> {
     /// Tuple = (depressed, latched, locked, group) as in
     /// `zwp_input_method_keyboard_grab_v2::Modifiers`.
     pub(crate) raw_mods: (u32, u32, u32, u32),
-    /// Tail-char-drop fix. When the user is currently holding a
-    /// key whose keycode equals the one daklak is about to re-emit via
-    /// `vk_commit_char`, the XWayland X-server input thread silently
-    /// drops the synthetic press because that keycode is already
-    /// marked DOWN in its state table. Solution: emit a prelude
-    /// release for that keycode before the normal press/release pair,
-    /// transitioning X's state to UP first.
-    pub(crate) held_user_kc: Option<u32>,
+    /// Tail-char-drop fix. User keys the focused client sees as held. A
+    /// synthetic press on one of their keycodes (`vk_commit_char`, or the v1
+    /// keysym KWin maps to that keycode) would be dropped as a duplicate, so
+    /// the sink emits a prelude release first and removes the key here.
+    pub(crate) held: &'a mut HeldKeys,
     /// Wayland connection — used by `commit_via_keysym` to flush after
     /// the batch of emissions so they reach the compositor in one round.
     pub(crate) conn: Option<&'a wayland_client::Connection>,
@@ -198,6 +195,12 @@ impl OutputSink for AdapterSink<'_> {
             );
             self.forward_emitter.emit_modifiers(0, 0, 0, self.raw_mods.3);
         }
+        if state == KeyState::Pressed {
+            // A synthetic Backspace while the user's own Backspace is still
+            // down (fast delete-then-retype) would otherwise be dropped.
+            self.held
+                .release_before_press(self.forward_emitter, time, key_code);
+        }
         tracing::trace!(key_code, value, "vk_key emit (forward channel)");
         self.forward_emitter.emit_key(time, key_code, value);
         if guard_modifiers && state == KeyState::Released {
@@ -243,7 +246,7 @@ impl OutputSink for AdapterSink<'_> {
             &mut synthetic_mods,
             viet_ime_key_emitter::EmitCharParams {
                 raw_mods: self.raw_mods,
-                held_user_kc: self.held_user_kc,
+                held: self.held,
                 time,
                 c,
             },
@@ -256,7 +259,7 @@ impl OutputSink for AdapterSink<'_> {
             //
             // ImV2 has no ctx.keysym(). Every replacement goes through the
             // virtual keyboard's synthetic keymap (`vk_commit_char`, which
-            // includes the held_user_kc prelude-release fix), even when the
+            // includes the held-key prelude-release fix), even when the
             // client has a live text-input-v3 session:
             //
             // - Non-terminal clients (Firefox / Google Docs) ignore
@@ -365,19 +368,13 @@ impl AdapterSink<'_> {
 
             // Tail-char-drop fix: KWin ignores a press for a keycode it
             // already considers pressed. If the keycode KWin will pick for
-            // this keysym (any level: `ô` lives on level 5 of KEY_O) is the
+            // this keysym (any level: `ô` lives on level 5 of KEY_O) is a
             // physical key the user is still holding, release it through
             // the forward channel first so the synthetic press is not
             // dropped.
             if let Some(kc) = self.xkb.and_then(|xkb| xkb.keysym_keycode(sym)) {
-                if self.held_user_kc == Some(kc) {
-                    tracing::debug!(
-                        kc,
-                        char = %c,
-                        "commit_via_keysym: prelude release for still-held user key (tail-char-drop fix)"
-                    );
-                    self.forward_emitter.emit_key(time, kc, 0);
-                }
+                self.held
+                    .release_before_press(self.forward_emitter, time, kc);
             }
 
             // Per-char keysym barrier: KWin's forwardKeySym installs a

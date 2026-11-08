@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use viet_ime_key_emitter::{emit_char, EmitCharParams, KeyEmitter, SyntheticMods};
+use viet_ime_key_emitter::{emit_char, EmitCharParams, HeldKeys, KeyEmitter, SyntheticMods};
 
 #[derive(Debug, PartialEq, Eq)]
 enum Event {
@@ -45,7 +45,7 @@ impl EmitCharFixture {
         &mut self,
         emitter: &mut MockEmitter,
         raw_mods: (u32, u32, u32, u32),
-        held_user_kc: Option<u32>,
+        held: &mut HeldKeys,
         time: u32,
         c: char,
     ) -> bool {
@@ -59,7 +59,7 @@ impl EmitCharFixture {
             &mut synthetic_mods,
             EmitCharParams {
                 raw_mods,
-                held_user_kc,
+                held,
                 time,
                 c,
             },
@@ -83,7 +83,13 @@ impl KeyEmitter for MockEmitter {
 fn emit_char_unknown_returns_false() {
     let mut em = MockEmitter::new(true);
     let mut fixture = EmitCharFixture::new();
-    let ok = fixture.emit(&mut em, (0, 0, 0, 0), None, 0, '\u{FFFF}');
+    let ok = fixture.emit(
+        &mut em,
+        (0, 0, 0, 0),
+        &mut HeldKeys::default(),
+        0,
+        '\u{FFFF}',
+    );
     assert!(!ok);
     assert!(em.log.is_empty());
     assert_eq!(fixture.pending, 0);
@@ -97,7 +103,7 @@ fn emit_char_known_char_emits_press_release() {
     // 'â' is in the daklak inventory; we don't assert on the specific
     // keycode (depends on slot table), only on the shape of the event
     // stream: optional mod dance, then press(1) then release(0).
-    let ok = fixture.emit(&mut em, (0, 0, 0, 0), None, 42, 'â');
+    let ok = fixture.emit(&mut em, (0, 0, 0, 0), &mut HeldKeys::default(), 42, 'â');
     assert!(ok);
     let keys: Vec<_> = em
         .log
@@ -121,7 +127,7 @@ fn emit_char_bumps_pending_when_echo_grab() {
     // (set + restore).
     let mut em = MockEmitter::new(true);
     let mut fixture = EmitCharFixture::new();
-    let ok = fixture.emit(&mut em, (0, 0, 0, 0), None, 0, 'Â');
+    let ok = fixture.emit(&mut em, (0, 0, 0, 0), &mut HeldKeys::default(), 0, 'Â');
     assert!(ok);
     assert_eq!(
         fixture.pending, 2,
@@ -147,7 +153,7 @@ fn emit_char_bumps_pending_when_echo_grab() {
 fn emit_char_no_bump_when_no_grab_echo() {
     let mut em = MockEmitter::new(false);
     let mut fixture = EmitCharFixture::new();
-    let ok = fixture.emit(&mut em, (0, 0, 0, 0), None, 0, 'Â');
+    let ok = fixture.emit(&mut em, (0, 0, 0, 0), &mut HeldKeys::default(), 0, 'Â');
     assert!(ok);
     assert_eq!(
         fixture.pending, 0,
@@ -159,12 +165,12 @@ fn emit_char_no_bump_when_no_grab_echo() {
 
 #[test]
 fn emit_char_path_a_prelude_release() {
-    // When `held_user_kc` matches the keycode emit_char is about to press,
+    // When a held key matches the keycode emit_char is about to press,
     // the very first event must be a release of that keycode.
     let mut em = MockEmitter::new(true);
     let mut fixture = EmitCharFixture::new();
-    // First emit 'â' once with no held_user_kc to discover its keycode.
-    let _ = fixture.emit(&mut em, (0, 0, 0, 0), None, 0, 'â');
+    // First emit 'â' once with nothing held to discover its keycode.
+    let _ = fixture.emit(&mut em, (0, 0, 0, 0), &mut HeldKeys::default(), 0, 'â');
     let kc = em
         .log
         .iter()
@@ -174,10 +180,12 @@ fn emit_char_path_a_prelude_release() {
         })
         .expect("first emit produces a press");
 
-    // Now emit again with held_user_kc == kc and assert prelude release.
+    // Now emit again with kc held and assert prelude release.
     let mut em = MockEmitter::new(true);
     let mut fixture = EmitCharFixture::new();
-    let ok = fixture.emit(&mut em, (0, 0, 0, 0), Some(kc), 0, 'â');
+    let mut held = HeldKeys::default();
+    held.press(kc);
+    let ok = fixture.emit(&mut em, (0, 0, 0, 0), &mut held, 0, 'â');
     assert!(ok);
     let first = em.log.first().expect("at least one event");
     assert_eq!(
@@ -185,4 +193,90 @@ fn emit_char_path_a_prelude_release() {
         Event::Key(0, kc, 0),
         "prelude release must come first"
     );
+}
+
+fn keycode_of(c: char) -> u32 {
+    let mut em = MockEmitter::new(true);
+    let _ = EmitCharFixture::new().emit(&mut em, (0, 0, 0, 0), &mut HeldKeys::default(), 0, c);
+    em.log
+        .iter()
+        .find_map(|e| match e {
+            Event::Key(_, kc, 1) => Some(*kc),
+            _ => None,
+        })
+        .expect("emit produces a press")
+}
+
+#[test]
+fn every_held_key_is_released_before_its_synthetic_press() {
+    // Fast `hanhj`: `n` and the second `h` are both still down when `j`
+    // composes `ạnh`. Each re-pressed keycode needs its own prelude release,
+    // or the client drops it as a duplicate (`hạnh` → `hạh`).
+    let (kc_n, kc_h) = (keycode_of('n'), keycode_of('h'));
+    let mut held = HeldKeys::default();
+    held.press(kc_n);
+    held.press(kc_h);
+
+    let mut em = MockEmitter::new(false);
+    let mut fixture = EmitCharFixture::new();
+    for c in "ạnh".chars() {
+        assert!(fixture.emit(&mut em, (0, 0, 0, 0), &mut held, 0, c));
+    }
+
+    for kc in [kc_n, kc_h] {
+        let release = em.log.iter().position(|e| *e == Event::Key(0, kc, 0));
+        let press = em.log.iter().position(|e| *e == Event::Key(0, kc, 1));
+        assert!(
+            matches!((release, press), (Some(r), Some(p)) if r < p),
+            "keycode {kc} needs a release before its press: {:?}",
+            em.log
+        );
+    }
+    assert_eq!(
+        held,
+        HeldKeys::default(),
+        "released keys are no longer held"
+    );
+}
+
+#[test]
+fn prelude_release_is_emitted_once_per_held_key() {
+    // After the prelude release the client sees the key up, so a second
+    // char on the same keycode must not release it again.
+    let kc_n = keycode_of('n');
+    let mut held = HeldKeys::default();
+    held.press(kc_n);
+
+    let mut em = MockEmitter::new(false);
+    let mut fixture = EmitCharFixture::new();
+    for c in "nn".chars() {
+        assert!(fixture.emit(&mut em, (0, 0, 0, 0), &mut held, 0, c));
+    }
+    assert_eq!(
+        em.log,
+        vec![
+            Event::Key(0, kc_n, 0),
+            Event::Key(0, kc_n, 1),
+            Event::Key(0, kc_n, 0),
+            Event::Key(0, kc_n, 1),
+            Event::Key(0, kc_n, 0),
+        ]
+    );
+}
+
+#[test]
+fn held_key_is_released_once_before_a_synthetic_press() {
+    // Fast delete-then-retype: the user's third Backspace is still down when
+    // `j` composes and daklak presses Backspace itself. The client would
+    // drop that press as a duplicate (`hanh` + `j` -> `haạnh`).
+    const BACKSPACE: u32 = 14;
+    let mut held = HeldKeys::default();
+    held.press(BACKSPACE);
+    let mut em = MockEmitter::new(false);
+
+    assert!(held.release_before_press(&mut em, 7, BACKSPACE));
+    assert!(!held.release_before_press(&mut em, 8, BACKSPACE));
+    assert!(!held.release_before_press(&mut em, 9, 30));
+    assert_eq!(em.log, vec![Event::Key(7, BACKSPACE, 0)]);
+    assert!(!held.contains(BACKSPACE));
 }

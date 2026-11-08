@@ -158,8 +158,7 @@ impl AdapterHandler for Daemon {
                     commit = %repair.commit,
                     "repair from surrounding-confirmed raw key"
                 );
-                // No held key for a frame-triggered edit; frames carry no time.
-                ctx.with_sink(raw_mods, None, commit_string_functional, |sink| {
+                ctx.with_sink(raw_mods, commit_string_functional, |sink| {
                     w.apply_confirmed_repair_to_sink(
                         repair.backspaces,
                         &repair.commit,
@@ -312,13 +311,12 @@ impl AdapterHandler for Daemon {
         backspaces: usize,
         commit: &str,
         raw_mods: (u32, u32, u32, u32),
-        held_user_kc: Option<u32>,
     ) {
         let serial = ctx.serial();
         if let Some(w) = self.router.composer.as_mut() {
             tracing::debug!(method = ?w.method(), backspaces, commit, "strategy.apply");
             let commit_string_functional = w.commit_string_functional;
-            ctx.with_sink(raw_mods, held_user_kc, commit_string_functional, |sink| {
+            ctx.with_sink(raw_mods, commit_string_functional, |sink| {
                 w.apply_to_sink(backspaces, commit, serial, time, sink);
             });
         }

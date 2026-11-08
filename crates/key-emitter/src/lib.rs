@@ -33,7 +33,7 @@ mod uinput;
 mod vk_v1;
 mod vk_v2;
 
-pub use emit_char_impl::{emit_char, EmitCharParams, ModifierSnapshot, SyntheticMods};
+pub use emit_char_impl::{emit_char, EmitCharParams, HeldKeys, ModifierSnapshot, SyntheticMods};
 pub use keymap::{build, DaklakKeymap};
 pub use uinput::UinputEmitter;
 pub use vk_v1::VkV1Emitter;

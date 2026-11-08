@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use viet_ime_edit_strategy::ModifierState;
+use viet_ime_key_emitter::HeldKeys;
 use wayland_client::backend::ObjectId;
 use wayland_client::Connection;
 
@@ -167,10 +168,11 @@ pub struct AdapterState {
     /// `synthetic_mods_pending`. TTL safety net (50ms).
     pub synthetic_mods_emitted_at: Option<Instant>,
 
-    /// Last keycode + timestamp daklak forwarded as a vk.key press.
-    pub last_forwarded_key: Option<(u32, Instant)>,
-    /// Last keycode + timestamp daklak forwarded as a vk.key release.
-    pub last_forwarded_release: Option<(u32, Instant)>,
+    /// User keys whose press daklak forwarded to the focused client and whose
+    /// release it has not forwarded yet (tail-char-drop fix, see
+    /// [`HeldKeys`]). Cleared on deactivate: the grab that would deliver the
+    /// releases is gone.
+    pub held_forwarded: HeldKeys,
     /// True while dispatching a key-REPEAT event (wl_keyboard state=2) rather
     /// than a fresh press. Forward helpers read this to emit `value=2` so the
     /// focused client sees a proper repeat. Without it, rate-0 clients that
@@ -273,8 +275,7 @@ impl AdapterState {
             synthetic_mods_pending: 0,
             synthetic_mods_expected: VecDeque::new(),
             synthetic_mods_emitted_at: None,
-            last_forwarded_key: None,
-            last_forwarded_release: None,
+            held_forwarded: HeldKeys::default(),
             forwarding_repeat: false,
             client_repeat: ClientRepeat::default(),
             pending_im_commit_ack: false,
@@ -295,14 +296,6 @@ impl AdapterState {
             plasma_toplevels: HashMap::new(),
             #[cfg(feature = "kde")]
             plasma_manager: None,
-        }
-    }
-
-    pub(crate) fn held_user_kc(&self) -> Option<u32> {
-        match (self.last_forwarded_key, self.last_forwarded_release) {
-            (Some((kc_p, t_p)), Some((kc_r, t_r))) if kc_p == kc_r && t_r > t_p => None,
-            (Some((kc_p, _)), _) => Some(kc_p),
-            (None, _) => None,
         }
     }
 

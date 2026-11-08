@@ -15,7 +15,7 @@
 //! - Daklak synthetic keymap upload to vk (key-channel Vietnamese emit)
 //! - Synthetic-mods echo suppression
 //! - Focus tracking via `wlr-foreign-toplevel-management-v1` + X11 bridge
-//! - `last_forwarded_key` / `last_forwarded_release` bookkeeping for the tail-char-drop fix
+//! - Held forwarded-key bookkeeping for the tail-char-drop fix
 //!
 //! Does NOT own:
 //! - Engine state / composition logic
@@ -185,9 +185,9 @@ pub trait AdapterHandler: 'static {
         ch: Option<char>,
     ) -> KeyDecision;
 
-    /// Called by the adapter with `raw_mods` and `held_user_kc` snapshotted
-    /// just before this call. Daemon constructs a sink via `ctx.with_sink`
-    /// and runs `strategy.apply`.
+    /// Called by the adapter with `raw_mods` snapshotted just before this
+    /// call. Daemon constructs a sink via `ctx.with_sink` and runs
+    /// `strategy.apply`.
     fn apply_pending(
         &mut self,
         ctx: &mut AdapterCtx<'_>,
@@ -195,11 +195,10 @@ pub trait AdapterHandler: 'static {
         backspaces: usize,
         commit: &str,
         raw_mods: (u32, u32, u32, u32),
-        held_user_kc: Option<u32>,
     );
 
     /// User released a key. Adapter has already forwarded the release and
-    /// stamped `last_forwarded_release` before this call — daemon impl is
+    /// dropped the key from the held set before this call — daemon impl is
     /// usually a no-op.
     fn on_key_released(&mut self, _ctx: &mut AdapterCtx<'_>, _time: u32, _evdev: u32) {}
 
@@ -245,27 +244,19 @@ impl<'a> AdapterCtx<'a> {
         self.state.profile
     }
 
-    pub fn last_forwarded_key(&self) -> Option<(u32, Instant)> {
-        self.state.last_forwarded_key
-    }
-
-    pub fn last_forwarded_release(&self) -> Option<(u32, Instant)> {
-        self.state.last_forwarded_release
-    }
-
-    /// Forward a raw press through vk (or v1 context) and stamp
-    /// last_forwarded_key. Used by daemon when a key bypasses composition
-    /// (no active window, xkb has no char for it, nav key, etc.).
+    /// Forward a raw press through vk (or v1 context) and mark the key held.
+    /// Used by daemon when a key bypasses composition (no active window, xkb
+    /// has no char for it, nav key, etc.).
     pub fn forward_press(&mut self, time: u32, key: u32) {
         let value = self.state.press_value();
         self.state.emit_forward_key(time, key, value);
-        // A repeat is not a fresh press — don't refresh the tail-char-drop window.
+        // A repeat is not a fresh press; the held set already reflects it.
         if !self.state.forwarding_repeat {
-            self.state.last_forwarded_key = Some((key, Instant::now()));
+            self.state.held_forwarded.press(key);
         }
     }
 
-    /// Forward a raw press WITHOUT stamping last_forwarded_key. Used by the
+    /// Forward a raw press WITHOUT marking the key held. Used by the
     /// modifier-shortcut path — those keys don't participate in the tail-char-drop fix.
     /// Emits `value=2` while dispatching a repeat (see [`AdapterCtx::is_repeat`]).
     pub fn vk_key_press_unstamped(&mut self, time: u32, key: u32) {
@@ -297,13 +288,13 @@ impl<'a> AdapterCtx<'a> {
     }
 
     /// Construct an AdapterSink bound to live adapter proxies + the supplied
-    /// per-emit hints (raw_mods snapshot, held_user_kc for the tail-char-drop fix), then run
-    /// the closure with `&mut sink`. The closure typically invokes
-    /// `strategy.apply` on the resulting sink.
+    /// raw_mods snapshot, then run the closure with `&mut sink`. The closure
+    /// typically invokes `strategy.apply` on the resulting sink. The sink
+    /// releases held user keys it re-presses (tail-char-drop fix) and drops
+    /// them from the held set.
     pub fn with_sink<F>(
         &mut self,
         raw_mods: (u32, u32, u32, u32),
-        held_user_kc: Option<u32>,
         commit_string_functional: bool,
         f: F,
     ) where
@@ -335,7 +326,7 @@ impl<'a> AdapterCtx<'a> {
                     synthetic_mods_expected: &mut self.state.synthetic_mods_expected,
                     synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
                     raw_mods,
-                    held_user_kc,
+                    held: &mut self.state.held_forwarded,
                     commit_string_functional,
                     conn,
                     xkb: self.state.xkb.as_ref(),
@@ -358,7 +349,7 @@ impl<'a> AdapterCtx<'a> {
                     synthetic_mods_expected: &mut self.state.synthetic_mods_expected,
                     synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
                     raw_mods,
-                    held_user_kc,
+                    held: &mut self.state.held_forwarded,
                     commit_string_functional,
                     conn,
                     xkb: self.state.xkb.as_ref(),
@@ -397,7 +388,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         // Releases route through the same forward path as presses so the
         // focused app sees a balanced press/release pair.
         self.state.emit_forward_key(time, key, 0);
-        self.state.last_forwarded_release = Some((key, Instant::now()));
+        self.state.held_forwarded.release(key);
         let mut ctx = AdapterCtx {
             state: &mut self.state,
         };
@@ -423,7 +414,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             KeyDecision::Consumed => {}
             KeyDecision::ForwardRaw => {
                 self.state.emit_forward_key(time, key, 1);
-                self.state.last_forwarded_key = Some((key, Instant::now()));
+                self.state.held_forwarded.press(key);
             }
             KeyDecision::Apply {
                 // `method` is carried for diagnostics/parity but the emit path
@@ -443,21 +434,13 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 if repeatable {
                     self.state.client_repeat.arm(key, time, Instant::now());
                 }
-                let held_user_kc = self.state.held_user_kc();
-
                 let raw_mods = self.state.raw_mods;
                 {
                     let mut ctx = AdapterCtx {
                         state: &mut self.state,
                     };
-                    self.handler.apply_pending(
-                        &mut ctx,
-                        time,
-                        backspaces,
-                        &commit,
-                        raw_mods,
-                        held_user_kc,
-                    );
+                    self.handler
+                        .apply_pending(&mut ctx, time, backspaces, &commit, raw_mods);
                 }
 
                 // (Tail-char drop on space-after-tone on Tier 2
@@ -506,9 +489,8 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             // via the ctx helpers.
             KeyDecision::Consumed => {}
             // Forward-only keys (Enter, digits, punctuation, no active window /
-            // no xkb char): emit the repeat directly as value=2. Don't stamp
-            // last_forwarded_key — a repeat is not a fresh press for the
-            // tail-char-drop window.
+            // no xkb char): emit the repeat directly as value=2. The key's
+            // held state is unchanged by a repeat.
             KeyDecision::ForwardRaw => {
                 for &value in repeat_forward_values(client_timer) {
                     self.state.emit_forward_key(time, key, value);
@@ -524,19 +506,12 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 commit,
             } => {
                 self.state.forwarding_repeat = false;
-                let held_user_kc = self.state.held_user_kc();
                 let raw_mods = self.state.raw_mods;
                 let mut ctx = AdapterCtx {
                     state: &mut self.state,
                 };
-                self.handler.apply_pending(
-                    &mut ctx,
-                    time,
-                    backspaces,
-                    &commit,
-                    raw_mods,
-                    held_user_kc,
-                );
+                self.handler
+                    .apply_pending(&mut ctx, time, backspaces, &commit, raw_mods);
             }
         }
         self.state.forwarding_repeat = false;
@@ -950,7 +925,6 @@ mod tests {
             _backspaces: usize,
             _commit: &str,
             _raw_mods: (u32, u32, u32, u32),
-            _held_user_kc: Option<u32>,
         ) {
         }
 
@@ -991,7 +965,6 @@ mod tests {
             _backspaces: usize,
             _commit: &str,
             _raw_mods: (u32, u32, u32, u32),
-            _held_user_kc: Option<u32>,
         ) {
         }
 
@@ -1077,29 +1050,100 @@ mod tests {
         assert_eq!(s.press_value(), 1, "back to state 1 once repeat clears");
     }
 
+    /// Forwards every key raw except KEY_J (36), which composes; records the
+    /// held set each edit is applied with.
+    #[derive(Default)]
+    struct ToneOnJHandler {
+        held_at_apply: Vec<viet_ime_key_emitter::HeldKeys>,
+    }
+
+    impl AdapterHandler for ToneOnJHandler {
+        fn on_done_frame(&mut self, _ctx: &mut AdapterCtx<'_>, _frame: &FrameSnapshot) {}
+
+        fn on_key_pressed(
+            &mut self,
+            _ctx: &mut AdapterCtx<'_>,
+            _time: u32,
+            key: u32,
+            _ch: Option<char>,
+        ) -> KeyDecision {
+            if key == 36 {
+                KeyDecision::Apply {
+                    method: BackspaceMethod::ForwardKey,
+                    backspaces: 3,
+                    commit: "ạnh".to_owned(),
+                }
+            } else {
+                KeyDecision::ForwardRaw
+            }
+        }
+
+        fn apply_pending(
+            &mut self,
+            ctx: &mut AdapterCtx<'_>,
+            _time: u32,
+            _backspaces: usize,
+            _commit: &str,
+            _raw_mods: (u32, u32, u32, u32),
+        ) {
+            self.held_at_apply.push(ctx.state.held_forwarded.clone());
+        }
+
+        fn on_modifiers(&mut self, _ctx: &mut AdapterCtx<'_>, _mods: ModifierState) {}
+
+        fn on_focus_changed(
+            &mut self,
+            _ctx: &mut AdapterCtx<'_>,
+            _app_id: Option<String>,
+            _is_xwayland: bool,
+        ) {
+        }
+    }
+
     #[test]
-    fn held_user_kc_tracks_unreleased_forwarded_press() {
-        let mut s = AdapterState::new();
-        let press_at = Instant::now();
+    fn edit_sees_every_forwarded_key_still_held() {
+        // Fast `hanhj`: when `j` composes `ạnh`, both `n` and the second `h`
+        // are still down. The edit re-presses both keycodes, so both must be
+        // known as held, not only the most recent press.
+        const H: u32 = 35;
+        const A: u32 = 30;
+        const N: u32 = 49;
+        const J: u32 = 36;
+        let mut app = WaylandAdapter {
+            handler: ToneOnJHandler::default(),
+            state: AdapterState::new(),
+            qh: None,
+        };
+        app.dispatch_key_press(0, H);
+        app.dispatch_key_press(1, A);
+        app.dispatch_key_release(2, H);
+        app.dispatch_key_press(3, N);
+        app.dispatch_key_press(4, H);
+        app.dispatch_key_release(5, A);
+        app.dispatch_key_press(6, J);
 
-        assert_eq!(s.held_user_kc(), None, "no forwarded press is held");
+        let held = &app.handler.held_at_apply[0];
+        assert!(held.contains(N), "n is still held: {held:?}");
+        assert!(held.contains(H), "second h is still held: {held:?}");
+        assert!(!held.contains(A), "a was released: {held:?}");
+        assert!(!held.contains(J), "consumed j never reached the client");
 
-        s.last_forwarded_key = Some((38, press_at));
-        assert_eq!(s.held_user_kc(), Some(38), "press without release is held");
+        app.dispatch_key_release(7, N);
+        assert!(!app.state.held_forwarded.contains(N));
+        assert!(app.state.held_forwarded.contains(H));
+    }
 
-        s.last_forwarded_release = Some((39, press_at + Duration::from_millis(1)));
-        assert_eq!(
-            s.held_user_kc(),
-            Some(38),
-            "release of a different key does not clear the held press"
-        );
-
-        s.last_forwarded_release = Some((38, press_at + Duration::from_millis(2)));
-        assert_eq!(
-            s.held_user_kc(),
-            None,
-            "matching release after the press clears the held key"
-        );
+    #[test]
+    fn key_repeat_does_not_mark_a_released_key_held() {
+        let mut app = WaylandAdapter {
+            handler: ToneOnJHandler::default(),
+            state: AdapterState::new(),
+            qh: None,
+        };
+        app.dispatch_key_press(0, 30);
+        app.dispatch_key_release(1, 30);
+        app.dispatch_key_repeat(2, 30);
+        assert!(!app.state.held_forwarded.contains(30));
     }
 
     #[test]

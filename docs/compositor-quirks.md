@@ -170,11 +170,22 @@ keycode. It ignores a press for a keycode it already considers pressed. With
 daklak's keymap, `ô` lives on level 5 of KEY_O, so fast rollover (`o` still held
 while `w` turns `o` into `ơ`) would make KWin drop the synthetic press.
 
-**Resolution:** Before each keysym, `commit_via_keysym_v1` looks up the keycode
-KWin will pick (`XkbState::keysym_keycode`, same any-level search) and, if it is
-the physical key the user is still holding, emits a release for it through the
-forward channel first. The virtual-keyboard path does the same with the
-keycode from `char_to_emit`.
+Fast typing often holds more than one key at once: in `hanhj`, `n` and the
+second `h` can both still be down when `j` composes `ạnh`, so a fix that only
+remembers the last forwarded key drops the `n` (`hạh`).
+
+**Resolution:** The adapter keeps every user key whose press it forwarded and
+whose release it has not (`HeldKeys` in `crates/key-emitter`, cleared on
+deactivate). Before each keysym, `commit_via_keysym_v1` looks up the keycode
+KWin will pick (`XkbState::keysym_keycode`, same any-level search) and, if that
+key is held, emits a release for it through the forward channel first and drops
+it from the set, so a later char on the same keycode needs no second release.
+The virtual-keyboard path (`emit_char`) does the same with the keycode from
+`char_to_emit`, and so does every synthetic Backspace (`AdapterSink::vk_key`):
+deleting fast and retyping leaves the user's own Backspace down when the next
+key's edit presses Backspace (`hanh` + `j` became `haạnh` in terminals). All
+three go through `HeldKeys::release_before_press`. Edits triggered by a
+surrounding-text frame use the same set.
 
 ## Preedit rendering of forwarded keys
 

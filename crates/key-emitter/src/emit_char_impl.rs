@@ -29,9 +29,66 @@ pub struct SyntheticMods<'a> {
     pub emitted_at: &'a mut Option<Instant>,
 }
 
-pub struct EmitCharParams {
+/// Keycodes whose user press was forwarded to the focused client and whose
+/// release has not been forwarded yet.
+///
+/// Tail-char-drop fix. The client (or KWin, or XWayland) ignores a press for
+/// a keycode it already considers down, so a synthetic press of a key the
+/// user is still holding is lost. Fast typing holds several keys at once
+/// (`hanh` + `j`: `n` and `h` are both down when `j` composes `ạnh`), so
+/// every held key must be tracked, not just the last one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldKeys(Vec<u32>);
+
+impl HeldKeys {
+    pub fn press(&mut self, keycode: u32) {
+        if !self.0.contains(&keycode) {
+            self.0.push(keycode);
+        }
+    }
+
+    /// Forget `keycode`; returns whether it was held.
+    pub fn release(&mut self, keycode: u32) -> bool {
+        let before = self.0.len();
+        self.0.retain(|&kc| kc != keycode);
+        self.0.len() != before
+    }
+
+    pub fn contains(&self, keycode: u32) -> bool {
+        self.0.contains(&keycode)
+    }
+
+    /// Tail-char-drop fix: a client drops a synthetic press of a keycode it
+    /// still sees down from the user (fast rollover: the user's Backspace or
+    /// letter is still held when daklak re-presses it for an edit). If
+    /// `keycode` is held, release it on `emitter` first and forget it: the
+    /// client now sees it up, so later presses of it need no release.
+    /// Returns whether a release was emitted.
+    pub fn release_before_press(
+        &mut self,
+        emitter: &mut dyn KeyEmitter,
+        time: u32,
+        keycode: u32,
+    ) -> bool {
+        if !self.release(keycode) {
+            return false;
+        }
+        tracing::debug!(keycode, "prelude release for still-held user key");
+        emitter.emit_key(time, keycode, 0);
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+pub struct EmitCharParams<'a> {
     pub raw_mods: ModifierSnapshot,
-    pub held_user_kc: Option<u32>,
+    /// Keys the focused client sees as held. A synthetic press of one of
+    /// them is preceded by a release, and the key is removed: the client now
+    /// sees it up, so later chars on the same keycode need no release.
+    pub held: &'a mut HeldKeys,
     pub time: u32,
     pub c: char,
 }
@@ -39,11 +96,11 @@ pub struct EmitCharParams {
 pub fn emit_char(
     emitter: &mut dyn KeyEmitter,
     synthetic_mods: &mut SyntheticMods<'_>,
-    params: EmitCharParams,
+    params: EmitCharParams<'_>,
 ) -> bool {
     let EmitCharParams {
         raw_mods,
-        held_user_kc,
+        held,
         time,
         c,
     } = params;
@@ -56,18 +113,7 @@ pub fn emit_char(
     let (_, lat, lock, group) = raw_mods;
     let echo = emitter.modifier_echo_through_grab();
 
-    // XWayland tail-char-drop fix. When the user is currently
-    // holding a key whose keycode equals the one we're about to press,
-    // X's input thread still has it DOWN and silently no-ops our
-    // synthetic press as a duplicate. Emit a synthetic release first.
-    if held_user_kc == Some(spec.keycode) {
-        tracing::debug!(
-            keycode = spec.keycode,
-            char = %c,
-            "emit_char: prelude release for still-held user key (tail-char-drop fix)"
-        );
-        emitter.emit_key(time, spec.keycode, 0);
-    }
+    held.release_before_press(emitter, time, spec.keycode);
 
     if let Some((emit_mask, _)) = dance {
         emitter.emit_modifiers(emit_mask, lat, lock, group);

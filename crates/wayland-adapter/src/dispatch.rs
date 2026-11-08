@@ -92,6 +92,7 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV2, ()> for WaylandAdapter<H> {
             }
             zwp_input_method_v2::Event::Deactivate => {
                 state.state.client_repeat.cancel();
+                state.state.held_forwarded.clear();
                 state.state.apply_event(FrameEvent::Deactivate);
             }
             zwp_input_method_v2::Event::SurroundingText {
