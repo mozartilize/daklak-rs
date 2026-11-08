@@ -173,12 +173,21 @@ impl EngineState {
         self.word_keys += 1;
         self.word_raw.push(ch);
         apply_to_word(&mut self.word, &result, ch);
-        if self.word.chars().count() <= MAX_WORD_CHARS {
+        // vnkey restores a word that stops being Vietnamese by rewriting it
+        // to its whole key history.
+        let vnkey_restored =
+            result.consumed && self.word == self.word_raw && self.word != format!("{before}{ch}");
+        if !vnkey_restored && self.word.chars().count() <= MAX_WORD_CHARS {
             return result;
         }
-        // Longer than any Vietnamese word: put back the keys typed for it and
-        // stop composing until the word ends.
-        let raw = std::mem::take(&mut self.word_raw);
+        // Not Vietnamese (vnkey restored it, or it is longer than any
+        // Vietnamese word): put back keys reproducing the word as it was on
+        // screen, plus this key. Keys that were undone are not resurrected:
+        // escapes (`corrr` shows `corr`, so `correct` + `i` is `correcti`)
+        // and replaced tones (`hanhjf` shows `hành`, so `p` gives `hanhfp`).
+        // Then stop composing until the word ends.
+        let raw = format!("{}{ch}", self.raw_form(&before));
+        self.word_raw.clear();
         self.engine.reset();
         self.word.clear();
         self.raw_word = true;
@@ -235,6 +244,25 @@ impl EngineState {
         } else {
             tone_last_context(text, self.method)
         }
+    }
+
+    /// The raw letters of the on-screen word `text`, for a non-Vietnamese
+    /// restore: each glyph spelled as the user could have typed it, picking
+    /// the first spelling that is a subsequence of the keys actually typed.
+    /// Keys that were undone are therefore dropped (`correct` typed as
+    /// `corrrect` stays `correct`; `hành` typed as `hanhjf` is `hanhf`),
+    /// while shorthands survive (`sưi` typed as `swi` is `swi`). Unlike
+    /// `keys_for`, the result need not re-type `text` in this method.
+    fn raw_form(&self, text: &str) -> String {
+        let typed: Vec<char> = self.word_raw.chars().collect();
+        for tone_last in [false, true] {
+            let groups = spelling_groups(text, self.method, tone_last);
+            let mut keys = String::new();
+            if pick_typed_spelling(&groups, &typed, 0, &mut keys) {
+                return keys;
+            }
+        }
+        self.keys_for(text)
     }
 
     /// Reset engine state. Call on focus loss, click, navigation key, or
@@ -400,16 +428,94 @@ fn chars_from_composed(ch: char, method: InputMethod) -> &'static str {
     reversal::chars_from_composed(ch, method)
 }
 
+/// For each glyph of `text`, the spellings that type it, preferred first.
+/// Telex horn/breve glyphs also list shorthands: `ư` as `uw`, `w` or `u` (the
+/// `w` of `uow` horns both vowels), `ơ`/`ă` as `ow`/`aw` or bare. With
+/// `tone_last`, each word's tone key is its own group after its letters.
+fn spelling_groups(text: &str, method: InputMethod, tone_last: bool) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
+    let mut tone = None;
+    let flush = |groups: &mut Vec<Vec<String>>, tone: Option<char>| {
+        if let Some(key) = tone {
+            groups.push(vec![key.to_string()]);
+        }
+    };
+    for ch in text.chars() {
+        let mut keys = chars_from_composed(ch, method).to_owned();
+        if !ch.is_alphabetic() {
+            flush(&mut groups, tone.take());
+            groups.push(vec![keys]);
+            continue;
+        }
+        if tone_last {
+            if let Some((at, key)) = keys.char_indices().last() {
+                if at > 0 && is_tone_key(key, method) {
+                    flush(&mut groups, tone.replace(key));
+                    keys.truncate(at);
+                }
+            }
+        }
+        let mut spellings = vec![keys.clone()];
+        if method == InputMethod::Telex && !ch.is_ascii() {
+            if let Some(w) = keys.find(['w', 'W']) {
+                let mut bare = keys.clone();
+                bare.remove(w);
+                spellings.push(bare);
+                if w == 1 && keys.starts_with(['u', 'U']) {
+                    spellings.push(keys[1..].to_owned());
+                }
+            }
+        }
+        groups.push(spellings);
+    }
+    flush(&mut groups, tone);
+    groups
+}
+
+/// Append to `out` one spelling per group of `groups` that together form a
+/// subsequence of `typed[pos..]`; backtracks over spellings.
+fn pick_typed_spelling(
+    groups: &[Vec<String>],
+    typed: &[char],
+    pos: usize,
+    out: &mut String,
+) -> bool {
+    let Some((spellings, rest)) = groups.split_first() else {
+        return true;
+    };
+    for spelling in spellings {
+        let mut next = pos;
+        let len = out.len();
+        let matched = spelling.chars().all(|key| {
+            let found = typed[next..]
+                .iter()
+                .position(|t| t.eq_ignore_ascii_case(&key));
+            if let Some(at) = found {
+                out.push(typed[next + at]);
+                next += at + 1;
+                true
+            } else {
+                false
+            }
+        });
+        if matched && pick_typed_spelling(rest, typed, next, out) {
+            return true;
+        }
+        out.truncate(len);
+    }
+    false
+}
+
 fn is_subsequence(needle: &str, haystack: &str) -> bool {
     let mut rest = haystack.chars();
     needle
         .chars()
-        .all(|ch| rest.any(|typed| typed == ch))
+        .all(|ch| rest.any(|typed| typed.eq_ignore_ascii_case(&ch)))
 }
 
 fn is_tone_key(key: char, method: InputMethod) -> bool {
     match method {
-        InputMethod::Telex => matches!(key, 's' | 'f' | 'r' | 'x' | 'j'),
+        InputMethod::Telex => matches!(key.to_ascii_lowercase(), 's' | 'f' | 'r' | 'x' | 'j'),
         InputMethod::Vni => matches!(key, '1'..='5'),
         InputMethod::Viqr => matches!(key, '\'' | '`' | '?' | '~' | '.'),
     }
@@ -493,16 +599,47 @@ mod tests {
     }
 
     #[test]
-    fn eighth_letter_restores_the_typed_keys_until_word_break() {
+    fn eighth_letter_restores_the_word_as_shown_until_word_break() {
         // `đ` + consonants has no vowel, so vnkey never restores it itself;
         // only the length cap can.
         let mut eng = EngineState::new(InputMethod::Telex);
         assert_eq!(type_str(&mut eng, "ddbcdghk"), "đbcdghk");
         let mut eng = EngineState::new(InputMethod::Telex);
         assert_eq!(type_str(&mut eng, "ddbcdghkl"), "ddbcdghkl");
+        // `ddd` shows `dd`; the escaping third `d` is not put back.
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert_eq!(type_str(&mut eng, "dddbcdgh"), "ddbcdgh");
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert_eq!(type_str(&mut eng, "dddbcdghk"), "ddbcdghk");
         // Raw until the word ends (`dd` stays `dd`), then composing resumes.
         let mut eng = EngineState::new(InputMethod::Telex);
         assert_eq!(type_str(&mut eng, "ddbcdghkldd as"), "ddbcdghkldd á");
+    }
+
+    #[test]
+    fn restore_puts_back_the_word_as_shown_not_undone_keys() {
+        // A non-Vietnamese restore puts back keys reproducing the word as it
+        // was on screen, plus the new key: escape keys (`rr` shows `r`) and
+        // replaced tone keys (`jf` shows only the grave) are not resurrected.
+        for (keys, expected) in [
+            // Length cap: `correct` + `i` is longer than any Vietnamese word.
+            ("corrrection", "correction"),
+            ("errrors", "errors"),
+            // vnkey's own restore: the word stops being Vietnamese.
+            ("hanhjfp", "hanhfp"),
+            ("toosst", "toost"),
+            ("loorrd", "loord"),
+            // Capitalized and all-caps non-Vietnamese words keep typed case.
+            ("Osin", "Osin"),
+            ("OSIN", "OSIN"),
+            ("Doesnt", "Doesnt"),
+            // Nothing undone: every key typed comes back as before.
+            ("tuwjd", "tuwjd"),
+            ("doesnt", "doesnt"),
+        ] {
+            let mut eng = EngineState::new(InputMethod::Telex);
+            assert_eq!(type_str(&mut eng, keys), expected, "{keys}");
+        }
     }
 
     #[test]
@@ -515,10 +652,12 @@ mod tests {
         assert_eq!(type_str(&mut eng, &toggled), "hành");
         type_str(&mut eng, "k");
         assert_eq!(type_str(&mut eng, " hanhj"), " hạnh");
-        // Same for a long word typed live (crashed at key 131): vnkey
-        // restores it to the keys typed, and the rest passes through.
+        // Same for a long word typed live (crashed at key 131). `asas` shows
+        // `âs` (the second `s` undid the tone), so `a` restores the word as
+        // shown, `aas` + `a`; the rest passes through.
         let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, &"as".repeat(66)), "as".repeat(66));
+        let expected = format!("aasas{}", "as".repeat(63));
+        assert_eq!(type_str(&mut eng, &"as".repeat(66)), expected);
     }
 
     #[test]
@@ -544,7 +683,7 @@ mod tests {
         // Retroactive editing reseeds from the screen word after every edit.
         // A later restore must still show the tone key where it was typed:
         // mid-word in `doesnt` (`doén` is not `doens`), last in `hanhjp`.
-        for keys in ["doesnt", "hanhjp"] {
+        for keys in ["doesnt", "hanhjp", "Osin"] {
             let mut eng = EngineState::new(InputMethod::Telex);
             let mut screen = String::new();
             for ch in keys.chars() {

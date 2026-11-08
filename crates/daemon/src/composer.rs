@@ -3353,17 +3353,15 @@ mod tests {
                 _ => panic!("expected tone update"),
             }
 
-            // 'i' makes the syllable un-composable → raw restore. On the continuous
-            // engine the restore is the full keystroke history (seed "six" + typed
-            // "sxi" = "sixsxi"), not the reset-per-key path's cleaner "sixi". Both
-            // are just a literal echo of a nonsense sequence; the continuous form is
-            // what IBus/wayland now produce.
+            // 'i' makes the syllable un-composable → raw restore of the word as
+            // shown (`sĩ` is `six`) plus `i`, not the whole key history
+            // (seed "six" + typed "sxi" = "sixsxi").
             match c.feed_key('i') {
                 KeyDecision::Apply {
                     backspaces, commit, ..
                 } => {
                     assert_eq!(backspaces, 2);
-                    assert_eq!(commit, "sixsxi");
+                    assert_eq!(commit, "sixi");
                 }
                 _ => panic!("expected raw restore"),
             }

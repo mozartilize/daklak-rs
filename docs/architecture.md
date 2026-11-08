@@ -200,11 +200,18 @@ failure, or an abort inside a dependency.
 Wraps the vendored vnkey engine and exposes the linguistic operations the
 Composer needs. No I/O, no Wayland, no transport policy.
 
-A word longer than 7 letters on screen, the length of the longest Vietnamese
-word (`nghiêng`; corrections such as a changed tone do not count against it),
-is not Vietnamese: the wrapper restores it to the keys typed for it and passes
-keys through unchanged until vnkey's next word break. Seeding a word longer
-than the cap passes keys through the same way. Separately, one word may
+A word that stops being Vietnamese is restored to raw letters: either vnkey
+restores it, or a key makes it longer than 7 letters on screen, the length of
+the longest Vietnamese word (`nghiêng`; corrections such as a changed tone do
+not count against it). Either way the wrapper writes the raw letters of the
+word **as it was on screen**, plus the new key, then passes keys through
+unchanged until vnkey's next word break. Each glyph is spelled as the user
+could have typed it (`ư` as `uw`, `w` or `u`), choosing the first spelling
+that is a subsequence of the keys actually typed. So undone keys never come
+back: `corrrect` showed `correct`, and `i` gives `correcti`, not `corrrecti`;
+`hanhjf` showed `hành`, and `p` gives `hanhfp`. vnkey's own restore would put
+back its whole key history. Seeding a word longer than the cap passes keys
+through the same way. Separately, one word may
 feed vnkey at most 32 keys before its key history is compacted to keys that
 reproduce the word on screen: vnkey's non-Vietnamese restore copies the whole
 history into a fixed 128-entry buffer, so tone toggling on a short word would
