@@ -798,37 +798,15 @@ impl Composer {
             }
         } else {
             tracing::trace!("BS not consumed → forward");
-            let deleted_visible = self.edit.shadow_text().chars().last();
             self.edit.pop_forwarded_char();
-            if self.method() == BackspaceMethod::ForwardKey {
-                // ForwardKey clients (foot and other terminals that advertise
-                // surrounding-text but never reflect it, so the liveness
-                // watchdog downgrades ST→FK) never deliver a post-backspace
-                // frame to resync engine state. After a raw restore (e.g.
-                // `tự`+`d` → `tuwjd`), vnkey holds a NonVn buffer; forwarded
-                // backspaces only decrement it, so it stays non-composable and
-                // a re-typed tone key (`tu`+`w`) forwards raw instead of
-                // composing `ư`. Reseed the engine from the word the backspace
-                // just re-exposed. The render gate keeps English/foreign words
-                // raw — they fail the round-trip and leave the engine empty —
-                // and seeding from the popped shadow (not the pre-delete
-                // buffer) never resurrects the deleted glyph.
-                let word = self.current_shadow_word().to_owned();
-                self.engine.reset();
-                self.retroactive_context =
-                    !word.is_empty() && self.engine.feed_context_gated(&word);
-            } else if r.backspaces > 0 && matches!(deleted_visible, Some(ch) if !ch.is_ascii()) {
-                // SurroundingText: `processed=false` can still carry a positive
-                // backspace count — vnkey recognized an owned glyph was deleted
-                // but emitted no edit. When that glyph is a composed non-ASCII
-                // char (e.g. `u`+`w` -> `ư`), drop stale raw history before a
-                // later raw restore resurrects the deleted prefix (`sưi`+`t` ->
-                // `uswit`). Plain ASCII English backspaces keep their engine
-                // history so retyping `doesnt` stays raw. (The post-backspace
-                // surrounding frame re-seeds when the cursor context warrants.)
-                self.engine.reset();
-                self.retroactive_context = false;
-            }
+            // vnkey only shortened its key history, which can no longer match
+            // the screen: after a non-Vietnamese restore it stays
+            // non-composable (`hanhjph` minus `jph`, then `j`, stays raw), and
+            // a deleted composed glyph's keys resurface on a later restore
+            // (`sưi` + BS + `t` -> `uswit`). Rebuild it from the word the
+            // backspace re-exposed, the same on every tier.
+            let word = self.current_shadow_word().to_owned();
+            self.retroactive_context = self.engine.reseed_after_delete(&word);
             self.last_keystroke_at = Instant::now();
             KeyDecision::ForwardRaw
         }
@@ -2824,7 +2802,7 @@ mod tests {
             );
             let repair = repair.expect("actual insertion frame should finish the transaction");
             assert_eq!(repair.backspaces, 3);
-            assert_eq!(repair.commit, "eejtr");
+            assert_eq!(repair.commit, "eetjr");
             assert_eq!(c.prev_surrounding_for_trace(), (actual, actual_cursor));
         }
 
@@ -4185,101 +4163,83 @@ mod tests {
         }
     }
 
-    #[test]
-    fn retyping_english_after_plain_backspaces_stays_raw() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-
-        c.observe_surrounding_bytes("doesnt", ByteCursor(6), ByteCursor(6), true);
-
-        for expected in ["doesn", "does", "doe"] {
-            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
-            c.observe_surrounding_bytes(
-                expected,
-                ByteCursor(expected.len() as u32),
-                ByteCursor(expected.len() as u32),
-                false,
-            );
-        }
-
-        for ch in ['s', 'n', 't'] {
-            c.mark_action();
-            match c.feed_key(ch) {
-                KeyDecision::ForwardRaw => {}
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    panic!("expected raw {ch:?}, got edit bs={backspaces} commit={commit:?}");
-                }
-                KeyDecision::Consumed => panic!("expected raw {ch:?}, got consumed"),
-            }
-            let text = c.shadow_text().to_owned();
-            c.observe_surrounding_bytes(
-                &text,
-                ByteCursor(text.len() as u32),
-                ByteCursor(text.len() as u32),
-                false,
-            );
-        }
-
-        assert_eq!(c.shadow_text(), "doesnt");
-    }
-
-    #[test]
-    fn retyping_typed_english_after_plain_backspaces_stays_raw() {
-        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+    /// Type `keys` (`<` = Backspace) into a client that echoes every edit,
+    /// returning the visible text.
+    fn type_echoed(c: &mut Composer, start: &str, keys: &str) -> String {
         let mut sink = DeleteCaptureSink::default();
-
-        for ch in "doesnt".chars() {
+        let mut visible = start.to_owned();
+        for ch in keys.chars() {
             c.mark_action();
-            match c.feed_key(ch) {
-                KeyDecision::ForwardRaw => {}
+            let decision = if ch == '<' {
+                c.feed_backspace()
+            } else {
+                c.feed_key(ch)
+            };
+            match decision {
+                KeyDecision::ForwardRaw if ch == '<' => {
+                    visible.pop();
+                }
+                KeyDecision::ForwardRaw => visible.push(ch),
                 KeyDecision::Apply {
                     backspaces, commit, ..
                 } => {
+                    for _ in 0..backspaces {
+                        visible.pop();
+                    }
+                    visible.push_str(&commit);
                     c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
                 }
                 KeyDecision::Consumed => {}
             }
-            let text = c.shadow_text().to_owned();
-            c.observe_surrounding_bytes(
-                &text,
-                ByteCursor(text.len() as u32),
-                ByteCursor(text.len() as u32),
-                false,
-            );
+            let cursor = visible.len() as u32;
+            c.observe_surrounding_bytes(&visible, ByteCursor(cursor), ByteCursor(cursor), false);
         }
+        visible
+    }
 
-        for expected in ["doesn", "does", "doe"] {
-            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
-            c.observe_surrounding_bytes(
-                expected,
-                ByteCursor(expected.len() as u32),
-                ByteCursor(expected.len() as u32),
-                false,
-            );
+    #[test]
+    fn deleting_into_a_restored_word_composes_again() {
+        // `hanhj` + `p` is not Vietnamese and restores to raw `hanhjp`.
+        // Deleting `jph` leaves `hanh`, which must compose like fresh typing.
+        for method in [
+            BackspaceMethod::SurroundingText,
+            BackspaceMethod::ForwardKey,
+        ] {
+            let mut c = Composer::new(InputMethod::Telex, method, false);
+            let visible = type_echoed(&mut c, "", "hanhjph<<<j ");
+            assert_eq!(visible, "hạnh ", "{method:?}");
         }
+    }
 
-        for ch in ['s', 'n', 't'] {
-            c.mark_action();
-            match c.feed_key(ch) {
-                KeyDecision::ForwardRaw => {}
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    panic!("expected raw {ch:?}, got edit bs={backspaces} commit={commit:?}");
-                }
-                KeyDecision::Consumed => panic!("expected raw {ch:?}, got consumed"),
-            }
-            let text = c.shadow_text().to_owned();
-            c.observe_surrounding_bytes(
-                &text,
-                ByteCursor(text.len() as u32),
-                ByteCursor(text.len() as u32),
-                false,
-            );
-        }
+    #[test]
+    fn restore_after_reseed_puts_tone_key_last() {
+        // A field that starts with `h` seeds the engine from its text, and the
+        // tone edit reseeds it from the screen word `hạnh`. The restore on
+        // `p` must put the tone key last, as typed (`hanhjp`, not `hajnhp`).
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        c.observe_surrounding_bytes("h", ByteCursor(1), ByteCursor(1), true);
+        assert_eq!(type_echoed(&mut c, "h", "anhjp"), "hanhjp");
+    }
 
-        assert_eq!(c.shadow_text(), "doesnt");
+    #[test]
+    fn deleting_into_an_unreproducible_word_does_not_compose_a_fragment() {
+        // `doesn` (raw on screen) cannot be reproduced by Telex keys, so the
+        // keys typed after deleting into it stay raw instead of composing a
+        // new fragment mid-word (`does` + `as` must not become `doesá`).
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        assert_eq!(type_echoed(&mut c, "", "doesnt<<as"), "doesas");
+    }
+
+    #[test]
+    fn retyping_english_after_plain_backspaces_ends_as_typed() {
+        // Deleting back into `doesnt` and retyping it composes like typing it
+        // fresh (`doé`, `doén`), and the invalid `t` restores it to raw.
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        c.observe_surrounding_bytes("doesnt", ByteCursor(6), ByteCursor(6), true);
+        assert_eq!(type_echoed(&mut c, "doesnt", "<<<snt"), "doesnt");
+
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        assert_eq!(type_echoed(&mut c, "", "doesnt<<<snt"), "doesnt");
     }
 
     #[test]

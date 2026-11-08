@@ -221,10 +221,20 @@ impl EngineState {
         result
     }
 
-    /// Keys that rebuild composed `text`, for seeding this engine. Only the
-    /// last form of each glyph is kept, never undone tone toggles.
+    /// Keys that rebuild composed `text`, for seeding this engine. vnkey puts
+    /// these keys back verbatim if the word later stops being Vietnamese, so
+    /// they follow the order the user typed: the tone key last (`hạnh` ->
+    /// `hanhj`, so `hạnh` + `p` restores `hanhjp`, not `hajnhp`), unless the
+    /// keys typed for this word put it right after its vowel (`doén` typed
+    /// as `doesn` stays `doesn`, so `t` restores `doesnt`). Either way only
+    /// the last form is kept, never undone tone toggles.
     fn keys_for(&self, text: &str) -> String {
-        context_from_surrounding(text, self.method).0
+        let by_glyph = context_from_surrounding(text, self.method).0;
+        if is_subsequence(&by_glyph, &self.word_raw) {
+            by_glyph
+        } else {
+            tone_last_context(text, self.method)
+        }
     }
 
     /// Reset engine state. Call on focus loss, click, navigation key, or
@@ -296,6 +306,22 @@ impl EngineState {
             return false;
         }
         self.seed(&context, screen)
+    }
+
+    /// Rebuild composition state after the app deleted text that vnkey did
+    /// not edit itself. vnkey's history still holds the deleted keys, and
+    /// after a non-Vietnamese restore it stays non-composable, so it is
+    /// replaced by keys reproducing `word`, the word now before the cursor:
+    /// `hanhjph` minus `jph` composes `hạnh` on the next `j` like freshly
+    /// typed `hanh`. A word that cannot be reproduced is not composed: keys
+    /// pass through until the next word break.
+    pub fn reseed_after_delete(&mut self, word: &str) -> bool {
+        if self.feed_context_gated(word) {
+            return true;
+        }
+        self.reset();
+        self.raw_word = !word.is_empty();
+        false
     }
 
     fn seed(&mut self, keys: &str, screen: String) -> bool {
@@ -372,6 +398,45 @@ fn context_from_surrounding(text: &str, method: InputMethod) -> (String, Vec<u8>
 
 fn chars_from_composed(ch: char, method: InputMethod) -> &'static str {
     reversal::chars_from_composed(ch, method)
+}
+
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut rest = haystack.chars();
+    needle
+        .chars()
+        .all(|ch| rest.any(|typed| typed == ch))
+}
+
+fn is_tone_key(key: char, method: InputMethod) -> bool {
+    match method {
+        InputMethod::Telex => matches!(key, 's' | 'f' | 'r' | 'x' | 'j'),
+        InputMethod::Vni => matches!(key, '1'..='5'),
+        InputMethod::Viqr => matches!(key, '\'' | '`' | '?' | '~' | '.'),
+    }
+}
+
+/// Like `context_from_surrounding`, but each word's tone key comes after the
+/// word's letters instead of right after its vowel.
+fn tone_last_context(text: &str, method: InputMethod) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut tone = None;
+    for ch in text.chars() {
+        let keys = chars_from_composed(ch, method);
+        if !ch.is_alphabetic() {
+            result.extend(tone.take());
+            result.push_str(keys);
+            continue;
+        }
+        match keys.char_indices().last() {
+            Some((at, key)) if at > 0 && is_tone_key(key, method) => {
+                result.extend(tone.replace(key));
+                result.push_str(&keys[..at]);
+            }
+            _ => result.push_str(keys),
+        }
+    }
+    result.extend(tone);
+    result
 }
 
 #[cfg(test)]
@@ -464,6 +529,31 @@ mod tests {
         let r = eng.process_key('f');
         assert!(r.consumed);
         assert_eq!((r.backspaces, r.commit.as_str()), (1, "à"));
+    }
+
+    #[test]
+    fn seed_keys_put_the_tone_last() {
+        // Seeded words restore with the tone key last, as typed.
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert!(eng.feed_context_gated("hạnh"));
+        assert_eq!(type_str(&mut eng, "p"), "hanhjp");
+    }
+
+    #[test]
+    fn reseeding_keeps_the_typed_tone_position() {
+        // Retroactive editing reseeds from the screen word after every edit.
+        // A later restore must still show the tone key where it was typed:
+        // mid-word in `doesnt` (`doén` is not `doens`), last in `hanhjp`.
+        for keys in ["doesnt", "hanhjp"] {
+            let mut eng = EngineState::new(InputMethod::Telex);
+            let mut screen = String::new();
+            for ch in keys.chars() {
+                let r = eng.process_key(ch);
+                apply_to_word(&mut screen, &r, ch);
+                eng.feed_context_gated(&screen);
+            }
+            assert_eq!(screen, keys);
+        }
     }
 
     #[test]

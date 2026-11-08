@@ -115,13 +115,23 @@ survives across transforms — typing `tieengs`, the sắc tone lands on `iê`
 because the engine still holds the cluster. All three transports (wayland IM
 v1/v2, IBus, evdev) use this one path, `Composer::feed_key`.
 
-Retroactive editing — the cursor jumping into existing text — is the only time
-the engine is **(re)seeded**: the word before the cursor is read from the shadow
-and fed back via `feed_context_gated`. That seed is **render-gated**: the
-reconstruction (composed glyphs → telex keystrokes) is replayed and must
+The engine is **(re)seeded** from the word before the cursor in the shadow in
+two cases: retroactive editing (the cursor jumping into existing text), and a
+backspace that vnkey could not edit itself. After such a backspace vnkey has
+only shortened its key history, which no longer matches the screen; after a
+non-Vietnamese restore it would stay non-composable (`hanhjph`, three
+backspaces, then `j` must give `hạnh`). This reseed is the same on every
+backspace tier.
+
+A seed is fed via `feed_context_gated` and is **render-gated**: the
+reconstruction (composed glyphs → method keystrokes) is replayed and must
 round-trip back to the original glyphs before it is trusted. A word that does
 not round-trip (e.g. English `wor`, which telex-reads as a Vietnamese vowel) is
-left unseeded and typed fresh — never seeded as garbage.
+never seeded as garbage: on a cursor jump it is left unseeded and typed fresh;
+after a backspace, keys pass through unchanged until the next word break, so
+no new syllable starts mid-word. The reconstruction follows the order the user
+typed the word: the tone key last (`hạnh` → `hanhj`) unless it was typed right
+after the vowel (`doén` typed as `doesn`).
 
 ## Composer transitions
 
