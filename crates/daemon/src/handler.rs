@@ -898,7 +898,9 @@ mod tests {
     /// Shift-held passthrough chars on the v1/KWin ForwardKey path. KWin's
     /// notifyKeyboardKey doesn't refresh the client's modifier state for an
     /// IM-forwarded keycode, so a raw-forwarded shifted letter loses its case.
-    /// The transport commits the already-decoded char as text instead.
+    /// The transport retypes the already-decoded char as a keysym; with no
+    /// keysym route (as here: the test context has no live im-v1 context),
+    /// it commits the char as text.
     mod shifted_passthrough {
         use super::super::Daemon;
         use crate::composer::Composer;
@@ -941,7 +943,7 @@ mod tests {
         }
 
         #[test]
-        fn v1_level_shifted_passthrough_commits_decoded_char() {
+        fn v1_level_shifted_passthrough_without_key_channel_commits_text() {
             let mut d = daemon();
             // 'L' is a consonant the engine forwards (doesn't compose alone).
             // Its base level for key 38 is 'l', so 'L' is level-shifted → on v1
@@ -958,7 +960,7 @@ mod tests {
         }
 
         #[test]
-        fn v1_level_shifted_passthrough_is_not_recorded_as_raw_forward() {
+        fn v1_level_shifted_text_commit_is_not_recorded_as_raw_forward() {
             let mut d = daemon();
 
             let decision = key(&mut d, ImProtocol::ImV1, 'L');

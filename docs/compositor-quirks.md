@@ -16,6 +16,7 @@ not re-litigate or add ad-hoc workarounds beyond what's described here.
 - [Preserve literal-key history after a confirmed repair](#preserve-literal-key-history-after-a-confirmed-repair)
 - [Tail-drop after tone + space](#tail-drop-after-tone--space)
 - [KWin: keysym on a still-held key](#kwin-keysym-on-a-still-held-key)
+- [KWin: Shift-level passthrough is typed as a keysym](#kwin-shift-level-passthrough-is-typed-as-a-keysym)
 - [Preedit rendering of forwarded keys](#preedit-rendering-of-forwarded-keys)
 
 ## GNOME / IBus ForwardKeyEvent fails in Mutter
@@ -214,6 +215,41 @@ deleting fast and retyping leaves the user's own Backspace down when the next
 key's edit presses Backspace (`hanh` + `j` became `haạnh` in terminals). All
 three go through `HeldKeys::release_before_press`. Edits triggered by a
 surrounding-text frame use the same set.
+
+## KWin: Shift-level passthrough is typed as a keysym
+
+**Behavior:** KWin re-decodes a key forwarded by the input method at its base
+level (`InputMethod::key` → `notifyKeyboardKey` does not refresh the client's
+modifiers), so a forwarded Shift+`m` arrives as `m`. A passthrough char whose
+level differs from the key's base level (Shift, AltGr/Level3, CapsLock) must
+take another route.
+
+That route must stay on the keyboard channel. Sent as `commit_string`, the
+char can overtake keys forwarded just before it in GTK clients (GTK3 and GTK4),
+as in the Ghostty section above. GDK applies the commit as soon as it is read
+but the earlier keys go through its key queue, so the reordering shows when the
+client's main thread falls behind:
+
+- A Firefox trace showed `wl_keyboard.key` for Space arriving before
+  `commit_string("M")`, yet Firefox's IME handler committed `M` (with no key
+  event in progress) before its key handler saw the Space: `cho M` became
+  `choM `. It appeared only on the first line typed into a freshly opened
+  window, while Firefox was still busy starting up.
+- A plain GTK3 or GTK4 entry never reordered while idle. With its main loop
+  blocked 40 ms in every 50 ms, every fast line of capitalised words did
+  (`cho MotH aiB a ...`); lowercase-only lines stayed correct, and so did
+  every line once the capitals went through the keyboard channel.
+
+Reproduce with `tools/typing-race-e2e/run.py -t gtk3 --busy` (or `-t gtk`), and
+capture Firefox's side with `--native-trace DIR` (see the harness README).
+
+**Decision:** the transport types the decoded char as an im-v1 keysym
+(`AdapterCtx::type_char_on_key_channel`); KWin's `forwardKeySym` presses the
+key with the modifiers that level needs and then restores the real modifier
+state. The physical key is consumed, so daklak arms its own repeat as for any
+applied key. The composer keeps the char as a forwarded raw key, including its
+pending confirmation. `commit_string` remains only as the fallback when no
+keysym exists for the char.
 
 ## Preedit rendering of forwarded keys
 

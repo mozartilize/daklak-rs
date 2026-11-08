@@ -240,6 +240,16 @@ impl Default for AdapterState {
 }
 
 impl AdapterState {
+    /// A consumed physical key never reaches the focused client, which
+    /// therefore cannot self-repeat it. For positive repeat_info rates the
+    /// keyboard client (daklak) must synthesize repeats itself.
+    pub(crate) fn arm_consumed_key_repeat(&mut self, key: u32, time: u32) {
+        let repeatable = self.xkb.as_ref().is_none_or(|xkb| xkb.key_repeats(key));
+        if repeatable {
+            self.client_repeat.arm(key, time, Instant::now());
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             seat: None,

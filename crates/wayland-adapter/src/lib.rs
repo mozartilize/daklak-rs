@@ -39,7 +39,7 @@ mod state;
 
 use std::os::fd::AsFd;
 use std::os::unix::io::AsRawFd;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::unix::AsyncFd;
@@ -287,6 +287,35 @@ impl<'a> AdapterCtx<'a> {
         }
     }
 
+    /// Type `ch`, decoded from the physical `key`, on the keyboard channel
+    /// (im-v1 keysym) instead of forwarding the keycode. Returns `false` if
+    /// nothing was sent (no key channel or no keysym for `ch`); the caller
+    /// then needs another route.
+    ///
+    /// Used where a forwarded keycode would lose its modifier level (KWin
+    /// re-decodes IM-forwarded keys at base level). Unlike `commit_string`,
+    /// the keysym reaches the client as a key event, in order with the keys
+    /// forwarded around it. The physical key is consumed, so it is repeated
+    /// like an applied key.
+    pub fn type_char_on_key_channel(
+        &mut self,
+        time: u32,
+        key: u32,
+        ch: char,
+        commit_string_functional: bool,
+    ) -> bool {
+        let serial = self.state.serial;
+        let raw_mods = self.state.raw_mods;
+        let mut typed = false;
+        self.with_sink(raw_mods, commit_string_functional, |sink| {
+            typed = sink.commit_key_channel_text(serial, time, &ch.to_string());
+        });
+        if typed && !self.state.forwarding_repeat {
+            self.state.arm_consumed_key_repeat(key, time);
+        }
+        typed
+    }
+
     /// Construct an AdapterSink bound to live adapter proxies + the supplied
     /// raw_mods snapshot, then run the closure with `&mut sink`. The closure
     /// typically invokes `strategy.apply` on the resulting sink. The sink
@@ -423,17 +452,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 backspaces,
                 commit,
             } => {
-                // The physical key was consumed, so the focused client has no
-                // held key to self-repeat. For positive repeat_info rates the
-                // keyboard client (daklak) must synthesize repeats itself.
-                let repeatable = self
-                    .state
-                    .xkb
-                    .as_ref()
-                    .is_none_or(|xkb| xkb.key_repeats(key));
-                if repeatable {
-                    self.state.client_repeat.arm(key, time, Instant::now());
-                }
+                self.state.arm_consumed_key_repeat(key, time);
                 let raw_mods = self.state.raw_mods;
                 {
                     let mut ctx = AdapterCtx {
@@ -1020,7 +1039,7 @@ mod tests {
         };
         app.state.xkb = Some(viet_ime_keymap::xkb::XkbState::us_for_test());
         app.state.synthetic_mods_pending = 1;
-        app.state.synthetic_mods_emitted_at = Some(Instant::now());
+        app.state.synthetic_mods_emitted_at = Some(std::time::Instant::now());
 
         app.handle_modifiers(0x01, 0, 0, 0);
 

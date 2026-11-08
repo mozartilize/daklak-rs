@@ -200,10 +200,15 @@ word started, still raw (`D`, `d` typed right after Ctrl+Backspace show `Dd`),
 those letters are retyped as fresh keys and the word is repaired to the result
 (`Đ`). A word that also holds earlier text is left as it is.
 
-On KWin im-v1 a Shift-level letter that daklak passes through is sent as
-committed text, because a forwarded key loses its Shift level. The commit lands
-at the client's caret just like the raw key, so it keeps the key's pending
-confirmation.
+On KWin im-v1 a forwarded key loses its Shift level, so a Shift-level char that
+daklak passes through is typed as a keysym instead (KWin presses it with the
+modifiers it needs). A keysym is a key event, ordered with the raw keys
+forwarded around it; a text-input commit is not, and a busy GTK3/GTK4 client
+(Firefox while starting up) can apply a committed `M` before the space forwarded
+just before it. The
+char lands like the raw key, so the composer keeps its forwarded-key
+bookkeeping. Only when no keysym route exists is the char committed as text;
+that commit also keeps the key's pending confirmation.
 
 The two-second idle policy is tier-specific. `ForwardKey` resets the engine and
 clears its unverifiable shadow because it has no surrounding frames to report a
