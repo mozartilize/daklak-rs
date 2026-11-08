@@ -321,6 +321,18 @@ impl EngineState {
         self.screen_word = None;
     }
 
+    /// Start the word over as if `keys` had just been typed, and return the
+    /// word they show.
+    pub fn retype(&mut self, keys: &str) -> String {
+        self.reset();
+        let mut word = String::new();
+        for ch in keys.chars() {
+            let result = self.process_key(ch);
+            apply_to_word(&mut word, &result, ch);
+        }
+        word
+    }
+
     /// Change the active input method at runtime. Resets composition state
     /// (the new method has different keystroke semantics).
     pub fn set_input_method(&mut self, method: InputMethod) {

@@ -175,6 +175,36 @@ Firefox, which reports its caret ahead of its text, may not send in time. `Pendi
 raw key, repairability, and any speculative engine edit together, so those facts
 cannot drift into invalid flag combinations.
 
+Within 150 ms of a key, frames are echoes of daklak's own edits and are
+skipped unless they match the shadow, or show exactly one letter inserted since
+the recorded baseline (the user's own raw key). That baseline lags while echoes
+are skipped, so a half-applied echo can also look like one inserted letter:
+Firefox applying `gôn` → `goonh` reports `g`, then `goo`, against a baseline of
+`go`. A late echo of a raw key that daklak has since edited looks the same
+(`ngu` arriving after `nguw` showed `ngư`). A frame whose text before the caret
+is a strict prefix of the shadow, or one of the last few shadows daklak replaced
+since it last trusted a frame, is therefore not counted as a typed letter: it
+shows a state daklak has already moved past.
+
+A one-letter insertion also cannot echo the user's key if no key was typed
+since composition was last reset (activation, a shortcut, navigation). After
+Ctrl+Backspace, a lagging Firefox can still report the deleted word growing
+letter by letter (`vô s`, `vô sa`). Such a frame is treated like any external
+change: it reseeds frame-derived context, so the next key waits for a frame
+that proves where it landed instead of composing against the deleted word.
+
+Keys typed faster than the client reports them overlap: only the first raw key
+of a run is repairable from the frame that confirms it. When that frame shows
+the word before the caret consisting of exactly the letters typed since the
+word started, still raw (`D`, `d` typed right after Ctrl+Backspace show `Dd`),
+those letters are retyped as fresh keys and the word is repaired to the result
+(`Đ`). A word that also holds earlier text is left as it is.
+
+On KWin im-v1 a Shift-level letter that daklak passes through is sent as
+committed text, because a forwarded key loses its Shift level. The commit lands
+at the client's caret just like the raw key, so it keeps the key's pending
+confirmation.
+
 The two-second idle policy is tier-specific. `ForwardKey` resets the engine and
 clears its unverifiable shadow because it has no surrounding frames to report a
 cursor move. `SurroundingText` retains continuous engine state: a click during

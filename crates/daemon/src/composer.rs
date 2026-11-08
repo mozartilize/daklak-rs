@@ -249,6 +249,21 @@ pub struct Composer {
     /// repairability, and speculative engine edit in one enum prevents invalid
     /// combinations of independent flags.
     confirmation: ConfirmationState,
+
+    /// The letters typed since the current word started, when known (unknown
+    /// after a backspace). When a frame shows exactly these letters still raw
+    /// as the word before the caret, they can be retyped as fresh keys.
+    typed_word: Option<String>,
+
+    /// Whether a key was typed since composition was last reset (activation,
+    /// shortcut, navigation). Until then, a frame with one more letter cannot
+    /// be the echo of the user's key.
+    keys_since_reset: bool,
+
+    /// The last few shadows daklak replaced since a frame was last trusted.
+    /// A late echo can report one of them (`ngu` after `nguw` showed `ngư`):
+    /// it looks like a typed letter but describes a state already left.
+    passed_shadows: Vec<String>,
     edit: EditModel,
 }
 
@@ -486,6 +501,9 @@ impl Composer {
             bracket_shortcuts,
             confirm_retroactive_edits: false,
             confirmation: ConfirmationState::Live,
+            typed_word: Some(String::new()),
+            keys_since_reset: false,
+            passed_shadows: Vec::new(),
         }
     }
 
@@ -636,6 +654,18 @@ impl Composer {
         self.last_input_char = None;
         self.retroactive_context = false;
         self.confirmation = ConfirmationState::AwaitingFrame;
+        self.typed_word = Some(String::new());
+        self.keys_since_reset = false;
+        self.passed_shadows.clear();
+    }
+
+    /// Note the shadow before daklak changes it (see `passed_shadows`).
+    fn remember_shadow(&mut self) {
+        const KEEP: usize = 8;
+        if self.passed_shadows.len() == KEEP {
+            self.passed_shadows.remove(0);
+        }
+        self.passed_shadows.push(self.edit.shadow_text().to_owned());
     }
 
     /// Re-seed the engine after a retroactive edit was applied. Must mirror
@@ -722,6 +752,14 @@ impl Composer {
         }
 
         self.last_input_char = Some(ch);
+        self.keys_since_reset = true;
+        if ch.is_alphabetic() {
+            if let Some(word) = self.typed_word.as_mut() {
+                word.push(ch);
+            }
+        } else {
+            self.typed_word = Some(String::new());
+        }
         let result = self.engine.process_key(ch);
         self.last_keystroke_at = Instant::now();
         self.trace_process_key(ch, &result);
@@ -745,6 +783,7 @@ impl Composer {
                 }
             }
             KeyFinishPlan::Forward { pending } => {
+                self.remember_shadow();
                 self.edit.push_forwarded_char(ch);
                 self.confirmation = pending
                     .map(ConfirmationState::PendingRaw)
@@ -770,20 +809,23 @@ impl Composer {
         current_word_before_cursor(shadow, shadow.len() as u32)
     }
 
-    pub fn unrecord_forwarded_char(&mut self) {
+    /// The transport sends the char `feed_key` just forwarded as committed
+    /// text instead of a raw key (KWin im-v1 loses a forwarded key's Shift
+    /// level). Drop it from the shadow: the commit records it again.
+    ///
+    /// A commit lands at the client's caret exactly as the raw key would, so
+    /// a pending raw-key confirmation stays open and the client's next frame
+    /// still proves where the char landed. After Ctrl+Backspace, Firefox can
+    /// report the deleted word before the deletion; without the open
+    /// confirmation the next frame (`D`, not `ĐànhD`) was taken for an echo
+    /// and the rest of the word composed against the deleted one.
+    pub fn take_forwarded_char_for_commit(&mut self) {
         self.edit.pop_forwarded_char();
-        let pending = std::mem::replace(&mut self.confirmation, ConfirmationState::Live);
-        if matches!(
-            pending,
-            ConfirmationState::PendingRaw(PendingRaw { edit: Some(_), .. })
-        ) {
-            // Engine held speculative post-key state the app never applied.
-            self.engine.reset();
-            self.retroactive_context = false;
-        }
     }
 
     pub fn feed_backspace(&mut self) -> KeyDecision {
+        self.typed_word = None;
+        self.keys_since_reset = true;
         let r = self.engine.process_backspace();
         tracing::debug!(
             consumed = r.consumed,
@@ -801,6 +843,7 @@ impl Composer {
             }
         } else {
             tracing::trace!("BS not consumed → forward");
+            self.remember_shadow();
             self.edit.pop_forwarded_char();
             // vnkey only shortened its key history, which can no longer match
             // the screen: after a non-Vietnamese restore it stays
@@ -856,6 +899,7 @@ impl Composer {
         sink: &mut S,
         preserve_engine: bool,
     ) {
+        self.remember_shadow();
         let before = self.edit.shadow_text().to_owned();
         // The client converts the byte length of a `delete_surrounding_text`
         // to characters against the text it last reported, not its live
@@ -1022,8 +1066,26 @@ impl Composer {
             );
         }
         let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
-        let one_char_typed = self.edit.one_char_insertion_since_prev(text, cursor);
         let before_cursor = text_before_cursor(text, cursor);
+        // A frame one letter longer than the recorded baseline usually echoes
+        // the user's own raw key. But the baseline lags while echoes are
+        // skipped, so a half-applied echo of daklak's own edit can look the
+        // same (`go` -> `goo` while `gôn` becomes `goonh`), and so can a late
+        // echo of a raw key daklak has since edited (`ngu` after `nguw` showed
+        // `ngư`). Such a frame is a strict prefix of the shadow or a shadow
+        // daklak has replaced: a state already passed.
+        let shadow = self.edit.shadow_text();
+        let behind_shadow = recent_action
+            && before_cursor != shadow
+            && (shadow.starts_with(before_cursor)
+                || self.passed_shadows.iter().any(|s| s == before_cursor));
+        // With no key typed since a shortcut or navigation, it cannot echo
+        // one either: Firefox, lagging, reports the letters of a word that
+        // Ctrl+Backspace has already deleted. Such a frame reseeds as
+        // frame-derived context, so the next key waits for confirmation.
+        let one_char_typed = self.keys_since_reset
+            && !behind_shadow
+            && self.edit.one_char_insertion_since_prev(text, cursor);
         self.revalidate_live_confirmation(text, cursor, anchor);
 
         // A raw key awaiting confirmation is stronger evidence than the 150ms
@@ -1062,6 +1124,7 @@ impl Composer {
         }
 
         let deletion_already_applied = shadow_confirmed;
+        self.passed_shadows.clear();
         self.edit.on_surrounding_text(text, cursor, anchor);
         // A trusted frame supplies destination context; a frame-derived seed
         // below carries any remaining uncertainty in `confirmation`.
@@ -1173,6 +1236,24 @@ impl Composer {
             self.edit.record_surrounding(text, cursor, anchor);
             self.last_input_char = Some(ch);
             self.engine.reset();
+            if insertion_proven && self.typed_word.as_deref() == Some(actual_word.as_str()) {
+                // The word on screen is exactly the letters the user typed,
+                // left raw because they overlapped before any frame confirmed
+                // them (`D`, `d` typed fast after Ctrl+Backspace show `Dd`).
+                // Retype them as fresh keys and repair the word to match.
+                let word = self.engine.retype(&actual_word);
+                self.retroactive_context = true;
+                self.confirmation = ConfirmationState::LiveConfirmed;
+                let common = actual_word
+                    .chars()
+                    .zip(word.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                return (word != actual_word).then(|| RetroEdit {
+                    backspaces: actual_word.chars().count() - common,
+                    commit: word.chars().skip(common).collect(),
+                });
+            }
             self.retroactive_context =
                 !actual_word.is_empty() && self.engine.feed_context_gated(&actual_word);
             // When the frame PROVED this pending key landed at the reported
@@ -1752,6 +1833,133 @@ mod tests {
             client.report_stale(text, cursor);
         }
 
+        /// The client reports `text` with a collapsed caret at its end,
+        /// passed through the transport's duplicate gate. No repair expected.
+        fn report(c: &mut Composer, text: &str) {
+            let n = text.len() as u32;
+            c.note_client_surrounding(text, n);
+            if !c.should_skip_surrounding_frame(text, n, n, false, false) {
+                assert!(c
+                    .observe_surrounding_bytes(text, ByteCursor(n), ByteCursor(n), false)
+                    .is_none());
+            }
+        }
+
+        #[test]
+        fn late_echo_of_a_raw_key_does_not_undo_the_next_edit() {
+            // `nguw`: Firefox reports the raw `u` (`ngu`) only after daklak
+            // has turned it into `ư`. That report is a state daklak already
+            // left, not a new letter.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut sink = DeleteCaptureSink::default();
+            assert_eq!(type_echoed(&mut c, "", "ng"), "ng");
+            for ch in "uw".chars() {
+                c.mark_action();
+                if let KeyDecision::Apply {
+                    backspaces, commit, ..
+                } = c.feed_key(ch)
+                {
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+            }
+            report(&mut c, "ngu");
+            assert_eq!(c.shadow_text(), "ngư");
+            report(&mut c, "ngư");
+            assert_eq!(type_echoed(&mut c, "ngư", "owu<if "), "người ");
+        }
+
+        #[test]
+        fn late_reports_of_a_deleted_word_do_not_seed_the_next_one() {
+            // `vô sanx`, Ctrl+Backspace, `sanr`: expected `vô sản`. Firefox
+            // reports nothing while `sanx` is typed, then, after the deletion,
+            // the word's old states `vô s` and `vô sa`.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut sink = DeleteCaptureSink::default();
+            assert_eq!(type_echoed(&mut c, "", "voo "), "vô ");
+            for ch in "sanx".chars() {
+                c.mark_action();
+                if let KeyDecision::Apply {
+                    backspaces, commit, ..
+                } = c.feed_key(ch)
+                {
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+            }
+            c.reset_composition_preserving_surrounding();
+            c.defer_action();
+            report(&mut c, "vô s");
+            report(&mut c, "vô sa");
+            assert_eq!(type_echoed(&mut c, "vô ", "sanr "), "vô sản ");
+        }
+
+        #[test]
+        fn letters_typed_before_any_frame_compose_once_confirmed() {
+            // Ctrl+Backspace, then `D` and `d` typed before Firefox reports
+            // either: both go raw, and the second cannot be repaired from
+            // the first's frame. The frame showing `Dd` proves the word is
+            // exactly the typed letters, so they are retyped: `Đ`.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut sink = DeleteCaptureSink::default();
+            assert_eq!(type_echoed(&mut c, "", "Ddanhf"), "Đành");
+            c.reset_composition_preserving_surrounding();
+            c.defer_action();
+
+            c.mark_action();
+            assert!(matches!(c.feed_key('D'), KeyDecision::ForwardRaw));
+            c.take_forwarded_char_for_commit();
+            c.apply_to_sink(0, "D", 0, 0, &mut sink);
+            c.mark_action();
+            assert!(matches!(c.feed_key('d'), KeyDecision::ForwardRaw));
+            report(&mut c, "D");
+            let n = "Dd".len() as u32;
+            c.note_client_surrounding("Dd", n);
+            let repair = c.observe_surrounding_bytes("Dd", ByteCursor(n), ByteCursor(n), false);
+            let Some(super::super::RetroEdit { backspaces, commit }) = repair else {
+                panic!("the frame showing `Dd` must repair it");
+            };
+            assert_eq!((backspaces, commit.as_str()), (2, "Đ"));
+            c.apply_confirmed_repair_to_sink(backspaces, &commit, 0, 0, &mut sink);
+            assert_eq!(type_echoed(&mut c, "Đ", "anhs"), "Đánh");
+        }
+
+        #[test]
+        fn shifted_letter_committed_after_word_delete_follows_the_client() {
+            // `Ddanhf`, Ctrl+Backspace, `Ddanhs`: expected `Đánh`.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut sink = DeleteCaptureSink::default();
+            assert_eq!(type_echoed(&mut c, "", "Ddanh"), "Đanh");
+            c.mark_action();
+            match c.feed_key('f') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink),
+                _ => panic!("f must compose"),
+            }
+            // Firefox reports the edit half-applied, then nothing until:
+            report(&mut c, "Đ");
+
+            // Ctrl+Backspace goes to the app; the transport ends composition.
+            c.reset_composition_preserving_surrounding();
+            c.defer_action();
+            // Firefox finishes reporting `f` before applying the deletion. It
+            // is not a repeat, so daklak reseeds from the deleted word.
+            report(&mut c, "Đành");
+
+            // im-v1 sends Shift+D as committed text, not a raw key.
+            c.mark_action();
+            assert!(matches!(c.feed_key('D'), KeyDecision::ForwardRaw));
+            c.take_forwarded_char_for_commit();
+            c.apply_to_sink(0, "D", 0, 0, &mut sink);
+            // The next frame shows where it landed: the word is gone.
+            report(&mut c, "D");
+            assert_eq!(c.shadow_text(), "D");
+            assert_eq!(type_echoed(&mut c, "D", "danhs"), "Đánh");
+        }
+
         #[test]
         fn ww_after_confirmed_repair_survives_caret_first_report() {
             // `sord`, caret moved after `s`, then `ww`: expected `sword`.
@@ -1857,6 +2065,49 @@ mod tests {
             client.deliver_report(&mut c, false);
             sord_then_fast_lefts_and_w(&mut c, &mut client);
             assert_eq!(client.text, "sưord");
+        }
+
+        #[test]
+        fn partial_echo_of_own_edit_does_not_replace_the_shadow() {
+            // Firefox applying the restore `gôn` + `h` -> `goonh` reports the
+            // half-done `g`, then `goo`. The recorded report is the older
+            // `go`, so `goo` looks like one typed letter; trusting it would
+            // drop `nh` from the shadow, and Backspace + `g` would then miss
+            // the word (`goong` instead of `gông`).
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut sink = DeleteCaptureSink::default();
+            let mut press = |c: &mut Composer, ch: char| {
+                c.mark_action();
+                if let KeyDecision::Apply {
+                    backspaces, commit, ..
+                } = c.feed_key(ch)
+                {
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+            };
+            for (ch, echo) in [('g', "g"), ('o', "go")] {
+                press(&mut c, ch);
+                report(&mut c, echo);
+            }
+            for ch in "onh".chars() {
+                press(&mut c, ch);
+            }
+            assert_eq!(c.shadow_text(), "goonh");
+            for echo in ["gôn", "g", "goo", "goonh"] {
+                report(&mut c, echo);
+            }
+            assert_eq!(c.shadow_text(), "goonh");
+
+            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+            report(&mut c, "goon");
+            c.mark_action();
+            match c.feed_key('g') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => assert_eq!((backspaces, commit.as_str()), (3, "ông")),
+                _ => panic!("g after the deleted slip must compose gông"),
+            }
         }
 
         #[test]
@@ -2688,10 +2939,11 @@ mod tests {
         fn telex_bracket_shortcut_composes_live_when_frame_word_fails_gate() {
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, true);
             c.set_surrounding_confirmation(true);
-            // Frame word "t" fails the round-trip seed gate, so no frame
-            // context exists; '[' is live composition and must apply
-            // immediately (ơ) with no confirm-deferral flash.
-            c.observe_surrounding_bytes("t", ByteCursor(1), ByteCursor(1), false);
+            // Frame word "wor" fails the round-trip seed gate (Telex shows
+            // it as `ửo`), so no frame context exists; '[' is live
+            // composition and must apply immediately (ơ) with no
+            // confirm-deferral flash.
+            c.observe_surrounding_bytes("wor", ByteCursor(3), ByteCursor(3), false);
 
             c.mark_action();
             match c.feed_key('[') {
@@ -4248,12 +4500,20 @@ mod tests {
             // ForwardKey clients (terminals) send no surrounding text.
             if c.method() == BackspaceMethod::SurroundingText {
                 let cursor = visible.len() as u32;
-                c.observe_surrounding_bytes(
+                let repair = c.observe_surrounding_bytes(
                     &visible,
                     ByteCursor(cursor),
                     ByteCursor(cursor),
                     false,
                 );
+                // A frame confirming a deferred raw key may repair it.
+                if let Some(super::RetroEdit { backspaces, commit }) = repair {
+                    for _ in 0..backspaces {
+                        visible.pop();
+                    }
+                    visible.push_str(&commit);
+                    c.apply_confirmed_repair_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
             }
         }
         visible

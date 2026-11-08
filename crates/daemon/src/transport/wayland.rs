@@ -292,7 +292,7 @@ impl AdapterHandler for Daemon {
                 .composer
                 .as_mut()
                 .map(|w| {
-                    w.unrecord_forwarded_char();
+                    w.take_forwarded_char_for_commit();
                     w.method()
                 })
                 .unwrap_or(BackspaceMethod::ForwardKey);
