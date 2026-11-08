@@ -8,8 +8,8 @@ const KEY_BACKSPACE: u32 = 14;
 ///
 /// Pass both byte and char counts: per the v2/v3 spec
 /// (zwp-input-method-unstable-v2.xml:262-281) `before_length` is bytes.
-/// Firefox stale-echo handling can request char-count fallback for one
-/// correction; otherwise sinks use the spec-compliant byte counts.
+/// Callers may explicitly request character-count compatibility; normal
+/// composer corrections use the spec-compliant byte counts.
 ///
 /// When the compositor reports a selection (anchor ≠ cursor), Chromium may
 /// reject `delete_surrounding_text` because the client's selection state

@@ -79,8 +79,8 @@ pub trait OutputSink {
     /// Delete text around the cursor. `before_bytes`/`after_bytes` are
     /// UTF-8 byte counts (what wlroots v2/v3 IM and all spec-compliant
     /// v3 clients want); `before_chars`/`after_chars` are Unicode scalar
-    /// counts for the rare Firefox stale-echo fallback. The sink picks the
-    /// unit requested by the current correction.
+    /// counts for callers explicitly requesting character-count compatibility.
+    /// The sink receives the unit requested by the current correction.
     fn delete_surrounding_text(
         &mut self,
         before_bytes: u32,
@@ -174,8 +174,8 @@ impl Strategy {
 
     /// Like `apply`, but uses ForwardKey (virtual keyboard Backspace keys)
     /// regardless of the current method. Does NOT change `self.method`.
-    /// Used by the Firefox contenteditable quirk to bypass
-    /// `delete_surrounding_text` which Firefox handles unreliably.
+    /// Used when the client's cached byte-delete view disagrees with the live
+    /// shadow, or a client-specific fallback requires key deletion.
     pub fn apply_forward_key(
         &mut self,
         backspaces: usize,
@@ -319,9 +319,9 @@ mod tests {
 
     #[test]
     fn tier1_multibyte_delete_can_emit_char_count_primary_length() {
-        // Firefox's stale ContentCacheInParent can interpret the primary
-        // delete length against stale ASCII text. Char mode emits 1 for the
-        // visible scalar even though the shadow char is 2 bytes.
+        // Explicit compatibility API: the primary length is one scalar even
+        // though the glyph spans two UTF-8 bytes. This is not the byte-length
+        // contract used by the composer's cached-report client tests.
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("ư");
         let mut sink = MockSink::default();

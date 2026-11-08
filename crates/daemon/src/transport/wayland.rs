@@ -53,7 +53,7 @@ impl AdapterHandler for Daemon {
             // client is obligated to apply commit_string). It is driven down
             // ONLY by the runtime ST-liveness probe at the ST→FK downgrade —
             // not by a purpose/capability guess, because text-input-v3 exposes
-            // no per-feature bit and the breakage is per-widget. See plan91.
+            // no per-feature bit and the breakage is per-widget.
             c.set_modifiers(self.router.modifiers);
             self.router.composer = Some(c);
         } else if deactivate {
@@ -81,6 +81,9 @@ impl AdapterHandler for Daemon {
                 prev_cursor,
                 "on_done_frame surrounding_text"
             );
+            // Every report counts, including duplicates skipped below: the
+            // client measures the next byte delete against its latest one.
+            w.note_client_surrounding(text, *cursor);
 
             // Runtime tier downgrade ST → FK. An app that advertises
             // surrounding-text support but never reflects our commits (Google
@@ -111,8 +114,8 @@ impl AdapterHandler for Daemon {
             // Duplicate-frame guard. KWin re-emits the same SurroundingText
             // 2-3 times per keystroke. We've already processed this state —
             // running the reseed logic again resets and burns engine context.
-            // Let Composer keep duplicate frames that are still meaningful for
-            // pending correction-echo checks.
+            // The client byte-delete view was recorded above even if the
+            // duplicate is skipped here; revalidate confirmation in the gate.
             if w.should_skip_surrounding_frame(text, *cursor, *anchor, activate, deactivate) {
                 return;
             }

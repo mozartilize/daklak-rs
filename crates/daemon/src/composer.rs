@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, KeyDecision, ModifierState, Strategy};
 use viet_ime_engine::{EngineState, InputMethod, ProcessResult};
 
-use crate::quirks::firefox::FirefoxContenteditableQuirk;
 #[cfg(feature = "ibus")]
 use crate::quirks::ibus::IbusSurroundingQuirk;
 
@@ -93,18 +92,7 @@ impl EditModel {
     /// unchanged prefix+suffix proves this key, rather than an existing equal
     /// character, produced the frame.
     fn confirms_inserted_char(&self, text: &str, cursor: u32, ch: char) -> bool {
-        let cursor = (cursor as usize).min(text.len());
-        if !text.is_char_boundary(cursor) {
-            return false;
-        }
-        let before = &text[..cursor];
-        let Some((start, actual)) = before.char_indices().next_back() else {
-            return false;
-        };
-        actual == ch
-            && self.prev_text.len() + ch.len_utf8() == text.len()
-            && self.prev_text.as_bytes().get(..start) == text.as_bytes().get(..start)
-            && self.prev_text.as_bytes().get(start..) == text.as_bytes().get(cursor..)
+        char_inserted_before_cursor(&self.prev_text, text, cursor, ch)
     }
 
     fn is_duplicate_frame(&self, text: &str, cursor: u32, anchor: u32) -> bool {
@@ -237,8 +225,16 @@ pub struct Composer {
     /// leaks on a later raw restore.
     retroactive_context: bool,
 
-    /// Firefox contenteditable stale-echo workaround state.
-    firefox: FirefoxContenteditableQuirk,
+    /// The client's most recent surrounding-text report and the one before
+    /// it, as `(text, cursor)` (Wayland only). Every report counts, including
+    /// duplicates and echoes the reseed gate skips, so unlike the recorded
+    /// diff baseline these never go stale:
+    /// - text-input-v3 clients convert `delete_surrounding_text` byte lengths
+    ///   to characters against the latest report (`client_byte_delete_agrees`);
+    /// - consecutive reports prove where a raw key landed, and whether a frame
+    ///   really repeats the previous one.
+    client_report: Option<(String, u32)>,
+    previous_client_report: Option<(String, u32)>,
 
     /// Whether `[`/`]`/`{`/`}` Telex shortcuts for ơ/ư/Ơ/Ư are enabled.
     /// Stored so `set_input_method` can recreate the engine with it.
@@ -485,7 +481,8 @@ impl Composer {
             #[cfg(feature = "ibus")]
             ibus: IbusSurroundingQuirk::new(),
             retroactive_context: false,
-            firefox: FirefoxContenteditableQuirk::new(),
+            client_report: None,
+            previous_client_report: None,
             bracket_shortcuts,
             confirm_retroactive_edits: false,
             confirmation: ConfirmationState::Live,
@@ -639,8 +636,6 @@ impl Composer {
         self.last_input_char = None;
         self.retroactive_context = false;
         self.confirmation = ConfirmationState::AwaitingFrame;
-        self.firefox.clear();
-        self.firefox.reset_forward_sticky();
     }
 
     /// Re-seed the engine after a retroactive edit was applied. Must mirror
@@ -657,7 +652,9 @@ impl Composer {
 
         let shadow = self.edit.shadow_text();
         let word = current_word_before_cursor(shadow, shadow.len() as u32);
-        self.engine.reset();
+        // A successful seed replaces the engine itself. If the visible word
+        // cannot round-trip (e.g. literal `anw` after `anww`), keep the live
+        // engine's escape history instead of resetting it before rejection.
         self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(word);
     }
 
@@ -666,8 +663,11 @@ impl Composer {
     ///
     /// ForwardKey has no surrounding frames to detect a cursor move, so idle
     /// resets its engine and unverifiable shadow. SurroundingText retains
-    /// continuous state and uses frame revalidation instead; idle only defers
-    /// unconfirmed context.
+    /// continuous state and uses frame revalidation instead: a click during
+    /// the pause arrives as a frame that revokes or reseeds the composition.
+    /// Idle keeps live composition, confirmed or not (Firefox does not echo
+    /// daklak's edits until the next input, but does report a click at once),
+    /// and only defers context derived from a frame or a forwarded edit key.
     pub fn check_idle_reset(&mut self) -> bool {
         if self.last_keystroke_at.elapsed().as_secs() < 2 {
             return false;
@@ -712,7 +712,6 @@ impl Composer {
         }
         if start.clear_non_alpha_context {
             self.retroactive_context = false;
-            self.firefox.clear();
         }
         if let Some(word) = start.seed_word.as_deref() {
             tracing::debug!(word, "seed engine from shadow at word boundary");
@@ -744,7 +743,6 @@ impl Composer {
             }
             KeyFinishPlan::Forward { pending } => {
                 self.edit.push_forwarded_char(ch);
-                self.firefox.clear();
                 self.confirmation = pending
                     .map(ConfirmationState::PendingRaw)
                     .unwrap_or(ConfirmationState::Live);
@@ -832,7 +830,6 @@ impl Composer {
                 self.retroactive_context = false;
             }
             self.last_keystroke_at = Instant::now();
-            self.firefox.clear();
             KeyDecision::ForwardRaw
         }
     }
@@ -874,73 +871,26 @@ impl Composer {
         preserve_engine: bool,
     ) {
         let before = self.edit.shadow_text().to_owned();
-        let delete_echo = prefix_after_char_delete(&before, backspaces);
-        let delete_unit = self.firefox.delete_unit();
-
-        // Firefox contenteditable quirk: once a stale correction echo is
-        // observed, force delete through ForwardKey until a fresh correction
-        // echo clears the quirk state.
-        //
-        // delete_unit == Chars is still logged as the immediate stale signal.
-        // `firefox.use_forward_delete()` reflects the quirk's current stale
-        // assessment, while `firefox.forward_sticky()` keeps delete on
-        // ForwardKey for this text-input object once stale mode has been
-        // observed at least once.
-        let quirk_requests_forward = self.firefox.use_forward_delete();
-        if quirk_requests_forward {
-            self.firefox.arm_forward_sticky();
-        }
-        // Firefox contenteditable byte-vs-char bug (Bug 1905481 family):
-        // delete_surrounding_text uses byte counts per the text-input-v3 spec,
-        // but Firefox contenteditable may misinterpret them as character counts
-        // when the deletion spans multibyte UTF-8 and the composition is being
-        // REVERTED to raw ASCII (e.g. Telex ww undoes ư→w). Normal tone
-        // replacement (à→ả) commits another multibyte char so the byte
-        // arithmetic is self-correcting; raw reverts commit ASCII (1 byte per
-        // char), exposing Firefox's mis-measurement of the preceding delete.
-        // Use ForwardKey (physical Backspace) which always removes exactly
-        // 1 character regardless of byte width.
-        let multibyte_retroactive_revert = self.retroactive_context
-            && backspaces > 0
-            && commit.is_ascii()
-            && backspaces < before.chars().count() // partial revert, not full auto-restore
-            && before.chars().rev().take(backspaces).any(|c| c.len_utf8() > 1);
-        // Mixed expanding revert (e.g. gedit `tự` + `w`: delete `ự`, commit
-        // `ụw`). A Telex `ww`-revert that undoes a horn but keeps the tone
-        // commits ONE multibyte char plus raw ASCII, expanding the char count
-        // (commit chars > backspaces). Some apps drop the positional
-        // `delete_surrounding_text` for this shape while still applying the
-        // `commit_string`, leaving the deleted glyph on screen (`tự` → `tựụw`
-        // instead of `tụw`). The commit is not fully ASCII, so the revert
-        // guard above misses it; route the deletion through physical Backspace,
-        // which every app honors. Independent of `retroactive_context` (the
-        // gedit repro composes live, `retroactive_context=false`).
-        let mixed_expanding_revert = backspaces > 0
-            && backspaces < before.chars().count() // partial revert, not full auto-restore
-            && commit.chars().count() > backspaces
-            && commit.chars().any(|c| c.is_ascii())
-            && before.chars().rev().take(backspaces).any(|c| c.len_utf8() > 1);
-        let used_forward_key = quirk_requests_forward
-            || self.firefox.forward_sticky()
-            || multibyte_retroactive_revert
-            || mixed_expanding_revert;
+        // The client converts the byte length of a `delete_surrounding_text`
+        // to characters against the text it last reported, not its live
+        // buffer (GTK: `g_utf8_pointer_to_offset` over the cached
+        // surrounding text). When that report lags our previous commit, the
+        // same bytes cover a different number of characters: Firefox still
+        // reporting `anse|r` after `ans` + `ư` turns "delete `ư`" (2 bytes)
+        // into "delete 2 chars", eating the `s`. Physical Backspaces count
+        // characters at the real caret, so use them whenever the report does
+        // not end with the exact text being deleted.
+        let client_view_disagrees = backspaces > 0
+            && self.method() == BackspaceMethod::SurroundingText
+            && self.client_report.as_ref().is_some_and(|(text, cursor)| {
+                !client_byte_delete_agrees(text_before_cursor(text, *cursor), &before, backspaces)
+            });
+        let used_forward_key = client_view_disagrees;
         tracing::trace!(
-            ?delete_unit,
-            quirk_requests_forward,
-            sticky_forward = self.firefox.forward_sticky(),
             used_forward_key,
-            pending_echo = self.firefox.has_pending_echo(),
-            retroactive_context = self.retroactive_context,
-            "firefox delete-channel decision"
+            client_view_disagrees,
+            "delete-channel decision"
         );
-
-        // Firefox contenteditable quirk: when delete_unit == Chars, the quirk
-        // detected a stale surrounding-text echo, meaning Firefox didn't update
-        // its text-input-v3 state after our last correction. Using
-        // delete_surrounding_text in this state is unreliable — Firefox may
-        // delete the wrong range or skip the delete entirely, causing forward
-        // deletion into the next word. Emit physical Backspace key events
-        // (ForwardKey) instead.
         if used_forward_key {
             tracing::info!(
                 backspaces,
@@ -948,28 +898,23 @@ impl Composer {
                 shadow_before_chars = before.chars().count(),
                 commit_bytes = commit.len(),
                 commit_chars = commit.chars().count(),
-                "firefox quirk active: using ForwardKey instead of delete_surrounding_text"
+                "using ForwardKey instead of delete_surrounding_text"
             );
             self.edit
                 .apply_forward_key(backspaces, commit, serial, time, sink);
         } else {
             self.edit
-                .apply(backspaces, commit, serial, time, sink, delete_unit);
-            self.firefox.reset_delete_unit_after_use();
+                .apply(backspaces, commit, serial, time, sink, DeleteUnit::Bytes);
         }
 
         if !preserve_engine {
             self.refresh_retroactive_context_after_apply(backspaces);
         }
-        if backspaces > 0 && self.method() == BackspaceMethod::SurroundingText {
-            self.firefox
-                .record_expected_echo(self.edit.shadow_text().to_owned(), delete_echo);
-        }
     }
 
     /// Apply a repair calculated from the frame that confirmed a raw key's
-    /// actual insertion point. KWin may repeat the pre-edit frame; that is part
-    /// of this generic transaction, not evidence of Firefox stale state.
+    /// actual insertion point. KWin may repeat the pre-edit frame while this
+    /// client-confirmation transaction completes.
     pub fn apply_confirmed_repair_to_sink<S: viet_ime_edit_strategy::OutputSink>(
         &mut self,
         backspaces: usize,
@@ -985,7 +930,6 @@ impl Composer {
         // "kư" (no unique round-trip), the engine resets, and the second 'w'
         // composes a fresh "ư" ("kưư") instead of reverting to "kw".
         self.apply_to_sink_inner(backspaces, commit, serial, time, sink, true);
-        self.firefox.forget_expected_echo();
     }
 
     // ── surrounding-text / reseed gate (the ONE copy) ───────────────────────
@@ -999,7 +943,20 @@ impl Composer {
         anchor: ByteCursor,
         force_reseed: bool,
     ) -> Option<RetroEdit> {
+        // The Wayland transport notes each report before its duplicate gate;
+        // only note here for callers that did not (tests, direct use).
+        if self.client_report.as_ref() != Some(&(text.to_owned(), cursor.0)) {
+            self.note_client_surrounding(text, cursor.0);
+        }
         self.apply_surrounding(text, cursor.0, anchor.0, force_reseed)
+    }
+
+    /// Record a client surrounding-text report. Called for every Wayland
+    /// frame, before the duplicate gate and including echoes the reseed gate
+    /// ignores. See `client_report`.
+    pub fn note_client_surrounding(&mut self, text: &str, cursor: u32) {
+        self.previous_client_report = self.client_report.take();
+        self.client_report = Some((text.to_owned(), cursor));
     }
 
     /// IBus reports cursor/anchor in **chars**; everything downstream
@@ -1025,10 +982,25 @@ impl Composer {
         let _ = self.apply_surrounding(text, cursor_bytes, anchor_bytes, false);
     }
 
-    fn revalidate_live_confirmation(&mut self, before_cursor: &str) {
-        if matches!(self.confirmation, ConfirmationState::LiveConfirmed)
-            && before_cursor != self.edit.shadow_text()
-        {
+    /// Downgrade a confirmed live composition when a report shows the caret
+    /// is no longer where our edits left it.
+    ///
+    /// A report can disagree with the shadow in text alone: Firefox updates
+    /// its caret before the text it reports, so right after an edit it sends
+    /// the new cursor with the previous text. Such a report puts the caret
+    /// exactly where the shadow says it is (byte offset == shadow length), so
+    /// it is not evidence of a cursor move; deletes stay safe because
+    /// `client_view_disagrees` sends Backspaces at the real caret whenever the
+    /// reported text differs. A report outside the echo window that changes
+    /// the text is trusted by `apply_surrounding`, which reseeds from it.
+    fn revalidate_live_confirmation(&mut self, text: &str, cursor: u32, anchor: u32) {
+        if !matches!(self.confirmation, ConfirmationState::LiveConfirmed) {
+            return;
+        }
+        let shadow = self.edit.shadow_text();
+        let text_matches = text_before_cursor(text, cursor) == shadow;
+        let caret_matches = cursor == anchor && cursor as usize == shadow.len();
+        if !text_matches && !caret_matches {
             self.confirmation = ConfirmationState::AwaitingFrame;
         }
     }
@@ -1066,13 +1038,13 @@ impl Composer {
         let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
         let one_char_typed = self.edit.one_char_insertion_since_prev(text, cursor);
         let before_cursor = text_before_cursor(text, cursor);
-        self.revalidate_live_confirmation(before_cursor);
+        self.revalidate_live_confirmation(text, cursor, anchor);
 
         // A raw key awaiting confirmation is stronger evidence than the 150ms
         // echo heuristic: daklak issued no positional edit for this key, and a
         // frame containing it immediately before the reported cursor tells us
-        // where the client actually inserted it. Handle this before Firefox or
-        // generic stale-echo classification.
+        // where the client actually inserted it. Handle this before generic
+        // stale-frame filtering.
         if self.confirmation.pending_raw().is_some() && cursor == anchor {
             if let Some(repair) = self.confirm_pending_raw_key(text, cursor, anchor, before_cursor) {
                 return Some(repair);
@@ -1097,12 +1069,6 @@ impl Composer {
             force_reseed,
             shadow_confirmed,
         );
-
-        self.firefox
-            .observe_surrounding(before_cursor, recent_action, self.retroactive_context);
-        if self.firefox.use_forward_delete() || self.firefox.forward_sticky() {
-            self.commit_string_functional = false;
-        }
 
         if !decision.trust {
             tracing::trace!(text, cursor, anchor, "skip recent surrounding_text echo");
@@ -1195,7 +1161,15 @@ impl Composer {
         // Shadow equality alone also matches a cursor move over an adjacent
         // identical character; a real insertion changes the document.
         let document_changed = text != self.edit.prev_surrounding_for_trace().0;
+        // The recorded baseline can be stale (echoes skipped since), so the
+        // client's own previous report is checked too: going from it to this
+        // frame by exactly the raw key at the caret proves where it landed.
+        let client_step_inserted = self
+            .previous_client_report
+            .as_ref()
+            .is_some_and(|(prev, _)| char_inserted_before_cursor(prev, text, cursor, ch));
         let insertion_proven = self.edit.confirms_inserted_char(text, cursor, ch)
+            || client_step_inserted
             || (before_cursor == self.edit.shadow_text() && document_changed);
         let repairable = pending.repairable;
         let stripped = &before_cursor[..raw_index];
@@ -1301,7 +1275,11 @@ impl Composer {
         };
 
         self.retroactive_context = true;
-        self.confirmation = ConfirmationState::FrameDerived;
+        // As in the stash path above: the frame proved where this key landed,
+        // so the caret is known and the next key may edit directly. Leaving
+        // it frame-derived defers the next key until a report proves it too,
+        // which Firefox's caret-first reports may never do before Enter.
+        self.confirmation = ConfirmationState::LiveConfirmed;
         if !replay.consumed {
             // The seeded engine already incorporated the raw key and matches the
             // screen; no visible correction is needed.
@@ -1337,10 +1315,12 @@ impl Composer {
         self.edit.is_duplicate_frame(text, cursor, anchor)
     }
 
-    /// Duplicate surrounding frames are normally safe to skip, but not while a
-    /// SurroundingText correction is awaiting its echo: Firefox contenteditable
-    /// can report the stale pre-edit text unchanged, and that duplicate is the
-    /// only signal to switch the next correction to char-count delete.
+    /// Skip exact repeats of the last recorded frame. A repeat carries no new
+    /// evidence, so it must not revoke confirmation either: clients resend
+    /// the frame that confirmed a raw key after daklak has already repaired
+    /// it, and that frame naturally disagrees with the repaired shadow.
+    /// Wayland records the client's byte-delete view before this gate, so
+    /// deletes stay safe without inspecting the repeat.
     pub fn should_skip_surrounding_frame(
         &mut self,
         text: &str,
@@ -1349,17 +1329,29 @@ impl Composer {
         activate: bool,
         deactivate: bool,
     ) -> bool {
-        self.revalidate_live_confirmation(text_before_cursor(text, cursor));
-        !activate
+        // The recorded baseline goes stale while echoes are skipped, so a
+        // frame equal to it is only a repeat if it also equals the client's
+        // previous report. (The current report is this frame, noted already.)
+        let repeats_client = self
+            .previous_client_report
+            .as_ref()
+            .is_none_or(|(prev, prev_cursor)| prev == text && *prev_cursor == cursor);
+        let duplicate = !activate
             && !deactivate
-            && !self.firefox.has_pending_echo()
             && self.is_duplicate_frame(text, cursor, anchor)
+            && repeats_client;
+        if !duplicate {
+            self.revalidate_live_confirmation(text, cursor, anchor);
+        }
+        duplicate
     }
 
     /// Clear the surrounding-text diff bookkeeping (no surrounding text in
     /// this frame). Wayland-only: the v3 frame had no surrounding_text.
     pub fn clear_prev_surrounding(&mut self) {
         self.edit.clear_prev_surrounding();
+        self.client_report = None;
+        self.previous_client_report = None;
     }
 
     pub fn prev_surrounding_for_trace(&self) -> (&str, u32) {
@@ -1442,6 +1434,37 @@ fn is_word_boundary(c: char) -> bool {
         )
 }
 
+/// Whether a text-input delete of the last `backspaces` characters of
+/// `shadow`, sent as a byte length, removes exactly that many characters on a
+/// client whose last report before its cursor was `client_before`. The
+/// client measures the byte span backwards from its reported cursor, so it is
+/// exact only when the report ends with those same bytes.
+fn client_byte_delete_agrees(client_before: &str, shadow: &str, backspaces: usize) -> bool {
+    let Some((start, _)) = shadow
+        .char_indices()
+        .rev()
+        .nth(backspaces.saturating_sub(1))
+    else {
+        return false;
+    };
+    client_before.ends_with(&shadow[start..])
+}
+
+/// Whether `text` is `prev` with `ch` inserted immediately before `cursor`.
+fn char_inserted_before_cursor(prev: &str, text: &str, cursor: u32, ch: char) -> bool {
+    let cursor = (cursor as usize).min(text.len());
+    if !text.is_char_boundary(cursor) {
+        return false;
+    }
+    let Some((start, actual)) = text[..cursor].char_indices().next_back() else {
+        return false;
+    };
+    actual == ch
+        && prev.len() + ch.len_utf8() == text.len()
+        && prev.as_bytes().get(..start) == text.as_bytes().get(..start)
+        && prev.as_bytes().get(start..) == text.as_bytes().get(cursor..)
+}
+
 fn text_before_cursor(text: &str, cursor: u32) -> &str {
     let cursor = (cursor as usize).min(text.len());
     let cursor = (0..=cursor)
@@ -1449,19 +1472,6 @@ fn text_before_cursor(text: &str, cursor: u32) -> &str {
         .find(|i| text.is_char_boundary(*i))
         .unwrap_or(0);
     &text[..cursor]
-}
-
-/// Expected "delete-phase echo": the shadow with `backspaces` chars removed
-/// from the END. This is deliberately the ONLY intermediate echo shape the
-/// Firefox quirk recognizes — our corrections are always delete-tail +
-/// commit, so a compliant client passing through the intermediate state can
-/// only show an end-deletion. Firefox's stale cache (Bug 1905481) can report
-/// other shapes (pre-edit text, truncations); those deliberately do NOT get
-/// their own patterns. See `FirefoxContenteditableQuirk::observe_surrounding`
-/// for why unrecognized shapes degrade to ForwardKey instead.
-fn prefix_after_char_delete(text: &str, backspaces: usize) -> String {
-    let keep = text.chars().count().saturating_sub(backspaces);
-    text.chars().take(keep).collect()
 }
 
 /// Detects whether the transition from (`prev_text`, `prev_cursor`) to
@@ -1563,446 +1573,624 @@ mod tests {
         }
     }
 
+    /// A text-input-v3 client modelled on GTK's im-wayland module: a byte
+    /// delete is converted to characters against the last reported text,
+    /// then applied at the live caret. Key Backspaces delete one live scalar.
+    /// These tests cover collapsed selections and byte spans on UTF-8
+    /// boundaries; unsupported spans fail rather than guessing a char count.
+    struct CachedReportClient {
+        text: String,
+        caret: usize,
+        report: String,
+        report_cursor: usize,
+        pending_delete_chars: usize,
+        pending_commit: String,
+    }
+
+    impl CachedReportClient {
+        fn new(text: &str, caret: usize) -> Self {
+            assert!(text.is_char_boundary(caret));
+            Self {
+                text: text.to_owned(),
+                caret,
+                report: text.to_owned(),
+                report_cursor: caret,
+                pending_delete_chars: 0,
+                pending_commit: String::new(),
+            }
+        }
+
+        fn report_live(&mut self) -> (String, u32) {
+            self.report = self.text.clone();
+            self.report_cursor = self.caret;
+            (self.report.clone(), self.caret as u32)
+        }
+
+        fn report_stale(&mut self, text: &str, cursor: usize) -> (String, u32) {
+            assert!(text.is_char_boundary(cursor));
+            self.report = text.to_owned();
+            self.report_cursor = cursor;
+            (self.report.clone(), cursor as u32)
+        }
+
+        /// Follow the transport's duplicate-frame gate, still recording every
+        /// client report for byte-delete conversion before the gate runs.
+        fn deliver_report(&self, c: &mut Composer, activate: bool) {
+            let cursor = self.report_cursor as u32;
+            c.note_client_surrounding(&self.report, cursor);
+            if !c.should_skip_surrounding_frame(&self.report, cursor, cursor, activate, false) {
+                assert!(
+                    c.observe_surrounding_bytes(
+                        &self.report,
+                        ByteCursor(cursor),
+                        ByteCursor(cursor),
+                        activate
+                    )
+                    .is_none(),
+                    "this fixture does not model confirmation-deferred repairs"
+                );
+            }
+        }
+
+        fn delete_chars_before_caret(&mut self, n: usize) {
+            for _ in 0..n {
+                if let Some(ch) = self.text[..self.caret].chars().next_back() {
+                    self.caret -= ch.len_utf8();
+                    self.text.remove(self.caret);
+                }
+            }
+        }
+
+        fn insert(&mut self, text: &str) {
+            self.text.insert_str(self.caret, text);
+            self.caret += text.len();
+        }
+    }
+
+    impl OutputSink for CachedReportClient {
+        fn delete_surrounding_text(&mut self, before_bytes: u32, _: u32, after_bytes: u32, _: u32) {
+            assert_eq!(
+                after_bytes, 0,
+                "this fixture models collapsed selections only"
+            );
+            let start = self
+                .report_cursor
+                .checked_sub(before_bytes as usize)
+                .expect("delete exceeds the cached report");
+            self.pending_delete_chars = self
+                .report
+                .get(start..self.report_cursor)
+                .expect("fixture byte span must end on UTF-8 boundaries")
+                .chars()
+                .count();
+        }
+
+        fn commit_string(&mut self, text: &str) {
+            self.pending_commit.push_str(text);
+        }
+
+        fn commit(&mut self, _serial: u32) {
+            let n = std::mem::take(&mut self.pending_delete_chars);
+            self.delete_chars_before_caret(n);
+            let text = std::mem::take(&mut self.pending_commit);
+            self.insert(&text);
+        }
+
+        fn vk_key(&mut self, _time: u32, key_code: u32, state: KeyState) {
+            if key_code == 14 && state == KeyState::Pressed {
+                self.delete_chars_before_caret(1);
+            }
+        }
+
+        fn vk_modifiers(&mut self, _: u32, _: u32, _: u32, _: u32) {}
+
+        fn vk_commit_char(&mut self, _time: u32, _ch: char) -> bool {
+            false
+        }
+    }
+
+    fn type_key(c: &mut Composer, client: &mut CachedReportClient, ch: char) {
+        c.mark_action();
+        match c.feed_key(ch) {
+            KeyDecision::Apply {
+                backspaces, commit, ..
+            } => c.apply_to_sink(backspaces, &commit, 0, 0, client),
+            KeyDecision::ForwardRaw => client.insert(&ch.to_string()),
+            KeyDecision::Consumed => {}
+        }
+    }
+
+    /// Like `deliver_report`, but applies a frame-confirmed repair the way the
+    /// Wayland transport does (no new action mark; the key already set it).
+    fn deliver_report_with_repairs(
+        c: &mut Composer,
+        client: &mut CachedReportClient,
+        activate: bool,
+    ) {
+        let (report, cursor) = (client.report.clone(), client.report_cursor as u32);
+        c.note_client_surrounding(&report, cursor);
+        if c.should_skip_surrounding_frame(&report, cursor, cursor, activate, false) {
+            return;
+        }
+        if let Some(repair) =
+            c.observe_surrounding_bytes(&report, ByteCursor(cursor), ByteCursor(cursor), activate)
+        {
+            c.apply_confirmed_repair_to_sink(repair.backspaces, &repair.commit, 0, 0, client);
+        }
+    }
+
+    fn apply_edit(
+        c: &mut Composer,
+        client: &mut CachedReportClient,
+        backspaces: usize,
+        commit: &str,
+    ) {
+        c.mark_action();
+        c.apply_to_sink(backspaces, commit, 0, 0, client);
+    }
+
+    #[test]
+    fn cached_report_client_distinguishes_stale_and_live_byte_measurement() {
+        // Hand-worked: stale `anse|r` measures two ASCII chars, whereas live
+        // `ansư|er` measures one 2-byte scalar. Neither calculation uses the
+        // composer's delete-span helpers.
+        let mut stale = CachedReportClient::new("ansưer", 5);
+        stale.report_stale("anser", 4);
+        stale.delete_surrounding_text(2, 1, 0, 0);
+        stale.commit_string("w");
+        stale.commit(0);
+        assert_eq!(stale.text, "anwer");
+
+        let mut live = CachedReportClient::new("ansưer", 5);
+        live.delete_surrounding_text(2, 1, 0, 0);
+        live.commit_string("w");
+        live.commit(0);
+        assert_eq!(live.text, "answer");
+
+        let mut keyed = CachedReportClient::new("ansưer", 5);
+        keyed.report_stale("anser", 4);
+        keyed.vk_key(0, 14, KeyState::Pressed);
+        keyed.vk_key(0, 14, KeyState::Released);
+        keyed.commit_string("w");
+        keyed.commit(0);
+        assert_eq!(keyed.text, "answer");
+    }
+
+    mod confirmation_with_lagging_reports {
+        use super::*;
+
+        /// Firefox reports its caret before its text: each report carries the
+        /// new cursor with the text as it was one edit earlier.
+        fn lagging(client: &mut CachedReportClient, text: &str) {
+            let cursor = client.caret;
+            client.report_stale(text, cursor);
+        }
+
+        #[test]
+        fn ww_after_confirmed_repair_survives_caret_first_report() {
+            // `sord`, caret moved after `s`, then `ww`: expected `sword`.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut client = CachedReportClient::new("sord", 1);
+            client.deliver_report(&mut c, true);
+
+            // First w: frame-derived context, so it goes raw and the frame
+            // showing the inserted `w` confirms it and repairs it to `ư`.
+            type_key(&mut c, &mut client, 'w');
+            assert_eq!(client.text, "sword");
+            client.report_live();
+            deliver_report_with_repairs(&mut c, &mut client, false);
+            assert_eq!(client.text, "sưord");
+
+            // Firefox: caret after `ư` (byte 3), text still `sword`.
+            lagging(&mut client, "sword");
+            deliver_report_with_repairs(&mut c, &mut client, false);
+
+            // Second w reverts `ư` to a literal `w`.
+            // Firefox sent no up-to-date report before the line ended, so a
+            // deferred key would never be confirmed.
+            type_key(&mut c, &mut client, 'w');
+            assert_eq!(client.text, "sword");
+            assert_eq!(client.caret, 2);
+        }
+
+        #[test]
+        fn repeated_pre_repair_report_does_not_defer_next_key() {
+            // Fresh line in a rich editor: `sw` is confirmed and repaired to
+            // `sư`, then the client repeats the very report that triggered
+            // the repair. That repeat is old news, not a cursor move: the
+            // second w must revert to a literal `w` straight away.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut client = CachedReportClient::new("s", 1);
+            client.deliver_report(&mut c, true);
+            type_key(&mut c, &mut client, 'w');
+            client.report_live();
+            deliver_report_with_repairs(&mut c, &mut client, false);
+            assert_eq!(client.text, "sư");
+
+            deliver_report_with_repairs(&mut c, &mut client, false); // `sw|` again
+            type_key(&mut c, &mut client, 'w');
+            assert_eq!(client.text, "sw");
+        }
+
+        /// `sord`, three fast Lefts (no reports in between), then `w`. Firefox
+        /// reports the moved caret only after the key: `sord|1` inside the echo
+        /// window (skipped), then `sword|2`.
+        fn sord_then_fast_lefts_and_w(c: &mut Composer, client: &mut CachedReportClient) {
+            for _ in 0..3 {
+                c.reset_composition_preserving_surrounding();
+                c.defer_action();
+            }
+            client.caret = 1;
+            type_key(c, client, 'w');
+            assert_eq!(client.text, "sword");
+            client.report_stale("sord", 1);
+            deliver_report_with_repairs(c, client, false);
+            client.report_live();
+            deliver_report_with_repairs(c, client, false);
+        }
+
+        #[test]
+        fn skipped_caret_report_still_proves_raw_key_insertion() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            // `sor` + `d` restores `sỏ` to raw `sord`; Firefox keeps reporting
+            // the old `sỏ|4`, which stays the recorded baseline.
+            let mut client = CachedReportClient::new("sỏ", "sỏ".len());
+            client.deliver_report(&mut c, true);
+            apply_edit(&mut c, &mut client, 2, "sord");
+            client.deliver_report(&mut c, false);
+            sord_then_fast_lefts_and_w(&mut c, &mut client);
+            // `sord|1` -> `sword|2` is exactly the raw w at the caret.
+            assert_eq!(client.text, "sưord");
+
+            // The repair proved the caret position. With only caret-first
+            // reports afterwards (`sword|3`, then nothing before Enter), the
+            // second w must still revert at once.
+            lagging(&mut client, "sword");
+            deliver_report_with_repairs(&mut c, &mut client, false);
+            type_key(&mut c, &mut client, 'w');
+            assert_eq!(client.text, "sword");
+        }
+
+        #[test]
+        fn report_equal_to_stale_baseline_is_not_skipped_as_duplicate() {
+            // The recorded baseline is `sword|2` from the previous line (the
+            // clear and this line's reports were all skipped as echoes). The
+            // new `sword|2` matches that baseline but not the client's
+            // previous report, so it is new evidence and must be processed.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut client = CachedReportClient::new("sword", 2);
+            client.deliver_report(&mut c, true);
+            client.text = "sord".to_owned();
+            client.caret = 4;
+            client.report_live();
+            c.mark_action(); // this report lands inside an echo window
+            client.deliver_report(&mut c, false);
+            sord_then_fast_lefts_and_w(&mut c, &mut client);
+            assert_eq!(client.text, "sưord");
+        }
+
+        #[test]
+        fn caret_elsewhere_after_repair_still_defers_next_edit() {
+            // Control: a report whose caret is NOT where our edit put it is a
+            // real move (click). The next key must not edit at the old spot.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut client = CachedReportClient::new("sord la", 1);
+            client.deliver_report(&mut c, true);
+            type_key(&mut c, &mut client, 'w');
+            client.report_live();
+            deliver_report_with_repairs(&mut c, &mut client, false);
+            assert_eq!(client.text, "sưord la");
+
+            // Click after `la` within the echo window.
+            client.caret = client.text.len();
+            client.report_live();
+            deliver_report_with_repairs(&mut c, &mut client, false);
+            type_key(&mut c, &mut client, 'f');
+            client.report_live();
+            deliver_report_with_repairs(&mut c, &mut client, false);
+            // Composing `là` or leaving a raw `f` are both safe here; editing
+            // with the stale `sư` context (`lừ`, `sừord`) is the bug.
+            assert!(
+                ["sưord là", "sưord laf"].contains(&client.text.as_str()),
+                "{:?}",
+                client.text
+            );
+        }
+    }
+
     mod firefox_contenteditable {
         use super::*;
 
         #[test]
-        fn stale_surrounding_echo_arms_char_delete_for_composed_chars() {
+        fn ww_revert_mid_word_with_stale_report_keeps_preceding_char() {
+            // `anser`, caret moved after `s`; Telex `ww` must give `answer`.
+            // Firefox reports the first `w`'s result late: old text `anser `
+            // with the cursor already one step on (`anse|r`). Measured
+            // against that report, the 2-byte delete of `ư` spans `se`,
+            // two characters, which also ate the `s` (`anwer`).
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
+            let mut client = CachedReportClient::new("anser ", 3);
+            let (text, cursor) = client.report_live();
+            c.observe_surrounding_bytes(&text, ByteCursor(cursor), ByteCursor(cursor), true);
 
-            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
-            c.mark_action();
-            c.apply_to_sink(1, "ư", 1, 0, &mut sink);
-            assert_eq!(c.shadow_text(), "tư");
+            type_key(&mut c, &mut client, 'w');
+            assert_eq!(client.text, "ansưer ");
+            let (text, cursor) = client.report_stale("anser ", 4);
+            c.observe_surrounding_bytes(&text, ByteCursor(cursor), ByteCursor(cursor), false);
 
-            // Firefox contenteditable stale cache (Bug 1905481): after tu+w -> tư,
-            // the echo still reports the old shorter text. A byte-count delete would
-            // over-delete and eat the preceding consonant (the `tự` first-char drop),
-            // so arm char-count deletion for the next correction.
-            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
-
-            c.mark_action();
-            c.apply_to_sink(1, "ự", 2, 0, &mut sink);
-
-            // Stale echo now bypasses delete_surrounding_text and emits one
-            // ForwardKey Backspace pair instead.
-            assert_eq!(sink.deletes.len(), 1);
-            assert_eq!(sink.vk_keys.len(), 2);
-            assert_eq!(sink.vk_keys[0], (0, 14, KeyState::Pressed));
-            assert_eq!(sink.vk_keys[1], (0, 14, KeyState::Released));
-            assert_eq!(c.shadow_text(), "tự");
+            type_key(&mut c, &mut client, 'w');
+            assert_eq!(client.text, "answer ");
         }
 
         #[test]
-        fn duplicate_stale_echo_is_not_skipped_while_waiting_for_correction_echo() {
+        fn ww_revert_with_fresh_report_still_uses_byte_delete() {
+            // Same edit with an up-to-date report: the byte delete measures
+            // exactly `ư`, so the text-input channel stays in use.
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("anser ", 3);
+            let (text, cursor) = client.report_live();
+            c.observe_surrounding_bytes(&text, ByteCursor(cursor), ByteCursor(cursor), true);
+
+            type_key(&mut c, &mut client, 'w');
+            let (text, cursor) = client.report_live();
+            c.observe_surrounding_bytes(&text, ByteCursor(cursor), ByteCursor(cursor), false);
+
             let mut sink = DeleteCaptureSink::default();
-
-            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
             c.mark_action();
-            c.apply_to_sink(1, "ư", 1, 0, &mut sink);
-
-            assert!(c.is_duplicate_frame("tu", 2, 2));
-            assert!(!c.should_skip_surrounding_frame("tu", 2, 2, false, false));
-
-            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
-            c.mark_action();
-            c.apply_to_sink(1, "ự", 2, 0, &mut sink);
-
-            // Duplicate stale echo still reaches the correction path, but
-            // the correction now uses ForwardKey Backspace instead of
-            // delete_surrounding_text.
-            assert_eq!(sink.deletes.len(), 1);
-            assert_eq!(sink.vk_keys.len(), 2);
-            assert_eq!(sink.vk_keys[0], (0, 14, KeyState::Pressed));
-            assert_eq!(sink.vk_keys[1], (0, 14, KeyState::Released));
-        }
-
-        #[test]
-        fn stale_mode_keeps_using_forward_key_until_a_fresh_echo() {
-            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
-
-            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
-            c.mark_action();
-            c.apply_to_sink(1, "ư", 1, 0, &mut sink);
-
-            // Stale echo arms firefox quirk mode.
-            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
-
-            c.mark_action();
-            c.apply_to_sink(1, "ự", 2, 0, &mut sink);
-            c.mark_action();
-            c.apply_to_sink(1, "ữ", 3, 0, &mut sink);
-
-            // Initial correction uses surrounding delete; stale-mode corrections
-            // keep using ForwardKey until a healthy echo arrives.
-            assert_eq!(sink.deletes.len(), 1);
-            assert_eq!(sink.vk_keys.len(), 4);
-            assert_eq!(sink.vk_keys[0], (0, 14, KeyState::Pressed));
-            assert_eq!(sink.vk_keys[1], (0, 14, KeyState::Released));
-            assert_eq!(sink.vk_keys[2], (0, 14, KeyState::Pressed));
-            assert_eq!(sink.vk_keys[3], (0, 14, KeyState::Released));
-        }
-
-        #[test]
-        fn fresh_surrounding_echo_keeps_byte_delete() {
-            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
-
-            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
-            c.mark_action();
-            c.apply_to_sink(1, "ư", 1, 0, &mut sink);
-
-            c.observe_surrounding_bytes("tư", ByteCursor(3), ByteCursor(3), false);
-            c.mark_action();
-            c.apply_to_sink(1, "ự", 2, 0, &mut sink);
-
-            // Fresh echo preserves byte-count delete → before_bytes = 2.
-            assert_eq!(sink.deletes[1], (2, 1, 0, 0));
-        }
-
-        #[test]
-        fn space_after_stale_echo_forwards_raw_and_sticky_mode_persists() {
-            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
-
-            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), true);
-            c.mark_action();
-            c.apply_to_sink(1, "ư", 1, 0, &mut sink);
-            c.observe_surrounding_bytes("tu", ByteCursor(2), ByteCursor(2), false);
-
-            // Space is forwarded raw. It clears the one-shot char-delete state
-            // (`firefox.clear()`), but `forward_sticky` deliberately survives
-            // word boundaries: a widget that produced one stale echo is assumed
-            // stale for its whole lifetime, so later corrections keep using
-            // ForwardKey. Sticky mode only resets with the Composer (recreated
-            // on activate) via `full_reset`.
-            assert!(matches!(c.feed_key(' '), KeyDecision::ForwardRaw));
-        }
-
-        #[test]
-        fn forwarded_char_after_stale_echo_resets_char_delete_before_next_correction() {
-            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
-
-            c.observe_surrounding_bytes("d", ByteCursor(1), ByteCursor(1), true);
-            for (ch, text) in [('o', "do"), ('e', "doe")] {
-                c.mark_action();
-                assert!(matches!(c.feed_key(ch), KeyDecision::ForwardRaw));
-                c.observe_surrounding_bytes(
-                    text,
-                    ByteCursor(text.len() as u32),
-                    ByteCursor(text.len() as u32),
-                    false,
-                );
-            }
-
-            c.mark_action();
-            // doe + s in Telex: backspaces=1, commit="é" → shadow becomes "doé"
-            match c.feed_key('s') {
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => c.apply_to_sink(backspaces, &commit, 1, 0, &mut sink),
-                _ => panic!("expected stale-echo setup tone edit"),
-            }
-            c.observe_surrounding_bytes("doe", ByteCursor(3), ByteCursor(3), false);
-
-            // A forwarded raw key changes the buffer, so the one-shot char-count
-            // assumption no longer applies — reset to byte deletes.
-            c.mark_action();
-            assert!(matches!(c.feed_key('n'), KeyDecision::ForwardRaw));
-
-            c.mark_action();
-            match c.feed_key('t') {
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    assert_eq!(backspaces, 4);
-                    assert_eq!(commit, "doesnt");
-                    c.apply_to_sink(backspaces, &commit, 2, 0, &mut sink);
-                }
-                _ => panic!("expected deconversion to raw English word"),
-            }
-
-            assert_eq!(sink.deletes.last(), Some(&(5, 4, 0, 0)));
-        }
-
-        #[test]
-        fn retroactive_stale_echo_keeps_byte_delete_for_multibyte_tone_updates() {
-            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
-            let text = "cà phê";
-            let cursor = "cà".len() as u32;
-
-            c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), false);
-
-            c.mark_action();
-            match c.feed_key('r') {
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    assert_eq!(backspaces, 1);
-                    assert_eq!(commit, "ả");
-                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-                }
-                _ => panic!("expected retroactive tone replacement"),
-            }
-
-            // Firefox contenteditable can echo the old surrounding buffer with the
-            // cursor shifted past the edit. This must not switch retroactive edits
-            // to char-count deletion, because the v1 path still needs byte counts
-            // to delete the multibyte Vietnamese character before committing again.
-            c.observe_surrounding_bytes(text, ByteCursor("cà ".len() as u32), ByteCursor("cà ".len() as u32), false);
-
-            c.mark_action();
-            match c.feed_key('j') {
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    assert_eq!(backspaces, 1);
-                    assert_eq!(commit, "ạ");
-                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-                }
-                _ => panic!("expected second retroactive tone replacement"),
-            }
-
-            assert_eq!(sink.deletes[1], (3, 1, 0, 0));
-        }
-
-        #[test]
-        fn retroactive_stale_cursor_into_next_word_uses_forward_key_delete() {
-            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
-
-            // Cursor moved to the end of the first word in a two-word phrase.
-            c.observe_surrounding_bytes(
-                "là lạ",
-                ByteCursor("là".len() as u32),
-                ByteCursor("là".len() as u32),
-                false,
-            );
-
-            // First retroactive tone replacement on the first word: là -> lạ.
-            c.mark_action();
-            match c.feed_key('j') {
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    assert_eq!(backspaces, 1);
-                    assert_eq!(commit, "ạ");
-                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-                }
-                _ => panic!("expected first retroactive tone replacement"),
-            }
-            assert_eq!(c.shadow_text(), "lạ");
-
-            // Firefox stale echo can shift cursor into the next word while
-            // still reporting old surrounding text. Historically this armed
-            // char-count delete and caused forward deletion into the second
-            // word. We now bypass delete_surrounding_text and emit ForwardKey BS.
-            c.observe_surrounding_bytes(
-                "lạ lạ",
-                ByteCursor("lạ l".len() as u32),
-                ByteCursor("lạ l".len() as u32),
-                false,
-            );
-
-            c.mark_action();
-            match c.feed_key('r') {
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    assert_eq!(backspaces, 1);
-                    assert_eq!(commit, "ả");
-                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-                }
-                _ => panic!("expected second retroactive tone replacement"),
-            }
-
-            // First correction used SurroundingText delete; second correction
-            // (after stale cursor shift) must use ForwardKey delete instead.
-            assert_eq!(sink.deletes.len(), 1);
-            assert_eq!(sink.vk_keys.len(), 2);
-            assert_eq!(sink.vk_keys[0], (0, 14, KeyState::Pressed));
-            assert_eq!(sink.vk_keys[1], (0, 14, KeyState::Released));
-            assert_eq!(c.shadow_text(), "lả");
-        }
-
-        #[test]
-        fn mixed_expanding_revert_uses_forward_key_delete() {
-            // gedit repro: compose `tự` live (tuwj), then press `w` again. The
-            // Telex `ww`-revert undoes the horn but keeps the tone → delete `ự`
-            // (1 multibyte char), commit `ụw` (2 chars, one non-ASCII + one
-            // ASCII). gedit dropped the positional delete_surrounding_text after
-            // an idle gap while still applying commit_string, leaving `tựụw`.
-            // The deletion must go through physical Backspace, which gedit
-            // honors, so the screen becomes `tụw`.
-            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
-
-            for ch in ['t', 'u', 'w', 'j'] {
-                if let KeyDecision::Apply {
-                    backspaces, commit, ..
-                } = c.feed_key(ch)
-                {
-                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-                }
-            }
-            assert_eq!(c.shadow_text(), "tự");
-            let deletes_before = sink.deletes.len();
-            let vk_before = sink.vk_keys.len();
-
             match c.feed_key('w') {
                 KeyDecision::Apply {
                     backspaces, commit, ..
-                } => {
-                    assert_eq!(backspaces, 1);
-                    assert_eq!(commit, "ụw");
-                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-                }
-                _ => panic!("expected `ww`-revert Apply(1, \"ụw\")"),
+                } => c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink),
+                _ => panic!("expected ww revert"),
             }
-
-            // The revert deletion routed through ForwardKey (one Backspace
-            // press/release pair), NOT an added delete_surrounding_text.
-            assert_eq!(
-                sink.deletes.len(),
-                deletes_before,
-                "mixed expanding revert must not use delete_surrounding_text"
-            );
-            assert_eq!(sink.vk_keys.len(), vk_before + 2);
-            assert_eq!(sink.vk_keys[vk_before], (0, 14, KeyState::Pressed));
-            assert_eq!(sink.vk_keys[vk_before + 1], (0, 14, KeyState::Released));
-            assert_eq!(c.shadow_text(), "tụw");
+            assert_eq!(sink.deletes, vec![(2, 1, 0, 0)]);
+            assert!(sink.vk_keys.is_empty());
         }
 
         #[test]
-        fn ordinary_multibyte_tone_replacement_still_uses_surrounding_delete() {
-            // Control: `tư` + `j` → delete `ư` (1 multibyte char), commit `ự`
-            // (1 multibyte char). commit chars == backspaces, so it is NOT a
-            // mixed expanding revert — it must keep normal SurroundingText
-            // delete_surrounding_text (byte-count), not physical Backspace.
+        fn tone_on_stale_report_with_queued_raw_key_keeps_word() {
+            // `nhieeuf` typed fast in Firefox: when `f` arrives the last
+            // report is `nhie|` (neither `ê` nor the raw `u` reported yet).
+            // A 3-byte delete of `êu` measured there spans `hie`.
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
+            let mut client = CachedReportClient::new("x ", 2);
+            let (text, cursor) = client.report_live();
+            c.observe_surrounding_bytes(&text, ByteCursor(cursor), ByteCursor(cursor), true);
 
-            for ch in ['t', 'u', 'w'] {
-                if let KeyDecision::Apply {
-                    backspaces, commit, ..
-                } = c.feed_key(ch)
-                {
-                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-                }
+            for ch in "nhiee".chars() {
+                type_key(&mut c, &mut client, ch);
             }
-            assert_eq!(c.shadow_text(), "tư");
-            let vk_before = sink.vk_keys.len();
-
-            match c.feed_key('j') {
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    assert_eq!(backspaces, 1);
-                    assert_eq!(commit, "ự");
-                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-                }
-                _ => panic!("expected tone Apply(1, \"ự\")"),
-            }
-
-            // Normal tone replacement uses delete_surrounding_text (2 bytes for
-            // the multibyte `ư`), NOT physical Backspace.
-            assert_eq!(
-                sink.vk_keys.len(),
-                vk_before,
-                "must not emit ForwardKey Backspace"
-            );
-            assert_eq!(sink.deletes.last().copied(), Some((2, 1, 0, 0)));
-            assert_eq!(c.shadow_text(), "tự");
+            assert_eq!(client.text, "x nhiê");
+            let (text, cursor) = client.report_stale("x nhie", 6);
+            c.observe_surrounding_bytes(&text, ByteCursor(cursor), ByteCursor(cursor), false);
+            type_key(&mut c, &mut client, 'u');
+            type_key(&mut c, &mut client, 'f');
+            assert_eq!(client.text, "x nhiều");
         }
 
         #[test]
-        fn stale_firefox_echo_marks_commit_string_unusable_before_forward_key() {
+        fn stale_byte_measurement_preserves_preceding_consonant() {
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
+            let mut client = CachedReportClient::new("tu suffix", 2);
+            client.deliver_report(&mut c, true);
+            apply_edit(&mut c, &mut client, 1, "ư");
+            assert_eq!(client.text, "tư suffix");
 
-            c.observe_surrounding_bytes("la", ByteCursor(2), ByteCursor(2), true);
-            c.mark_action();
-            c.apply_to_sink(1, "ả", 1, 0, &mut sink);
+            // The report still measures two bytes as `tu`, not the live `ư`.
+            client.deliver_report(&mut c, false);
+            apply_edit(&mut c, &mut client, 1, "ự");
+            assert_eq!(client.text, "tự suffix");
+            assert_eq!(client.caret, "tự".len());
+        }
+
+        #[test]
+        fn delete_phase_report_does_not_corrupt_the_next_correction() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("prefix tu suffix", "prefix tu".len());
+            client.deliver_report(&mut c, true);
+            apply_edit(&mut c, &mut client, 1, "ư");
+            // A delayed intermediate report contains only the delete phase;
+            // the live application has already applied the replacement.
+            client.report_stale("prefix t suffix", "prefix t".len());
+            client.deliver_report(&mut c, false);
+            apply_edit(&mut c, &mut client, 1, "ự");
+            assert_eq!(client.text, "prefix tự suffix");
+        }
+
+        #[test]
+        fn external_edit_after_correction_uses_new_word_not_old_echo() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("tu suffix", 2);
+            client.deliver_report(&mut c, true);
+            type_key(&mut c, &mut client, 'w');
+            assert_eq!(client.text, "tư suffix");
+
+            // External edit after the correction: its pending echo cannot
+            // authorize editing the old word instead of this new destination.
+            client.text = "la tail".to_owned();
+            client.caret = 2;
+            client.report_live();
+            c.defer_action();
+            client.deliver_report(&mut c, false);
+            type_key(&mut c, &mut client, 'f');
+            assert_eq!(client.text, "là tail");
+        }
+
+        #[test]
+        fn duplicate_stale_reports_do_not_change_correction_result() {
+            for duplicates in [1, 3] {
+                let mut c =
+                    Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+                let mut client = CachedReportClient::new("tu suffix", 2);
+                client.deliver_report(&mut c, true);
+                apply_edit(&mut c, &mut client, 1, "ư");
+                for _ in 0..duplicates {
+                    client.deliver_report(&mut c, false);
+                }
+                apply_edit(&mut c, &mut client, 1, "ự");
+                assert_eq!(client.text, "tự suffix", "{duplicates} duplicate reports");
+            }
+        }
+
+        #[test]
+        fn repeated_corrections_preserve_text_when_reports_lag_then_catch_up() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("tu suffix", 2);
+            client.deliver_report(&mut c, true);
+            apply_edit(&mut c, &mut client, 1, "ư");
+            client.deliver_report(&mut c, false);
+
+            for (glyph, want) in [("ự", "tự suffix"), ("ữ", "tữ suffix")] {
+                apply_edit(&mut c, &mut client, 1, glyph);
+                assert_eq!(client.text, want);
+            }
+            client.report_live();
+            client.deliver_report(&mut c, false);
+            apply_edit(&mut c, &mut client, 1, "ư");
+            assert_eq!(client.text, "tư suffix");
+        }
+
+        #[test]
+        fn stale_report_does_not_corrupt_the_next_word() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("tu", 2);
+            client.deliver_report(&mut c, true);
+            type_key(&mut c, &mut client, 'w');
+            client.deliver_report(&mut c, false);
+            type_key(&mut c, &mut client, 'j');
+            assert_eq!(client.text, "tự");
+            for ch in " hanhj ".chars() {
+                type_key(&mut c, &mut client, ch);
+                client.report_live();
+                client.deliver_report(&mut c, false);
+            }
+            assert_eq!(client.text, "tự hạnh ");
+        }
+
+        #[test]
+        fn english_restore_after_forwarded_char_preserves_surrounding_text() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("d suffix", 1);
+            client.deliver_report(&mut c, true);
+            for ch in "oe".chars() {
+                type_key(&mut c, &mut client, ch);
+                client.report_live();
+                client.deliver_report(&mut c, false);
+            }
+            type_key(&mut c, &mut client, 's');
+            assert_eq!(client.text, "doé suffix");
+            client.deliver_report(&mut c, false); // still `doe| suffix`
+            type_key(&mut c, &mut client, 'n');
+            client.report_live();
+            client.deliver_report(&mut c, false);
+            type_key(&mut c, &mut client, 't');
+            assert_eq!(client.text, "doesnt suffix");
+            assert_eq!(client.caret, "doesnt".len());
+        }
+
+        #[test]
+        fn stale_cursor_after_word_preserves_multibyte_tone_and_suffix() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("cà phê", "cà".len());
+            client.deliver_report(&mut c, true);
+            type_key(&mut c, &mut client, 'r');
+            assert_eq!(client.text, "cả phê");
+
+            // Three bytes back from cached `cà |phê` covers `à ` (two
+            // scalars), but the real caret is still before the space.
+            client.report_stale("cà phê", "cà ".len());
+            client.deliver_report(&mut c, false);
+            type_key(&mut c, &mut client, 'j');
+            assert_eq!(client.text, "cạ phê");
+            assert_eq!(client.caret, "cạ".len());
+        }
+
+        #[test]
+        fn stale_cursor_in_next_word_does_not_edit_that_word() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("là lạ", "là".len());
+            client.deliver_report(&mut c, true);
+            type_key(&mut c, &mut client, 'j');
+            assert_eq!(client.text, "lạ lạ");
+
+            // The cached cursor drifts into the suffix; the live caret stays
+            // at the end of the first word throughout both corrections.
+            client.report_stale("lạ lạ", "lạ l".len());
+            client.deliver_report(&mut c, false);
+            type_key(&mut c, &mut client, 'r');
+            assert_eq!(client.text, "lả lạ");
+            assert_eq!(client.caret, "lả".len());
+        }
+
+        #[test]
+        fn mixed_expanding_revert_preserves_text_with_fresh_or_stale_report() {
+            // `tuwj` -> `tự`, then w removes the horn but keeps the tone:
+            // `tụw`. The former gedit fallback must not dictate a channel;
+            // only the resulting text and insertion point are the contract.
+            for stale in [false, true] {
+                let mut c =
+                    Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+                let mut client = CachedReportClient::new("x  suffix", 2);
+                client.deliver_report(&mut c, true);
+                for ch in "tuwj".chars() {
+                    type_key(&mut c, &mut client, ch);
+                    client.report_live();
+                    client.deliver_report(&mut c, false);
+                }
+                assert_eq!(client.text, "x tự suffix");
+                if stale {
+                    client.report_stale("x tư suffix", "x tư".len());
+                }
+                client.deliver_report(&mut c, false);
+                type_key(&mut c, &mut client, 'w');
+                assert_eq!(client.text, "x tụw suffix", "stale={stale}");
+                assert_eq!(client.caret, "x tụw".len());
+            }
+        }
+
+        #[test]
+        fn tone_replacement_with_fresh_reports_preserves_surrounding_text() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("tu suffix", 2);
+            client.deliver_report(&mut c, true);
+            type_key(&mut c, &mut client, 'w');
+            assert_eq!(client.text, "tư suffix");
+            client.report_live();
+            client.deliver_report(&mut c, false);
+            type_key(&mut c, &mut client, 'j');
+            assert_eq!(client.text, "tự suffix");
+            assert_eq!(client.caret, "tự".len());
+        }
+
+        #[test]
+        fn stale_delete_report_does_not_disable_working_commits() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("la tail", 2);
+            client.deliver_report(&mut c, true);
+            apply_edit(&mut c, &mut client, 1, "ả");
+            assert_eq!(client.text, "lả tail");
+
+            client.report_stale("la tail", 3);
+            client.deliver_report(&mut c, false);
+            apply_edit(&mut c, &mut client, 1, "ạ");
+            assert_eq!(client.text, "lạ tail");
+            // A stale byte-delete view is not evidence that commits are dead.
             assert!(c.commit_string_functional);
-
-            c.observe_surrounding_bytes(
-                "lạ l",
-                ByteCursor("lạ l".len() as u32),
-                ByteCursor("lạ l".len() as u32),
-                false,
-            );
-
-            assert!(c.firefox.use_forward_delete());
-            assert!(!c.commit_string_functional);
         }
 
         #[test]
-        fn full_reset_preserves_commit_string_ratchet_for_composer_lifetime() {
-            // `commit_string_functional` is a ONE-WAY ratchet: once a widget
-            // proves it ignores the text-input-v3 server-event contract, no
-            // in-session event may flip it back — the breakage is per-widget
-            // and permanent, and one flapped correction doubles a word.
-            // Recovery is scoped to Composer recreation on activate. This pin
-            // fails if someone "fixes" full_reset to restore the flag; that
-            // change must instead be paired with removing the
-            // Composer-per-activate invariant documented on the field.
-            let mut c =
-                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
-
-            c.observe_surrounding_bytes("la", ByteCursor(2), ByteCursor(2), true);
-            c.mark_action();
-            c.apply_to_sink(1, "ả", 1, 0, &mut sink);
-            c.observe_surrounding_bytes(
-                "lạ l",
-                ByteCursor("lạ l".len() as u32),
-                ByteCursor("lạ l".len() as u32),
-                false,
-            );
-            assert!(!c.commit_string_functional);
-
+        fn full_reset_preserves_known_dead_commit_channel() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::ForwardKey, false);
+            // Transport liveness detection (or a no-text-input activation)
+            // marked this channel dead, independently of stale delete reports.
+            c.commit_string_functional = false;
             c.full_reset();
-
-            assert!(
-                !c.commit_string_functional,
-                "ratchet must survive full_reset; recovery is Composer recreation only"
-            );
-        }
-
-        #[test]
-        fn sticky_forward_mode_keeps_delete_channel_after_first_stale_hit() {
-            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
-
-            c.observe_surrounding_bytes("la", ByteCursor(2), ByteCursor(2), true);
-
-            // Arm Firefox quirk stale mode once, as seen in field logs where
-            // one correction flips to ForwardKey and following corrections
-            // previously flapped back to delete_surrounding_text.
-            c.firefox.record_expected_echo("lả".to_owned(), "l".to_owned());
-            c.firefox.observe_surrounding("lạ l", true, false);
-            assert!(c.firefox.use_forward_delete());
-
-            c.mark_action();
-            c.apply_to_sink(1, "ả", 1, 0, &mut sink);
-
-            // Quirk can transiently clear after unrelated surrounding frames,
-            // but sticky mode must keep delete on ForwardKey for this object.
-            c.firefox.clear();
-            c.mark_action();
-            c.apply_to_sink(1, "ạ", 2, 0, &mut sink);
-
-            assert_eq!(sink.deletes.len(), 0);
-            assert_eq!(sink.vk_keys.len(), 4);
-            assert_eq!(sink.vk_keys[0], (0, 14, KeyState::Pressed));
-            assert_eq!(sink.vk_keys[1], (0, 14, KeyState::Released));
-            assert_eq!(sink.vk_keys[2], (0, 14, KeyState::Pressed));
-            assert_eq!(sink.vk_keys[3], (0, 14, KeyState::Released));
+            assert!(!c.commit_string_functional);
         }
 
         #[test]
@@ -2085,65 +2273,20 @@ mod tests {
             }
         }
 
-        /// Reproduces the Firefox contenteditable bug: cursor mid-word in
-        /// "sword", user deletes 'w' then types 'ww' to get raw 'w' back.
-        /// First 'w' composes ư (seeded from "s"), second 'w' reverts via
-        /// bs=1 → delete_surrounding_text targets a multibyte char (ư = 2
-        /// bytes). Firefox misinterprets the byte-based delete as character-
-        /// based, eating 2 chars ("sư" = 3 bytes) instead of 2 bytes ("ư").
-        ///
-        /// The fix: when the delete backspaces over a multibyte char produced
-        /// from retroactive context seeding, use ForwardKey instead of
-        /// delete_surrounding_text — physical Backspace always removes
-        /// exactly 1 character regardless of byte width.
         #[test]
-        fn ww_undo_after_retroactive_seed_uses_forward_key() {
+        fn ww_undo_mid_word_preserves_preceding_letter_and_suffix() {
+            // Delete w from `sword`, then type ww after s to restore it.
+            // The last report predates both w keys; a two-byte delete must
+            // not be applied as two live characters.
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
-
-            // Simulate: text="sword " cursor=1 (cursor between 's' and 'word')
-            // User deleted 'w' externally, arriving as text="sord" cursor=1
-            c.observe_surrounding_bytes("sord ", ByteCursor(1), ByteCursor(1), true);
-
-            // First 'w': engine seeds from shadow "s", produces ư
-            c.mark_action();
-            match c.feed_key('w') {
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    assert_eq!(backspaces, 0);
-                    assert_eq!(commit, "ư");
-                    c.apply_to_sink(backspaces, &commit, 1, 0, &mut sink);
-                }
-                other => panic!("expected Apply for first 'w', got {:?}", std::mem::discriminant(&other)),
-            }
-
-            // Second 'w': engine reverts ư→w (Telex ww escape)
-            c.mark_action();
-            match c.feed_key('w') {
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    assert_eq!(backspaces, 1, "engine wants to delete 1 char (ư)");
-                    assert_eq!(commit, "w");
-                    c.apply_to_sink(backspaces, &commit, 2, 0, &mut sink);
-
-                    // The delete targeted ư (2 bytes, 1 char). On Firefox
-                    // contenteditable this MUST use ForwardKey, not
-                    // delete_surrounding_text, because Firefox mis-counts
-                    // byte offsets as characters.
-                    assert!(
-                        !sink.vk_keys.is_empty(),
-                        "second 'w' revert must use ForwardKey (physical BS), \
-                         not delete_surrounding_text — Firefox contenteditable \
-                         misinterprets byte offsets as char offsets for multibyte \
-                         deletions, eating the seeded context 's' as well"
-                    );
-                }
-                other => panic!("expected Apply for second 'w', got {:?}", std::mem::discriminant(&other)),
-            }
+            let mut client = CachedReportClient::new("sord ", 1);
+            client.deliver_report(&mut c, true);
+            type_key(&mut c, &mut client, 'w');
+            assert_eq!(client.text, "sưord ");
+            type_key(&mut c, &mut client, 'w');
+            assert_eq!(client.text, "sword ");
+            assert_eq!(client.caret, 2);
         }
-
     }
 
     mod surrounding_words {
@@ -2602,7 +2745,7 @@ mod tests {
         }
 
         #[test]
-        fn word_boundary_seed_established_during_key_still_requires_confirmation() {
+        fn idle_on_existing_word_still_requires_insertion_confirmation() {
             let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
             c.set_surrounding_confirmation(true);
             let text = "tiếng";
@@ -2614,12 +2757,10 @@ mod tests {
                 false,
             );
 
-            // Model an uncertain idle reset that retained synchronized shadow.
-            // The key itself performs the word-boundary seed; confirmation must
-            // be decided after that seed, not from the pre-key flag alone.
+            // Idle must not authorize an edit at an unconfirmed insertion
+            // point, irrespective of how word context is represented.
             c.last_keystroke_at -= std::time::Duration::from_secs(3);
             assert!(c.check_idle_reset());
-            c.retroactive_context = false;
             c.mark_action();
             assert!(matches!(c.feed_key('r'), KeyDecision::ForwardRaw));
 
@@ -2687,11 +2828,10 @@ mod tests {
             assert_eq!(c.prev_surrounding_for_trace(), (actual, actual_cursor));
         }
 
-        // After a stale Ctrl+Backspace snapshot, the retyped prefix forwards
-        // raw and repairs from confirming frames. Once one of those frames
-        // proves the insertion point (a stash-hit repair: viee→viê), the cursor
-        // is known and the following tone key composes LIVE (viêt→việt) instead
-        // of re-deferring — no per-key raw flash. The retyped word is still not
+        // After a stale Ctrl+Backspace snapshot, the first retyped key forwards
+        // raw. Once its frame proves the insertion point, the cursor is known
+        // and later keys compose LIVE (vie→viê, viêt→việt) instead of
+        // re-deferring — no per-key raw flash. The retyped word is still not
         // poisoned: the final shadow anchors "tiệng việt".
         #[test]
         fn stale_ctrl_backspace_prefix_composes_live_after_confirmed_repair() {
@@ -2727,6 +2867,48 @@ mod tests {
             ));
         }
 
+        #[test]
+        fn first_line_confirmed_repair_keeps_literal_w_history() {
+            // A fresh rich-text editor in Firefox reports a placeholder newline.
+            // Type `anwwser`: the first w is forwarded then repaired to `ăn`;
+            // the second w must escape to literal `anw` and keep `ser` raw.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_surrounding_confirmation(true);
+            let mut sink = DeleteCaptureSink::default();
+            // Start at the frame-derived `an` before the first w. This also
+            // covers placing the caret after an existing `an`.
+            c.observe_surrounding_bytes("an", ByteCursor(2), ByteCursor(2), true);
+            c.mark_action();
+            assert!(matches!(c.feed_key('w'), KeyDecision::ForwardRaw));
+            let repair = c
+                .observe_surrounding_bytes("anw", ByteCursor(3), ByteCursor(3), false)
+                .expect("first w should be repaired after insertion is confirmed");
+            assert_eq!((repair.backspaces, repair.commit.as_str()), (3, "ăn"));
+            c.apply_confirmed_repair_to_sink(repair.backspaces, &repair.commit, 0, 0, &mut sink);
+            c.observe_surrounding_bytes("ăn", ByteCursor(3), ByteCursor(3), false);
+
+            c.mark_action();
+            match c.feed_key('w') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!((backspaces, commit.as_str()), (2, "anw"));
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                }
+                _ => panic!("second w must revert to literal w"),
+            }
+            // Firefox repeats the pre-edit report before the next key.
+            c.observe_surrounding_bytes("ăn", ByteCursor(3), ByteCursor(3), false);
+            for ch in "ser".chars() {
+                c.mark_action();
+                assert!(
+                    matches!(c.feed_key(ch), KeyDecision::ForwardRaw),
+                    "unexpected edit for {ch}"
+                );
+            }
+            assert_eq!(c.shadow_text(), "anwser");
+        }
+
         fn type_confirmed_raw_prefix(c: &mut Composer) {
             // Ctrl+Backspace has already removed "vieetjr" in gedit. The first
             // retyped letter proves the real insertion point and replaces the
@@ -2751,19 +2933,17 @@ mod tests {
         }
 
         fn repair_confirmed_circumflex(c: &mut Composer, sink: &mut DeleteCaptureSink) {
+            // The confirmed prefix lets the circumflex compose live.
             c.mark_action();
-            assert!(matches!(c.feed_key('e'), KeyDecision::ForwardRaw));
-            let raw_ee = "tiệng viee mĩ miều";
-            let raw_ee_cursor = "tiệng viee".len() as u32;
-            let circumflex = c
-                .observe_surrounding_bytes(
-                    raw_ee,
-                    ByteCursor(raw_ee_cursor),
-                    ByteCursor(raw_ee_cursor),
-                    false,
-                )
-                .expect("confirmed raw e should repair viee to viê");
-            c.apply_confirmed_repair_to_sink(circumflex.backspaces, &circumflex.commit, 0, 0, sink);
+            match c.feed_key('e') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    assert_eq!((backspaces, commit.as_str()), (1, "ê"));
+                    c.apply_to_sink(backspaces, &commit, 0, 0, sink);
+                }
+                _ => panic!("circumflex after a confirmed prefix must compose live"),
+            }
 
             let composed_e = "tiệng viê mĩ miều";
             let composed_e_cursor = "tiệng viê".len() as u32;
@@ -2839,10 +3019,7 @@ mod tests {
             assert_eq!(edit.commit, "ểng");
 
             c.apply_confirmed_repair_to_sink(edit.backspaces, &edit.commit, 0, 0, sink);
-            assert!(
-                !c.firefox.has_pending_echo(),
-                "KWin repair echoes must not enter Firefox stale classification"
-            );
+            assert_eq!(c.shadow_text(), "tiểng");
             let corrected = "tiểng việt mĩ miều";
             let corrected_cursor = "tiểng".len() as u32;
             c.observe_surrounding_bytes(
@@ -2854,23 +3031,16 @@ mod tests {
         }
 
         fn assert_late_fused_next_tone(c: &mut Composer) {
-            // Every surrounding-derived positional edit follows the same safe
-            // transaction. The raw key may flash for one client frame, but the
-            // repair cannot land at an unreported mouse/keyboard cursor.
+            // The fused frame proved where `r` landed and the corrected echo
+            // matched, so the caret is known: the next tone composes live
+            // instead of flashing raw and waiting for another frame.
             c.mark_action();
-            assert!(matches!(c.feed_key('j'), KeyDecision::ForwardRaw));
-            let raw_j = "tiểngj việt mĩ miều";
-            let raw_j_cursor = "tiểngj".len() as u32;
-            let tone = c
-                .observe_surrounding_bytes(
-                    raw_j,
-                    ByteCursor(raw_j_cursor),
-                    ByteCursor(raw_j_cursor),
-                    false,
-                )
-                .expect("confirmed raw j should yield a tone repair");
-            assert_eq!(tone.backspaces, 4);
-            assert_eq!(tone.commit, "ệng");
+            match c.feed_key('j') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => assert_eq!((backspaces, commit.as_str()), (3, "ệng")),
+                _ => panic!("tone after a proven repair must compose live"),
+            }
         }
 
         // The same late-fused-frame shape must NOT fabricate an edit when the
@@ -3383,30 +3553,23 @@ mod tests {
         }
 
         #[test]
-        fn forwarded_ascii_backspace_on_seeded_word_stays_consistent() {
-            // Cursor placed after "la" in "la world"; the engine is seeded
-            // retroactively from "la". A forwarded ASCII backspace (deleting
-            // 'a') keeps engine history by design — vnkey's process_backspace
-            // decrements its internal buffer in the same pass, so the engine
-            // now holds "l", matching the popped shadow. The next 'f' has no
-            // vowel to tone and must forward raw (visible text "lf world"),
-            // NOT compose against a stale "la" seed (which would emit a bogus
-            // delete+"à" edit).
-            let mut c =
-                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-
-            c.observe_surrounding_bytes("la world", ByteCursor(2), ByteCursor(2), true);
-            assert!(c.retroactive_context);
-
+        fn deleting_seeded_vowel_does_not_tone_the_deleted_letter() {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("la world", 2);
+            client.deliver_report(&mut c, true);
             c.mark_action();
-            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
-            assert_eq!(c.shadow_text(), "l");
-
-            c.mark_action();
-            assert!(
-                matches!(c.feed_key('f'), KeyDecision::ForwardRaw),
-                "'f' after deleting 'a' must forward raw, not tone a stale seed"
-            );
+            match c.feed_backspace() {
+                KeyDecision::ForwardRaw => client.delete_chars_before_caret(1),
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => {
+                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut client);
+                }
+                KeyDecision::Consumed => {}
+            }
+            assert_eq!(client.text, "l world");
+            type_key(&mut c, &mut client, 'f');
+            assert_eq!(client.text, "lf world");
         }
 
         #[test]
@@ -3520,74 +3683,20 @@ mod tests {
         }
 
         #[test]
-        fn refresh_after_apply_seeds_current_word_not_whole_shadow() {
-            // User clicks after "ơ" in existing text "wor ơ x" (an English word
-            // precedes the Vietnamese one) and toggles tones on "ơ". After the
-            // first toggle the refresh reseed must feed ONLY the current word
-            // ("ở") like the initial seed does — feeding the whole shadow
-            // ("wor ở") fails the render gate ("wor" telex-misreads as "wỏ"),
-            // wrongly dropping retroactive_context. The Firefox quirk then
-            // misclassifies the next stale echo (cursor drifted onto the space)
-            // as in-word staleness and routes the next correction through
-            // ForwardKey backspaces instead of a byte-count
-            // delete_surrounding_text.
-            let mut c =
-                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
-            let mut sink = DeleteCaptureSink::default();
-            let text = "wor ơ x";
-            let cursor = "wor ơ".len() as u32;
+        fn consecutive_tone_updates_preserve_other_words_despite_stale_cursor() {
+            // The English prefix must not affect corrections of the word at
+            // the caret, whether its state is retained or reconstructed.
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut client = CachedReportClient::new("wor ơ x", "wor ơ".len());
+            client.deliver_report(&mut c, true);
+            type_key(&mut c, &mut client, 'r');
+            assert_eq!(client.text, "wor ở x");
 
-            c.observe_surrounding_bytes(text, ByteCursor(cursor), ByteCursor(cursor), true);
-
-            c.mark_action();
-            match c.feed_key('r') {
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    assert_eq!(backspaces, 1);
-                    assert_eq!(commit, "ở");
-                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-                }
-                _ => panic!("expected retroactive tone edit"),
-            }
-            assert_eq!(c.shadow_text(), "wor ở");
-            assert!(
-                c.retroactive_context,
-                "retroactive context must survive the refresh reseed"
-            );
-
-            // Firefox stale echo: old text, cursor shifted past the edit onto
-            // the following space. With retroactive_context intact this keeps
-            // byte deletes; if the refresh wrongly dropped it, the quirk arms
-            // char-count delete + ForwardKey here.
-            c.observe_surrounding_bytes(
-                text,
-                ByteCursor("wor ơ ".len() as u32),
-                ByteCursor("wor ơ ".len() as u32),
-                false,
-            );
-
-            c.mark_action();
-            match c.feed_key('j') {
-                KeyDecision::Apply {
-                    backspaces, commit, ..
-                } => {
-                    assert_eq!(backspaces, 1);
-                    assert_eq!(commit, "ợ");
-                    c.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
-                }
-                _ => panic!("expected second retroactive tone edit"),
-            }
-
-            // Both corrections must go through delete_surrounding_text. The
-            // second delete is 3 bytes / 1 char (ở).
-            assert_eq!(
-                sink.deletes.len(),
-                2,
-                "second correction must use delete_surrounding_text, not ForwardKey"
-            );
-            assert_eq!(sink.deletes[1], (3, 1, 0, 0));
-            assert!(sink.vk_keys.is_empty(), "no ForwardKey backspaces expected");
+            client.report_stale("wor ơ x", "wor ơ ".len());
+            client.deliver_report(&mut c, false);
+            type_key(&mut c, &mut client, 'j');
+            assert_eq!(client.text, "wor ợ x");
+            assert_eq!(client.caret, "wor ợ".len());
         }
     }
 

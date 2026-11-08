@@ -12,7 +12,8 @@ not re-litigate or add ad-hoc workarounds beyond what's described here.
 - [GNOME / IBus ForwardKeyEvent fails in Mutter](#gnome--ibus-forwardkeyevent-fails-in-mutter)
 - [Terminals — forwarded-key routing](#terminals--forwarded-key-routing)
 - [KWin / gedit: delayed surrounding cursor updates](#kwin--gedit-delayed-surrounding-cursor-updates)
-- [Firefox contenteditable: stale-echo delete bypass](#firefox-contenteditable-stale-echo-delete-bypass)
+- [Byte deletes are measured against the client's last report](#byte-deletes-are-measured-against-the-clients-last-report)
+- [Preserve literal-key history after a confirmed repair](#preserve-literal-key-history-after-a-confirmed-repair)
 - [Tail-drop after tone + space](#tail-drop-after-tone--space)
 - [KWin: keysym on a still-held key](#kwin-keysym-on-a-still-held-key)
 - [Preedit rendering of forwarded keys](#preedit-rendering-of-forwarded-keys)
@@ -111,42 +112,69 @@ key may therefore be visible for one client frame during retroactive editing;
 that bounded visual glitch is preferred to deleting at an unverified cursor.
 Live composition built from the current keyboard stream is unchanged.
 
-Frame-triggered repairs do not use the Firefox stale-echo classifier: KWin's
-pre-edit duplicate is part of this generic confirmation transaction and must
-not arm Firefox-specific ForwardKey fallback.
+Frame-triggered repairs use the same byte-delete safety check as key-triggered
+edits. KWin's pre-edit duplicate is part of the generic confirmation transaction;
+it requires no separate app-specific stale-echo classification.
 
-## Firefox contenteditable: stale-echo delete bypass
+## Byte deletes are measured against the client's last report
 
-**Behavior:** The text-input spec defines `delete_surrounding_text` lengths in
-**bytes**, but Firefox contenteditable can return stale surrounding-text echoes.
-When the echo is stale and the cursor drifts into the next word, a
-char-count delete can target the wrong character (for example deleting the
-inter-word space or the next word's prefix), so repeated tone edits start
-mutating text ahead of the intended word.
+**Behavior:** A text-input-v3 client cannot delete bytes from its own buffer
+directly; it converts the byte length of `delete_surrounding_text` to a
+character count and deletes that many characters before its real caret. GTK's
+im-wayland module (used by Firefox) does the conversion against its *cached*
+surrounding text, the last text the application reported, by walking back the
+byte length from the cached cursor. Firefox fills that cache from a content
+cache that can lag behind the edit daklak just committed, so the conversion
+can cover a different number of characters than daklak intended. KWin forwards
+the byte length unchanged.
 
-**Resolution:** Keep spec-correct byte deletes on healthy surrounding-text
-frames. When the Firefox quirk detects a stale correction echo, daklak now
-bypasses `delete_surrounding_text` and emits one ForwardKey Backspace pair per
-requested delete instead (Tier 2 key path). Replacement text is emitted as one
-whole string through a single channel: key channel where that fallback is needed
-(vk/keysym), or one whole `commit_string` where text-input commit is the working
-channel. daklak does not split a logical replacement across key events and
-`commit_string`. For retroactive reseed sessions this ForwardKey choice is kept
-sticky, so rapid stale cursor shifts cannot alternate between delete channels
-mid-word. This keeps retroactive surrounding-text reseeding but avoids Firefox's
-mis-targeted surrounding deletes and post-first-edit channel desync.
+Example: in `anser` with the caret after `s`, Telex `w` inserts `ư`. Firefox
+then reports the old text `anser` with the cursor one step on (`anse|r`). The
+second `w` reverts `ư` to `w` with a 2-byte delete; measured against
+`anse|r` those 2 bytes are `se`, two characters, so Firefox deletes `sư` and
+the result is `anwer` instead of `answer`. The same happens to a tone key typed
+before Firefox reports the previous vowel change (`nhieeuf` → `nều` plus a
+stray `u`).
 
-Implementation note: daemon-local Firefox contenteditable state lives in
-`crates/daemon/src/quirks/firefox.rs`. The ForwardKey bypass is wired in
-`Composer::apply_to_sink` and remains a removable workaround: when
-Firefox/contenteditable paths consistently echo spec-compliant
-surrounding-text updates, the quirk module and this Composer hook can be
-deleted without touching `crates/engine`.
+**Resolution:** The composer records the text before the cursor from every
+surrounding-text frame, including duplicates and echoes the reseed gate skips
+(`Composer::note_client_surrounding`). Before a SurroundingText correction
+with backspaces, it checks that this report ends with exactly the characters
+being deleted (`client_byte_delete_agrees`). Only then does the byte length
+measure the intended characters on the client; otherwise the deletion goes
+through ForwardKey Backspaces, which count characters at the real caret. When
+reports keep up with edits (gedit, GTK4, Chromium, and Firefox most of the
+time), corrections keep using `delete_surrounding_text`.
 
-Validation status: this behavior has been live-validated on wlroots/im-v2 and
-KWin/im-v1 terminal paths. KWin/im-v1 keeps the whole replacement on the keysym
-channel because splitting keysym and `commit_string` is not a coherent edit for
-some terminals.
+There is no separate Firefox stale-echo classifier or sticky delete-channel
+policy. A cached report mismatch affects this deletion only; it does not prove
+that `commit_string` is unusable. The independently detected dead-surrounding
+condition still downgrades the transport and enables the key-channel commit
+fallback. Each replacement string is emitted whole through one channel; KWin
+IMv1 keeps ForwardKey replacements on its keysym channel.
+
+Mixed expanding reverts (`tự` + `w` → `tụw`) use this same check, not a
+special-case routing guard. Gedit 51 on KWin produced `tụw` at 0.1-, 0.5-, and
+2.5-second pauses, three fresh documents per pause, both with and without the
+former guard. This validates the installed version, not every GTK client or
+older gedit version.
+
+## Preserve literal-key history after a confirmed repair
+
+In Firefox on KWin, the first line in a fresh ProseMirror or Lexical editor
+can enter surrounding-confirmed composition. Typing `anwwser` then repairs
+the first `w` to `ăn` and uses the second `w` to escape back to literal `anw`.
+Resetting the engine before the post-edit reseed loses that escape history:
+`anw` fails the render gate (replaying it produces `ăn`), and a later `r`
+incorrectly tones the remaining `se`.
+
+`Composer::refresh_retroactive_context_after_apply` therefore leaves the live
+engine intact until the render gate accepts a replacement seed. A successful
+`feed_context_gated` replaces the state itself; a rejected seed disables
+retroactive refresh but preserves the live literal-key history. The regression
+test checks the confirmed repair, the `ww` escape, and the following `ser`.
+The complete cursor-edit sequence ending in `answer` was also verified in
+fresh ProseMirror and Lexical windows on KWin with Firefox Developer Edition.
 
 ## Tail-drop after tone + space
 

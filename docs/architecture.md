@@ -129,10 +129,29 @@ left unseeded and typed fresh — never seeded as garbage.
 client context is live, derived from a frame, awaiting a fresh frame, or holding
 a pending raw key. `LiveConfirmed` records that the client echoed the current
 live shadow after the previous key; it authorizes the next post-idle edit to
-apply without a raw-key flash. Every surrounding frame revalidates that proof,
-and a shadow mismatch revokes it even when the frame is otherwise ignored as a
-recent or duplicate frame. Without a confirmed echo, the key remains
-confirm-deferred and is repaired from the delayed frame. `PendingRaw` keeps the
+apply without a raw-key flash. Every new surrounding frame revalidates that
+proof, and a frame showing the caret somewhere other than the end of the live
+shadow revokes it even when the frame is otherwise ignored as a recent echo.
+Two kinds of frame do not revoke it:
+
+- an exact repeat of the client's previous report, which carries no new
+  evidence (clients resend the frame that confirmed a raw key after daklak
+  repaired it). Matching the recorded diff baseline alone is not enough: that
+  baseline goes stale while echoes are skipped, so a frame equal to it can
+  still be new;
+- a frame whose collapsed caret byte offset equals the shadow length but whose
+  text lags. Firefox reports its new caret with the previous text after each
+  edit; the caret is where daklak left it, and the next delete still goes
+  through Backspace because the client's reported text disagrees
+  (see [Compositor quirks](compositor-quirks.md#byte-deletes-are-measured-against-the-clients-last-report)).
+
+Without a confirmed echo, the key remains
+confirm-deferred and is repaired from the delayed frame. A frame confirms a
+pending raw key when it is the recorded baseline, or the client's own previous
+report, with exactly that key inserted before the caret. A confirmed repair
+leaves the composition `LiveConfirmed`: the frame proved where the caret is,
+so the next key edits directly instead of waiting for another frame that
+Firefox, which reports its caret ahead of its text, may not send in time. `PendingRaw` keeps the
 raw key, repairability, and any speculative engine edit together, so those facts
 cannot drift into invalid flag combinations.
 
@@ -169,7 +188,7 @@ failure, or an abort inside a dependency.
 
 ### `engine`
 Wraps the vendored vnkey engine and exposes the linguistic operations the
-Composer needs. No I/O, no Wayland, no policy.
+Composer needs. No I/O, no Wayland, no transport policy.
 
 ### `edit-strategy`
 The policy layer, independent of any transport:
@@ -187,10 +206,9 @@ The policy layer, independent of any transport:
 - `main` — CLI parsing and transport selection.
 - `quirks/` — private module group for removable app/protocol workaround state.
   Quirk modules must not own Vietnamese composition, shadow-buffer delete-span
-  math, or transport emission. They only answer questions such as "should this
-  correction use character-count delete because Firefox just returned a stale
-  contenteditable echo?" or "should IBus downgrade after repeated missing
-  surrounding-text echoes?".
+  math, or transport emission. The IBus quirk answers whether repeated missing
+  surrounding-text echoes require a downgrade. Cached byte-delete safety is
+  handled directly by the composer, without a Firefox-specific classifier.
 
 ### `wayland-adapter`
 Owns all Wayland wire concerns: input-method v1 and v2 protocols, the virtual
