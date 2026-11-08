@@ -167,9 +167,13 @@ cannot drift into invalid flag combinations.
 
 The two-second idle policy is tier-specific. `ForwardKey` resets the engine and
 clears its unverifiable shadow because it has no surrounding frames to report a
-cursor move. `SurroundingText` retains continuous engine state; idle only demotes
-context lacking a confirmed frame, while incoming frames continuously revalidate
-that confirmation.
+cursor move. `SurroundingText` retains continuous engine state: a click during
+the pause arrives as a frame, which revokes or reseeds the composition. Idle
+keeps live composition whether or not the client has echoed it yet (Firefox
+does not echo daklak's edits until the next input, but reports a click at
+once, so `six`, a pause, then `x` still gives `six`). It only defers context
+derived from a frame or following a forwarded edit key, which was never
+confirmed by daklak's own key stream.
 
 `Composer::feed_key` owns the key-path mutations. It first snapshots immutable
 `FeedKeyFacts`; pure `plan_key_start` and `plan_key_finish` functions then

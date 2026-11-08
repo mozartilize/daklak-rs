@@ -673,7 +673,10 @@ impl Composer {
             return false;
         }
         if self.method() == BackspaceMethod::SurroundingText {
-            if !matches!(self.confirmation, ConfirmationState::LiveConfirmed) {
+            if !matches!(
+                self.confirmation,
+                ConfirmationState::Live | ConfirmationState::LiveConfirmed
+            ) {
                 self.confirmation = ConfirmationState::AwaitingFrame;
             }
         } else {
@@ -3230,8 +3233,12 @@ mod tests {
             assert!(matches!(composer.feed_key('s'), KeyDecision::ForwardRaw));
         }
 
+        // Firefox: `mĩ` is never echoed during the pause (its reports lag until
+        // the next input), so the word stays unconfirmed. Idle alone is no
+        // evidence of a cursor move — a click would arrive as a frame — so the
+        // next tone key still composes live: `mĩ` + `s` is `mí`, not `mĩs`.
         #[test]
-        fn delayed_live_echo_forwards_then_repairs_tone_key() {
+        fn unechoed_live_composition_survives_idle() {
             let mut composer =
                 Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
             let mut sink = DeleteCaptureSink::default();
@@ -3261,12 +3268,48 @@ mod tests {
             composer.last_keystroke_at -= std::time::Duration::from_secs(3);
             assert!(composer.check_idle_reset());
             composer.mark_action();
-            assert!(matches!(composer.feed_key('s'), KeyDecision::ForwardRaw));
+            match composer.feed_key('s') {
+                KeyDecision::Apply {
+                    backspaces, commit, ..
+                } => assert_eq!((backspaces, commit.as_str()), (1, "í")),
+                _ => panic!("tone after an idle pause must compose live"),
+            }
+        }
 
-            let repair = composer
-                .observe_surrounding_bytes("mĩs", ByteCursor(4), ByteCursor(4), false)
-                .expect("combined delayed frame must repair the raw tone key");
-            assert_eq!((repair.backspaces, repair.commit.as_str()), (2, "í"));
+        #[test]
+        fn click_during_idle_still_stops_live_composition() {
+            // The same pause, but Firefox reports a click before `mĩ`: the
+            // next key starts a new word at the click instead of editing `mĩ`.
+            let mut composer =
+                Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            let mut sink = DeleteCaptureSink::default();
+            composer.set_surrounding_confirmation(true);
+            for (ch, text) in [('m', "m"), ('i', "mi")] {
+                composer.mark_action();
+                assert!(matches!(composer.feed_key(ch), KeyDecision::ForwardRaw));
+                let cursor = text.len() as u32;
+                composer.observe_surrounding_bytes(
+                    text,
+                    ByteCursor(cursor),
+                    ByteCursor(cursor),
+                    false,
+                );
+            }
+            composer.mark_action();
+            let KeyDecision::Apply {
+                backspaces, commit, ..
+            } = composer.feed_key('x')
+            else {
+                panic!("x must compose mĩ");
+            };
+            composer.apply_to_sink(backspaces, &commit, 1, 0, &mut sink);
+
+            composer.last_keystroke_at -= std::time::Duration::from_secs(3);
+            composer.last_action_at -= std::time::Duration::from_secs(3);
+            composer.observe_surrounding_bytes("mĩ", ByteCursor(0), ByteCursor(0), false);
+            assert!(composer.check_idle_reset());
+            composer.mark_action();
+            assert!(matches!(composer.feed_key('s'), KeyDecision::ForwardRaw));
         }
 
         #[test]
