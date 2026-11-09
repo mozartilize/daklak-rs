@@ -79,6 +79,19 @@ pub struct Config {
     #[serde(default)]
     pub v2_key_replacement: bool,
 
+    /// Automatically capitalize the first letter at the start of an empty
+    /// field, after a newline, or after sentence-ending punctuation (`.`, `!`,
+    /// `?`, `…`) followed by whitespace.
+    /// Default false. Env override `DAKLAK_AUTO_CAPITALIZE` (truthy heuristic).
+    #[serde(default)]
+    pub auto_capitalize: bool,
+
+    /// Replace two consecutive spaces typed within 400 ms after a word/number
+    /// with `". "` (Gboard-style double-space period).
+    /// Default false. Env override `DAKLAK_DOUBLE_SPACE_PERIOD` (truthy heuristic).
+    #[serde(default)]
+    pub double_space_period: bool,
+
     /// Ordered evdev keymap hook names. Each name resolves to a
     /// `<name>-set` / `<name>-unset` script pair, searched at runtime in:
     /// `$XDG_CONFIG_HOME/daklak/hooks` (user overrides), then
@@ -117,6 +130,8 @@ impl Default for Config {
             evdev_grab_hooks: Vec::new(),
             modern_style: default_modern_style(),
             v2_key_replacement: false,
+            auto_capitalize: false,
+            double_space_period: false,
             config_path: None,
         }
     }
@@ -198,6 +213,20 @@ impl Config {
 
         if let Ok(v) = std::env::var("DAKLAK_V2_KEY_REPLACEMENT") {
             cfg.v2_key_replacement = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Ok(v) = std::env::var("DAKLAK_AUTO_CAPITALIZE") {
+            cfg.auto_capitalize = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Ok(v) = std::env::var("DAKLAK_DOUBLE_SPACE_PERIOD") {
+            cfg.double_space_period = matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );
@@ -347,6 +376,23 @@ log_path = "/tmp/daklak.log"
 
         let cfg: Config = toml::from_str("v2_key_replacement = false").unwrap();
         assert!(!cfg.v2_key_replacement);
+    }
+
+    #[test]
+    fn auto_capitalize_and_double_space_period_default_false_and_parse() {
+        let def = Config::default();
+        assert!(!def.auto_capitalize);
+        assert!(!def.double_space_period);
+
+        let cfg: Config = toml::from_str(
+            r#"
+            auto_capitalize = true
+            double_space_period = true
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.auto_capitalize);
+        assert!(cfg.double_space_period);
     }
 
     #[test]

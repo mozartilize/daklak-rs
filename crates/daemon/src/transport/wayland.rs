@@ -46,6 +46,8 @@ impl AdapterHandler for Daemon {
             );
             c.set_modern_style(self.config.modern_style);
             c.set_v2_key_replacement(self.config.v2_key_replacement);
+            c.set_auto_capitalize(self.config.auto_capitalize);
+            c.set_double_space_period(self.config.double_space_period);
             // Cursor-relative retroactive edits are confirmed by the client
             // frame containing the raw key at its actual insertion point.
             // Wayland-only: IBus cannot drain frame-triggered repairs here.
@@ -384,6 +386,8 @@ impl AdapterHandler for Daemon {
             );
             c.set_modern_style(self.config.modern_style);
             c.set_v2_key_replacement(self.config.v2_key_replacement);
+            c.set_auto_capitalize(self.config.auto_capitalize);
+            c.set_double_space_period(self.config.double_space_period);
             c.set_modifiers(self.router.modifiers);
             // No text-input session exists for this client, so commit_string is
             // dead. Force ForwardKey to route replacements through the virtual

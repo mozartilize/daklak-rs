@@ -155,6 +155,14 @@ impl EditModel {
 // at a time (compositor sends deactivate before new activate); ibus/evdev
 // create one per active session.
 
+/// Maximum time between two spaces after a word/number for the second space to
+/// replace the first with `". "` (Gboard-style double-space period).
+const DOUBLE_SPACE_WINDOW: Duration = Duration::from_millis(400);
+
+/// How long a double space typed without proven context waits for the client
+/// frame that shows whether it followed a word.
+const DOUBLE_SPACE_FRAME_WAIT: Duration = Duration::from_secs(1);
+
 /// Consecutive "dead surrounding" frames (empty text + cursor 0 while our
 /// shadow holds committed content) that trip the SurroundingText→ForwardKey
 /// runtime downgrade. Two absorbs a one-off race; a functional client never
@@ -260,6 +268,36 @@ pub struct Composer {
     /// keys rather than text commits, avoiding wlroots serial-mismatch drops.
     /// Opt-in, default false. Controlled by `Config::v2_key_replacement`.
     v2_key_replacement: bool,
+
+    /// Automatically capitalize the first letter at the start of an empty
+    /// field, after a newline, or after `. ! ? …` followed by whitespace.
+    auto_capitalize: bool,
+
+    /// Replace two spaces typed within `DOUBLE_SPACE_WINDOW` after a word or
+    /// number with `". "`.
+    double_space_period: bool,
+
+    /// Timestamp of the first `' '` typed immediately after an alphanumeric
+    /// character. Consumed on the next keystroke.
+    first_space_after_word_at: Option<Instant>,
+
+    /// Time of the previous key if it was a space (any context).
+    last_space_at: Option<Instant>,
+
+    /// A quick double space typed while the context was unproven (just
+    /// focused, or frame-derived). The next client frame converts it to
+    /// `". "` if it shows the two spaces right after a word or number.
+    pending_double_space_at: Option<Instant>,
+
+    /// True while the shadow's start is anchored to a known field start or a
+    /// trusted surrounding-text frame. Cleared when a navigation/shortcut reset
+    /// or a ForwardKey idle reset wipes the shadow because cursor context is
+    /// unknown.
+    shadow_anchored: bool,
+
+    /// True when an empty (or horizontal-whitespace-only) shadow represents the
+    /// start of the field.
+    empty_shadow_is_field_start: bool,
 
     /// Complete client-frame confirmation state. Keeping provenance, raw key,
     /// repairability, and speculative engine edit in one enum prevents invalid
@@ -517,6 +555,14 @@ impl Composer {
             bracket_shortcuts,
             confirm_retroactive_edits: false,
             v2_key_replacement: false,
+            auto_capitalize: false,
+            double_space_period: false,
+            first_space_after_word_at: None,
+            last_space_at: None,
+            pending_double_space_at: None,
+            // A new session may focus an existing field without reporting it.
+            shadow_anchored: false,
+            empty_shadow_is_field_start: false,
             confirmation: ConfirmationState::Live,
             typed_word: Some(String::new()),
             keys_since_reset: false,
@@ -650,6 +696,21 @@ impl Composer {
         self.v2_key_replacement = enabled;
     }
 
+    /// Enable or disable sentence-start auto-capitalization.
+    pub fn set_auto_capitalize(&mut self, enabled: bool) {
+        self.auto_capitalize = enabled;
+    }
+
+    /// Enable or disable Gboard-style double-space to `". "`.
+    pub fn set_double_space_period(&mut self, enabled: bool) {
+        self.double_space_period = enabled;
+        if !enabled {
+            self.first_space_after_word_at = None;
+            self.last_space_at = None;
+            self.pending_double_space_at = None;
+        }
+    }
+
     // ── lifecycle ─────────────────────────────────────────────────────────
 
     /// Reset compose state — call on deactivate / navigation key /
@@ -674,6 +735,11 @@ impl Composer {
         self.engine.reset();
         self.edit.reset_composition();
         self.last_input_char = None;
+        self.first_space_after_word_at = None;
+        self.last_space_at = None;
+        self.pending_double_space_at = None;
+        self.shadow_anchored = false;
+        self.empty_shadow_is_field_start = false;
         self.retroactive_context = false;
         self.confirmation = ConfirmationState::AwaitingFrame;
         self.typed_word = Some(String::new());
@@ -738,6 +804,11 @@ impl Composer {
             self.engine.reset();
             self.edit.reset_composition();
             self.last_input_char = None;
+            self.first_space_after_word_at = None;
+            self.last_space_at = None;
+            self.pending_double_space_at = None;
+            self.shadow_anchored = false;
+            self.empty_shadow_is_field_start = false;
             self.retroactive_context = false;
         }
         true
@@ -758,6 +829,18 @@ impl Composer {
     /// against garbage (`wor`+`d` → a bogus delete-2 edit instead of plain
     /// "word"). On gate failure the engine stays fresh and the key starts anew.
     pub fn feed_key(&mut self, ch: char) -> KeyDecision {
+        self.feed_key_at(ch, Instant::now())
+    }
+
+    pub(crate) fn feed_key_at(&mut self, ch: char, now: Instant) -> KeyDecision {
+        let first_space_at = self.first_space_after_word_at.take();
+        let prev_space_at = self.last_space_at.take();
+        self.pending_double_space_at = None;
+        let prev_ended_with_word_char = match self.edit.shadow_text().chars().last() {
+            Some(last) => last.is_alphanumeric(),
+            None => self.last_input_char.is_some_and(|c| c.is_alphanumeric()),
+        };
+
         let facts = FeedKeyFacts::capture(self, ch);
         let start = plan_key_start(&facts);
 
@@ -768,28 +851,90 @@ impl Composer {
         if start.clear_non_alpha_context {
             self.retroactive_context = false;
         }
+
+        if ch == ' '
+            && self.double_space_period
+            && !start.context_uncertain
+            && first_space_at
+                .is_some_and(|t| now.saturating_duration_since(t) <= DOUBLE_SPACE_WINDOW)
+        {
+            self.engine.reset();
+            self.retroactive_context = false;
+            self.last_input_char = Some(' ');
+            self.keys_since_reset = true;
+            self.typed_word = Some(String::new());
+            self.last_keystroke_at = now;
+            self.confirmation = ConfirmationState::Live;
+            return KeyDecision::Apply {
+                method: self.method(),
+                backspaces: 1,
+                commit: ". ".to_owned(),
+            };
+        }
+
         if let Some(word) = start.seed_word.as_deref() {
             tracing::debug!(word, "seed engine from shadow at word boundary");
             self.retroactive_context = self.engine.feed_context_gated(word);
         }
 
-        self.last_input_char = Some(ch);
+        let auto_capitalize_now = self.auto_capitalize
+            && !start.context_uncertain
+            && ch.is_ascii_lowercase()
+            && self.engine.at_word_beginning()
+            && self.is_at_sentence_start();
+        let effective_ch = if auto_capitalize_now {
+            ch.to_ascii_uppercase()
+        } else {
+            ch
+        };
+
+        if matches!(ch, '\n' | '\r') {
+            self.empty_shadow_is_field_start = true;
+        } else if !ch.is_whitespace() {
+            self.empty_shadow_is_field_start = false;
+        }
+
+        self.last_input_char = Some(effective_ch);
         self.keys_since_reset = true;
-        if ch.is_alphabetic() {
+        if effective_ch.is_alphabetic() {
             if let Some(word) = self.typed_word.as_mut() {
-                word.push(ch);
+                word.push(effective_ch);
             }
         } else {
             self.typed_word = Some(String::new());
         }
-        let result = self.engine.process_key(ch);
-        self.last_keystroke_at = Instant::now();
-        self.trace_process_key(ch, &result);
+        let result = self.engine.process_key(effective_ch);
+        self.last_keystroke_at = now;
+        self.trace_process_key(effective_ch, &result);
+
+        if ch == ' ' && !start.context_uncertain && prev_ended_with_word_char {
+            self.first_space_after_word_at = Some(now);
+        }
+        if ch == ' ' {
+            self.last_space_at = Some(now);
+            // Not provable from the shadow (e.g. right after focus): let the
+            // next client frame decide (`confirm_double_space`).
+            if self.double_space_period
+                && prev_space_at
+                    .is_some_and(|t| now.saturating_duration_since(t) <= DOUBLE_SPACE_WINDOW)
+            {
+                self.pending_double_space_at = Some(now);
+            }
+        }
+
+        if auto_capitalize_now && !result.consumed {
+            self.confirmation = ConfirmationState::Live;
+            return KeyDecision::Apply {
+                method: self.method(),
+                backspaces: 0,
+                commit: effective_ch.to_string(),
+            };
+        }
 
         let base_word = self.current_shadow_word().to_owned();
         let prior_pending = matches!(&facts.confirmation, ConfirmationState::PendingRaw(_));
         match plan_key_finish(
-            ch,
+            effective_ch,
             start.context_uncertain,
             prior_pending,
             facts.confirmation.is_frame_derived(),
@@ -806,13 +951,28 @@ impl Composer {
             }
             KeyFinishPlan::Forward { pending } => {
                 self.remember_shadow();
-                self.edit.push_forwarded_char(ch);
+                self.edit.push_forwarded_char(effective_ch);
                 self.confirmation = pending
                     .map(ConfirmationState::PendingRaw)
                     .unwrap_or(ConfirmationState::Live);
                 KeyDecision::ForwardRaw
             }
         }
+    }
+
+    fn is_at_sentence_start(&self) -> bool {
+        Self::sentence_start(self.edit.shadow_text(), self.empty_shadow_is_field_start)
+    }
+
+    fn sentence_start(before: &str, field_start_known: bool) -> bool {
+        let trimmed = before.trim_end_matches([' ', '\t']);
+        if trimmed.is_empty() {
+            return field_start_known;
+        }
+        if trimmed.ends_with(['\n', '\r']) {
+            return true;
+        }
+        trimmed.len() < before.len() && trimmed.ends_with(['.', '!', '?', '…'])
     }
 
     fn trace_process_key(&self, ch: char, result: &ProcessResult) {
@@ -847,6 +1007,10 @@ impl Composer {
 
     pub fn feed_backspace(&mut self) -> KeyDecision {
         self.typed_word = None;
+        self.last_input_char = None;
+        self.first_space_after_word_at = None;
+        self.last_space_at = None;
+        self.pending_double_space_at = None;
         self.keys_since_reset = true;
         let r = self.engine.process_backspace();
         tracing::debug!(
@@ -875,6 +1039,12 @@ impl Composer {
             // backspace re-exposed, the same on every tier.
             let word = self.current_shadow_word().to_owned();
             self.retroactive_context = self.engine.reseed_after_delete(&word);
+            if self.shadow_anchored
+                && self.edit.shadow_text().trim_matches([' ', '\t']).is_empty()
+                && self.engine.at_word_beginning()
+            {
+                self.empty_shadow_is_field_start = true;
+            }
             tracing::debug!(
                 word,
                 seeded = self.retroactive_context,
@@ -883,6 +1053,17 @@ impl Composer {
             self.last_keystroke_at = Instant::now();
             KeyDecision::ForwardRaw
         }
+    }
+
+    /// Update shadow state for transports (evdev) that emit `KeyDecision::Apply`
+    /// directly without calling `apply_to_sink`.
+    #[cfg(feature = "evdev_grab")]
+    pub fn record_applied_edit(&mut self, backspaces: usize, commit: &str) {
+        self.remember_shadow();
+        self.edit.strategy.shadow.pop_chars(backspaces);
+        self.edit.strategy.shadow.clear_selection();
+        self.edit.strategy.shadow.append(commit);
+        self.refresh_retroactive_context_after_apply(backspaces);
     }
 
     /// Apply a pending edit to an arbitrary sink. Used by transports that don't
@@ -1111,6 +1292,14 @@ impl Composer {
             && self.edit.one_char_insertion_since_prev(text, cursor);
         self.revalidate_live_confirmation(text, cursor, anchor);
 
+        // A double space typed before the context was proven: the frame that
+        // shows it right after a word or number turns it into ". ".
+        if self.pending_double_space_at.is_some() && cursor == anchor {
+            if let Some(repair) = self.confirm_double_space(text, cursor, anchor, before_cursor) {
+                return Some(repair);
+            }
+        }
+
         // A raw key awaiting confirmation is stronger evidence than the 150ms
         // echo heuristic: daklak issued no positional edit for this key, and a
         // frame containing it immediately before the reported cursor tells us
@@ -1124,6 +1313,27 @@ impl Composer {
         }
 
         let shadow_confirmed = before_cursor == self.edit.shadow_text();
+        // Chromium-family editors can activate without surrounding text and
+        // initially use ForwardKey. Keep composing normally until a frame
+        // confirms our visible text; then capitalize the current word if the
+        // frame proves it started a sentence. This also covers a word already
+        // composed before the first frame (`banj` -> `bạn` -> `Bạn`).
+        if self.auto_capitalize
+            && !self.shadow_anchored
+            && self.keys_since_reset
+            && cursor == anchor
+            && shadow_confirmed
+        {
+            let word = current_word_before_cursor(text, cursor);
+            let prefix = &before_cursor[..before_cursor.len() - word.len()];
+            if !word.is_empty() && Self::sentence_start(prefix, true) {
+                if let Some(keys) = self.typed_word.clone()
+                    .filter(|keys| keys.starts_with(|c: char| c.is_ascii_lowercase()))
+                {
+                    return Some(self.capitalize_confirmed_word(text, cursor, anchor, word, keys));
+                }
+            }
+        }
         let deletion = self.edit.deletion_since_prev(text, cursor) || shadow_confirmed;
         // `shadow_confirmed` (not `has_selection`) gates trust within the
         // recent-action window. A genuine Chromium autocomplete-selection frame
@@ -1149,6 +1359,12 @@ impl Composer {
         let deletion_already_applied = shadow_confirmed;
         self.passed_shadows.clear();
         self.edit.on_surrounding_text(text, cursor, anchor);
+        self.shadow_anchored = true;
+        self.empty_shadow_is_field_start = self
+            .edit
+            .shadow_text()
+            .trim_matches([' ', '\t'])
+            .is_empty();
         // A trusted frame supplies destination context; a frame-derived seed
         // below carries any remaining uncertainty in `confirmation`.
         let preserve_frame_derived = self.confirmation.is_frame_derived();
@@ -1185,6 +1401,7 @@ impl Composer {
                 // (external delete of "la "→"la", then 'f' must compose "là",
                 // not forward raw).
                 self.last_input_char = None;
+                self.first_space_after_word_at = None;
             }
         } else if decision.reseed {
             let word = current_word_before_insertion_point(text, cursor, anchor);
@@ -1201,6 +1418,7 @@ impl Composer {
             // Same invalidation as the deletion arm: after a genuine cursor
             // jump the last typed key describes the previous locale.
             self.last_input_char = None;
+            self.first_space_after_word_at = None;
             if self.retroactive_context {
                 tracing::debug!(word, "re-seed engine (activate or cursor jump)");
             }
@@ -1208,6 +1426,64 @@ impl Composer {
 
         self.edit.record_surrounding(text, cursor, anchor);
         None
+    }
+
+    fn confirm_double_space(
+        &mut self,
+        text: &str,
+        cursor: u32,
+        anchor: u32,
+        before_cursor: &str,
+    ) -> Option<RetroEdit> {
+        let typed_at = self.pending_double_space_at?;
+        if typed_at.elapsed() > DOUBLE_SPACE_FRAME_WAIT {
+            self.pending_double_space_at = None;
+            return None;
+        }
+        let word_end = before_cursor.strip_suffix("  ")?;
+        if !word_end.chars().next_back()?.is_alphanumeric() {
+            return None;
+        }
+        self.pending_double_space_at = None;
+        self.last_space_at = None;
+        self.engine.reset();
+        self.edit.on_surrounding_text(text, cursor, anchor);
+        self.edit.record_surrounding(text, cursor, anchor);
+        self.shadow_anchored = true;
+        self.empty_shadow_is_field_start = false;
+        self.last_input_char = Some(' ');
+        self.typed_word = Some(String::new());
+        self.retroactive_context = false;
+        self.confirmation = ConfirmationState::LiveConfirmed;
+        Some(RetroEdit {
+            backspaces: 2,
+            commit: ". ".to_owned(),
+        })
+    }
+
+    /// Call only with owned typed keys whose first character is ASCII lowercase.
+    fn capitalize_confirmed_word(
+        &mut self,
+        text: &str,
+        cursor: u32,
+        anchor: u32,
+        word: &str,
+        mut keys: String,
+    ) -> RetroEdit {
+        keys[..1].make_ascii_uppercase();
+        let commit = self.engine.retype(&keys);
+        self.edit.on_surrounding_text(text, cursor, anchor);
+        self.edit.record_surrounding(text, cursor, anchor);
+        self.shadow_anchored = true;
+        self.empty_shadow_is_field_start = false;
+        self.last_input_char = keys.chars().last();
+        self.typed_word = Some(keys);
+        self.retroactive_context = false;
+        self.confirmation = ConfirmationState::LiveConfirmed;
+        RetroEdit {
+            backspaces: word.chars().count(),
+            commit,
+        }
     }
 
     /// Finish a raw-key transaction from client ground truth. The only required
@@ -1240,14 +1516,42 @@ impl Composer {
             .previous_client_report
             .as_ref()
             .is_some_and(|(prev, _)| char_inserted_before_cursor(prev, text, cursor, ch));
+        // Several raw keys can arrive before any client frame. Prove the
+        // complete typed insertion rather than requiring an intermediate echo.
+        let typed_word_inserted = self.typed_word.as_deref().is_some_and(|word| {
+            !word.is_empty()
+                && (text_inserted_before_cursor(
+                    self.edit.prev_surrounding_for_trace().0, text, cursor, word,
+                ) || self.previous_client_report.as_ref().is_some_and(|(prev, _)| {
+                    text_inserted_before_cursor(prev, text, cursor, word)
+                }))
+        });
         let insertion_proven = self.edit.confirms_inserted_char(text, cursor, ch)
             || client_step_inserted
+            || typed_word_inserted
             || (before_cursor == self.edit.shadow_text() && document_changed);
         let repairable = pending.repairable;
         let stripped = &before_cursor[..raw_index];
         let base_word = current_word_before_cursor(stripped, stripped.len() as u32).to_owned();
         let actual_word = current_word_before_cursor(before_cursor, before_cursor.len() as u32)
             .to_owned();
+
+        // A reset can leave the same empty/sentence-ending frame on screen.
+        // Do not trust that duplicate as cursor evidence; capitalize only once
+        // this frame proves where our raw key (or overlapping word) landed.
+        if self.auto_capitalize
+            && insertion_proven
+            && self.typed_word.as_deref() == Some(actual_word.as_str())
+            && actual_word.starts_with(|c: char| c.is_ascii_lowercase())
+            && Self::sentence_start(
+                &before_cursor[..before_cursor.len() - actual_word.len()],
+                true,
+            )
+        {
+            return Some(self.capitalize_confirmed_word(
+                text, cursor, anchor, &actual_word, actual_word.clone(),
+            ));
+        }
 
         if !insertion_proven || !repairable {
             // The frame changed by more than this key (paste/delete/external
@@ -1542,15 +1846,16 @@ fn client_byte_delete_agrees(client_before: &str, shadow: &str, backspaces: usiz
 
 /// Whether `text` is `prev` with `ch` inserted immediately before `cursor`.
 fn char_inserted_before_cursor(prev: &str, text: &str, cursor: u32, ch: char) -> bool {
+    text_inserted_before_cursor(prev, text, cursor, ch.encode_utf8(&mut [0; 4]))
+}
+
+fn text_inserted_before_cursor(prev: &str, text: &str, cursor: u32, inserted: &str) -> bool {
     let cursor = (cursor as usize).min(text.len());
-    if !text.is_char_boundary(cursor) {
-        return false;
-    }
-    let Some((start, actual)) = text[..cursor].char_indices().next_back() else {
+    let Some(start) = cursor.checked_sub(inserted.len()) else {
         return false;
     };
-    actual == ch
-        && prev.len() + ch.len_utf8() == text.len()
+    text.get(start..cursor) == Some(inserted)
+        && prev.len() + inserted.len() == text.len()
         && prev.as_bytes().get(..start) == text.as_bytes().get(..start)
         && prev.as_bytes().get(start..) == text.as_bytes().get(cursor..)
 }
@@ -5039,6 +5344,394 @@ mod tests {
         assert_eq!(*sink.deletes.last().unwrap(), (1, 1, 0, 0));
     }
 
+    #[test]
+    fn sentence_features_are_disabled_by_default() {
+        for method in [BackspaceMethod::SurroundingText, BackspaceMethod::ForwardKey] {
+            let mut c = Composer::new(InputMethod::Telex, method, false);
+            assert_eq!(
+                type_echoed(&mut c, "", "xin chaof  banj. tamj bieetj"),
+                "xin chào  bạn. tạm biệt"
+            );
+        }
+    }
+
+    fn composer_at_empty_field(method: BackspaceMethod) -> Composer {
+        let mut c = Composer::new(InputMethod::Telex, method, false);
+        c.set_surrounding_confirmation(true);
+        // Field-start capitalization requires reported context, even if the
+        // replacement itself uses the key channel.
+        c.observe_surrounding_bytes("", ByteCursor(0), ByteCursor(0), true);
+        c.set_auto_capitalize(true);
+        c
+    }
+
+    #[test]
+    fn auto_capitalize_handles_sentence_starts_telex_and_restores() {
+        for method in [BackspaceMethod::SurroundingText, BackspaceMethod::ForwardKey] {
+            let mut c = composer_at_empty_field(method);
+            // Empty start, `. `, `! `, `? `, `\n`, `\r`, Vietnamese initial
+            // modifiers (`ddi` -> `Đi`, `anw` -> `Ăn`, `anhs` -> `Ánh`,
+            // `wowcs` -> `Ước`), and non-Vietnamese restores (`word` -> `Word`,
+            // `herea` -> `Herea`, `corrrection` -> `Correction`).
+            assert_eq!(
+                type_echoed(
+                    &mut c,
+                    "",
+                    "ddi hocj. anw com! anhs kia? wowcs mof. word\nherea\rcorrrection"
+                ),
+                "Đi học. Ăn com! Ánh kia? Ước mò. Word\nHerea\rCorrection"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_capitalize_skips_dot_without_space_commas_and_unanchored_resets() {
+        for method in [BackspaceMethod::SurroundingText, BackspaceMethod::ForwardKey] {
+            let mut c = composer_at_empty_field(method);
+            // `.` without trailing space (domain/file), `, `, `: `, `; ` must
+            // not capitalize the following word.
+            assert_eq!(
+                type_echoed(&mut c, "", "google.com, chaof: banj; tamj.py"),
+                "Google.com, chào: bạn; tạm.py"
+            );
+
+            // Plain Backspace back to an empty field restores field-start
+            // capitalization (`"D"` deleted -> `"T"`).
+            let mut c2 = composer_at_empty_field(method);
+            assert_eq!(type_echoed(&mut c2, "", "d<tooi"), "Tôi");
+
+            // A navigation/shortcut reset wipes the shadow because cursor
+            // context is unknown; without a frame proving the field is empty,
+            // the next word must not guess it is at the start of the field.
+            let mut c3 = composer_at_empty_field(method);
+            assert_eq!(type_echoed(&mut c3, "", "xin "), "Xin ");
+            c3.reset_composition_preserving_surrounding();
+            assert_eq!(type_echoed(&mut c3, "Xin ", "chaof"), "Xin chào");
+        }
+    }
+
+    #[test]
+    fn auto_capitalize_after_reset_waits_for_proven_insertion() {
+        for (prefix, expected) in [("", "Bạn"), ("xin. ", "xin. Bạn"), ("xin ", "xin bạn")] {
+            for overlap in [false, true] {
+                let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+                c.set_auto_capitalize(true);
+                c.set_surrounding_confirmation(true);
+                let mut client = CachedReportClient::new(prefix, prefix.len());
+                deliver_report_with_repairs(&mut c, &mut client, true);
+                c.reset_composition_preserving_surrounding();
+                c.defer_action();
+                // A shortcut can leave the old report unchanged. It must stay
+                // a duplicate, not become proof of the destination cursor.
+                deliver_report_with_repairs(&mut c, &mut client, false);
+                assert_eq!(c.confirmation_variant(), "AwaitingFrame");
+                for ch in "banj".chars() {
+                    type_key(&mut c, &mut client, ch);
+                    if !overlap {
+                        client.report_live();
+                        deliver_report_with_repairs(&mut c, &mut client, false);
+                    }
+                }
+                client.report_live();
+                deliver_report_with_repairs(&mut c, &mut client, false);
+                assert_eq!(client.text, expected, "prefix={prefix:?}, overlap={overlap}");
+                // Continue Telex after the repair; capitalization must not
+                // leave a lowercase seed or discard the word's engine state.
+                type_key(&mut c, &mut client, 's');
+                client.report_live();
+                deliver_report_with_repairs(&mut c, &mut client, false);
+                assert_eq!(client.text, expected.replace("ạn", "án"));
+            }
+        }
+    }
+
+    #[test]
+    fn auto_capitalize_does_not_trust_a_stale_sentence_start_after_navigation() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        c.set_auto_capitalize(true);
+        c.set_surrounding_confirmation(true);
+        let mut client = CachedReportClient::new("xin. ", 5);
+        deliver_report_with_repairs(&mut c, &mut client, true);
+        c.reset_composition_preserving_surrounding();
+        c.defer_action();
+        // Navigation moved into the word, but the old end-of-sentence frame
+        // arrived again before the application reported the destination.
+        client.caret = 3;
+        deliver_report_with_repairs(&mut c, &mut client, false);
+        type_key(&mut c, &mut client, 'b');
+        client.report_live();
+        deliver_report_with_repairs(&mut c, &mut client, false);
+        assert_eq!(client.text, "xinb. ");
+    }
+
+    #[test]
+    fn auto_capitalize_on_first_late_surrounding_frame() {
+        for initial_method in [BackspaceMethod::ForwardKey, BackspaceMethod::SurroundingText] {
+            for (prefix, keys, visible, expected) in [
+                ("", "b", "b", "B"),
+                ("", "banj", "bạn", "Bạn"),
+                ("", "ddi", "đi", "Đi"),
+                ("xin ", "banj", "xin bạn", "xin bạn"),
+            ] {
+                let mut c = Composer::new(InputMethod::Telex, initial_method, false);
+                c.set_auto_capitalize(true);
+                c.set_surrounding_confirmation(true);
+                let mut client = CachedReportClient::new(prefix, prefix.len());
+                // Chromium-family editors may activate without surrounding
+                // text, then send their first frame only after typing. On ST,
+                // model client reports queued but not yet dispatched to the
+                // composer: byte deletes still use the client's current view.
+                for ch in keys.chars() {
+                    if initial_method == BackspaceMethod::SurroundingText {
+                        client.report_live();
+                    }
+                    type_key(&mut c, &mut client, ch);
+                }
+                assert_eq!(client.text, visible);
+                c.set_method(BackspaceMethod::SurroundingText);
+                client.report_live();
+                deliver_report_with_repairs(&mut c, &mut client, false);
+                assert_eq!(client.text, expected, "{initial_method:?}: {keys}");
+                // A repeat of the pre-repair frame must not apply it twice.
+                deliver_report_with_repairs(&mut c, &mut client, false);
+                assert_eq!(client.text, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn late_frame_capitalization_respects_flag_selection_and_owned_text() {
+        for (enabled, text, cursor, anchor) in [
+            (false, "b", 1, 1),
+            (true, "b", 1, 0),
+            (true, "xb", 2, 2),
+        ] {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::ForwardKey, false);
+            c.set_auto_capitalize(enabled);
+            c.set_surrounding_confirmation(true);
+            assert!(matches!(c.feed_key('b'), KeyDecision::ForwardRaw));
+            c.set_method(BackspaceMethod::SurroundingText);
+            c.note_client_surrounding(text, cursor);
+            assert!(c.observe_surrounding_bytes(
+                text, ByteCursor(cursor), ByteCursor(anchor), false,
+            ).is_none());
+        }
+    }
+
+    #[test]
+    fn auto_capitalize_focus_uses_reported_context_not_new_session() {
+        for (prefix, expected) in [("", "Bạn"), ("xin. ", "xin. Bạn"), ("xin ", "xin bạn")] {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_auto_capitalize(true);
+            c.set_surrounding_confirmation(true);
+            let mut client = CachedReportClient::new(prefix, prefix.len());
+            deliver_report_with_repairs(&mut c, &mut client, true);
+            for ch in "banj".chars() {
+                type_key(&mut c, &mut client, ch);
+                client.report_live();
+                deliver_report_with_repairs(&mut c, &mut client, false);
+            }
+            assert_eq!(client.text, expected);
+        }
+
+        // A synthetic ForwardKey session knows nothing about the existing
+        // text. Neither immediate input nor input after idle may guess empty.
+        for idle in [false, true] {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::ForwardKey, false);
+            c.set_auto_capitalize(true);
+            if idle {
+                c.last_keystroke_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
+                c.check_idle_reset();
+            }
+            assert_eq!(type_echoed(&mut c, "xin ", "banj"), "xin bạn");
+            // A subsequently typed newline supplies local sentence context.
+            assert_eq!(type_echoed(&mut c, "xin bạn", "\rbanj"), "xin bạn\rBạn");
+        }
+    }
+
+    #[test]
+    fn double_space_period_after_refocus_uses_surrounding_context() {
+        // After focusing a field, the first frame describes existing text. A
+        // quick double space after a word or number must still become ". ",
+        // whether the frame arrives before the spaces, between them, or after
+        // both (Chromium-family editors report late).
+        for (prefix, expected) in [
+            ("xin chao", "xin chao. "),
+            ("số 12", "số 12. "),
+            // No word before the first space: plain spaces.
+            ("xin.", "xin.  "),
+            ("xin ", "xin   "),
+            ("", "  "),
+        ] {
+            for frames in ["before", "between", "after"] {
+                for reset in [false, true] {
+                    let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+                    c.set_double_space_period(true);
+                    c.set_surrounding_confirmation(true);
+                    let mut client = CachedReportClient::new(prefix, prefix.len());
+                    if reset {
+                        // Refocus inside a live session: the composer resets
+                        // and must not trust its old shadow.
+                        type_key(&mut c, &mut client, 'a');
+                        client = CachedReportClient::new(prefix, prefix.len());
+                        c.reset_composition_preserving_surrounding();
+                        c.defer_action();
+                    }
+                    if frames == "before" {
+                        deliver_report_with_repairs(&mut c, &mut client, !reset);
+                    }
+                    type_key(&mut c, &mut client, ' ');
+                    if frames == "between" {
+                        client.report_live();
+                        deliver_report_with_repairs(&mut c, &mut client, !reset);
+                    }
+                    type_key(&mut c, &mut client, ' ');
+                    client.report_live();
+                    deliver_report_with_repairs(&mut c, &mut client, false);
+                    assert_eq!(client.text, expected, "{prefix:?} frames={frames} reset={reset}");
+                    // A repeated final frame must not apply the period twice.
+                    deliver_report_with_repairs(&mut c, &mut client, false);
+                    assert_eq!(client.text, expected, "{prefix:?} frames={frames} reset={reset} (repeat)");
+                }
+            }
+        }
+
+        // Unproven-context pairs that must stay plain: a third quick space,
+        // and any key typed before the frame arrives.
+        for (keys, expected) in [("   ", "xin   "), ("  t", "xin  t")] {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_double_space_period(true);
+            c.set_surrounding_confirmation(true);
+            let mut client = CachedReportClient::new("xin", 3);
+            deliver_report_with_repairs(&mut c, &mut client, true);
+            for ch in keys.chars() {
+                type_key(&mut c, &mut client, ch);
+            }
+            client.report_live();
+            deliver_report_with_repairs(&mut c, &mut client, false);
+            assert_eq!(client.text, expected, "{keys:?}");
+        }
+
+        // A frame arriving long after the spaces does not rewrite them.
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        c.set_double_space_period(true);
+        c.set_surrounding_confirmation(true);
+        let mut client = CachedReportClient::new("xin", 3);
+        deliver_report_with_repairs(&mut c, &mut client, true);
+        type_key(&mut c, &mut client, ' ');
+        type_key(&mut c, &mut client, ' ');
+        c.pending_double_space_at = c
+            .pending_double_space_at
+            .map(|t| t - super::DOUBLE_SPACE_FRAME_WAIT - std::time::Duration::from_millis(1));
+        client.report_live();
+        deliver_report_with_repairs(&mut c, &mut client, false);
+        assert_eq!(client.text, "xin  ");
+
+        // A stale frame showing the pair after another key was typed: the
+        // caret has moved on, so the pair must not be rewritten.
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        c.set_double_space_period(true);
+        c.set_surrounding_confirmation(true);
+        let mut client = CachedReportClient::new("xin", 3);
+        deliver_report_with_repairs(&mut c, &mut client, true);
+        for ch in "  t".chars() {
+            type_key(&mut c, &mut client, ch);
+        }
+        client.report_stale("xin  ", 5);
+        deliver_report_with_repairs(&mut c, &mut client, false);
+        assert_eq!(client.text, "xin  t");
+
+        // With auto-capitalize, the late period starts a sentence.
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        c.set_double_space_period(true);
+        c.set_auto_capitalize(true);
+        c.set_surrounding_confirmation(true);
+        let mut client = CachedReportClient::new("xin chao", 8);
+        deliver_report_with_repairs(&mut c, &mut client, true);
+        for ch in "  ".chars() {
+            type_key(&mut c, &mut client, ch);
+        }
+        client.report_live();
+        deliver_report_with_repairs(&mut c, &mut client, false);
+        for ch in "tooi".chars() {
+            type_key(&mut c, &mut client, ch);
+            client.report_live();
+            deliver_report_with_repairs(&mut c, &mut client, false);
+        }
+        assert_eq!(client.text, "xin chao. Tôi");
+    }
+
+    #[test]
+    fn double_space_period_enforces_word_prefix_and_400ms_boundary() {
+        for method in [BackspaceMethod::SurroundingText, BackspaceMethod::ForwardKey] {
+            let mut c = Composer::new(InputMethod::Telex, method, false);
+            c.set_double_space_period(true);
+
+            // Empty field, punctuation before space, and a 3rd space must not
+            // insert extra periods; words and numbers do.
+            assert_eq!(
+                type_echoed(&mut c, "", "  hanhj   ddas  123  ,  "),
+                "  hạnh.  đá. 123. ,  "
+            );
+
+            // Space + Backspace + Space within 400ms must not eat the word's
+            // last letter (`"nay < "` -> `"nay "`, not `"na. "`).
+            let mut c_bs = Composer::new(InputMethod::Telex, method, false);
+            c_bs.set_double_space_period(true);
+            assert_eq!(type_echoed(&mut c_bs, "", "nay < "), "nay ");
+        }
+
+        // Exact 400ms vs 401ms boundary and 3rd space after an expired 2nd space.
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut at_400 = Composer::new(InputMethod::Telex, BackspaceMethod::ForwardKey, false);
+        at_400.set_double_space_period(true);
+        assert!(matches!(at_400.feed_key_at('b', t0), KeyDecision::ForwardRaw));
+        assert!(matches!(at_400.feed_key_at(' ', t0), KeyDecision::ForwardRaw));
+        match at_400.feed_key_at(' ', t0 + Duration::from_millis(400)) {
+            KeyDecision::Apply { backspaces, commit, .. } => {
+                assert_eq!((backspaces, commit.as_str()), (1, ". "));
+            }
+            _ => panic!("400ms must trigger double-space period"),
+        }
+
+        let mut at_401 = Composer::new(InputMethod::Telex, BackspaceMethod::ForwardKey, false);
+        at_401.set_double_space_period(true);
+        assert!(matches!(at_401.feed_key_at('b', t0), KeyDecision::ForwardRaw));
+        assert!(matches!(at_401.feed_key_at(' ', t0), KeyDecision::ForwardRaw));
+        assert!(
+            matches!(
+                at_401.feed_key_at(' ', t0 + Duration::from_millis(401)),
+                KeyDecision::ForwardRaw
+            ),
+            "401ms must not trigger double-space period"
+        );
+        assert!(
+            matches!(
+                at_401.feed_key_at(' ', t0 + Duration::from_millis(410)),
+                KeyDecision::ForwardRaw
+            ),
+            "a 3rd space right after an expired 2nd space has no word before it"
+        );
+    }
+
+    #[test]
+    fn double_space_period_and_auto_capitalize_chain_and_respect_backspace() {
+        for method in [BackspaceMethod::SurroundingText, BackspaceMethod::ForwardKey] {
+            let mut c = composer_at_empty_field(method);
+            c.set_double_space_period(true);
+            assert_eq!(
+                type_echoed(&mut c, "", "hoom nay  troiwf ddepj"),
+                "Hôm nay. Trời đẹp"
+            );
+
+            // Deleting the trailing space of `". "` leaves `"Hôm nay."` (no
+            // space after `.`), so the next letter must stay lowercase.
+            let mut c_bs = composer_at_empty_field(method);
+            c_bs.set_double_space_period(true);
+            assert_eq!(type_echoed(&mut c_bs, "", "hoom nay  <c"), "Hôm nay.c");
+        }
+    }
 }
 
 

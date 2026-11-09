@@ -31,6 +31,8 @@ pub struct DaklakTray {
     pub enabled: bool,
     pub method: MethodConfig,
     pub modern_style: bool,
+    pub auto_capitalize: bool,
+    pub double_space_period: bool,
     /// Whether evdev grab should be enabled at startup (persisted to config).
     pub evdev_enabled: bool,
     /// Current active backend (updated via watch channel at runtime).
@@ -120,11 +122,7 @@ impl ksni::Tray for DaklakTray {
                             _ => return,
                         };
                         tray.method = method;
-                        tray.apply(ConfigChange {
-                            method,
-                            modern_style: tray.modern_style,
-                            enable_evdev_grab: tray.evdev_enabled,
-                        });
+                        tray.apply(tray.current_change());
                     }),
                     options: vec![
                         RadioItem {
@@ -149,13 +147,28 @@ impl ksni::Tray for DaklakTray {
                 label: "Legacy tone placement (òa vs oà)".into(),
                 checked: !self.modern_style,
                 activate: Box::new(|tray: &mut Self| {
-                    let modern_style = !tray.modern_style;
-                    tray.modern_style = modern_style;
-                    tray.apply(ConfigChange {
-                        method: tray.method,
-                        modern_style,
-                        enable_evdev_grab: tray.evdev_enabled,
-                    });
+                    tray.modern_style = !tray.modern_style;
+                    tray.apply(tray.current_change());
+                }),
+                ..Default::default()
+            }
+            .into(),
+            CheckmarkItem {
+                label: "Auto-capitalize sentences".into(),
+                checked: self.auto_capitalize,
+                activate: Box::new(|tray: &mut Self| {
+                    tray.auto_capitalize = !tray.auto_capitalize;
+                    tray.apply(tray.current_change());
+                }),
+                ..Default::default()
+            }
+            .into(),
+            CheckmarkItem {
+                label: "Double-space period (. )".into(),
+                checked: self.double_space_period,
+                activate: Box::new(|tray: &mut Self| {
+                    tray.double_space_period = !tray.double_space_period;
+                    tray.apply(tray.current_change());
                 }),
                 ..Default::default()
             }
@@ -221,6 +234,16 @@ impl ksni::Tray for DaklakTray {
 }
 
 impl DaklakTray {
+    fn current_change(&self) -> ConfigChange {
+        ConfigChange {
+            method: self.method,
+            modern_style: self.modern_style,
+            auto_capitalize: self.auto_capitalize,
+            double_space_period: self.double_space_period,
+            enable_evdev_grab: self.evdev_enabled,
+        }
+    }
+
     /// Send runtime-safe config changes to the daemon and persist the full tray config.
     fn apply(&mut self, change: ConfigChange) {
         if self.config_change_tx.send(change).is_err() {
@@ -240,15 +263,7 @@ impl DaklakTray {
 
     fn save_current_config(&self) {
         if let Some(path) = &self.config_path {
-            save_config(
-                path,
-                ConfigChange {
-                    method: self.method,
-                    modern_style: self.modern_style,
-                    enable_evdev_grab: self.evdev_enabled,
-                },
-                &self.evdev_grab_hooks,
-            );
+            save_config(path, self.current_change(), &self.evdev_grab_hooks);
         }
     }
 }
@@ -431,12 +446,16 @@ fn save_config(path: &Path, change: ConfigChange, evdev_grab_hooks: &[String]) {
     let evdev_str = change.enable_evdev_grab.to_string();
     let method_val = format!("\"{}\"", method_str);
     let modern_val = change.modern_style.to_string();
+    let auto_cap_val = change.auto_capitalize.to_string();
+    let double_space_val = change.double_space_period.to_string();
 
     let out = if text.is_empty() {
         // No example to copy from — generate from scratch (no comments).
         let mut cfg = Config::default();
         cfg.method = change.method;
         cfg.modern_style = change.modern_style;
+        cfg.auto_capitalize = change.auto_capitalize;
+        cfg.double_space_period = change.double_space_period;
         cfg.enable_evdev_grab = change.enable_evdev_grab;
         cfg.evdev_grab_hooks = evdev_grab_hooks.to_vec();
         match toml::to_string_pretty(&cfg) {
@@ -454,6 +473,8 @@ fn save_config(path: &Path, change: ConfigChange, evdev_grab_hooks: &[String]) {
             let mut cfg = Config::default();
             cfg.method = change.method;
             cfg.modern_style = change.modern_style;
+            cfg.auto_capitalize = change.auto_capitalize;
+            cfg.double_space_period = change.double_space_period;
             cfg.enable_evdev_grab = change.enable_evdev_grab;
             cfg.evdev_grab_hooks = evdev_grab_hooks.to_vec();
             match toml::to_string_pretty(&cfg) {
@@ -482,6 +503,8 @@ fn save_config(path: &Path, change: ConfigChange, evdev_grab_hooks: &[String]) {
             };
             append("method", &method_val);
             append("modern_style", &modern_val);
+            append("auto_capitalize", &auto_cap_val);
+            append("double_space_period", &double_space_val);
             append("enable_evdev_grab", &evdev_str);
             append("evdev_grab_hooks", &hooks_str);
 
@@ -508,6 +531,8 @@ fn save_config(path: &Path, change: ConfigChange, evdev_grab_hooks: &[String]) {
             let mut cfg = Config::default();
             cfg.method = change.method;
             cfg.modern_style = change.modern_style;
+            cfg.auto_capitalize = change.auto_capitalize;
+            cfg.double_space_period = change.double_space_period;
             cfg.enable_evdev_grab = change.enable_evdev_grab;
             cfg.evdev_grab_hooks = evdev_grab_hooks.to_vec();
             match toml::to_string_pretty(&cfg) {
@@ -650,6 +675,8 @@ pub async fn run_tray(
         enabled: *state_rx.borrow_and_update(),
         method: config.method,
         modern_style: config.modern_style,
+        auto_capitalize: config.auto_capitalize,
+        double_space_period: config.double_space_period,
         evdev_enabled: config.enable_evdev_grab,
         backend: *backend_rx.borrow(),
         evdev_grab_hooks: config.evdev_grab_hooks.clone(),
@@ -743,6 +770,8 @@ mod tests {
             ConfigChange {
                 method: MethodConfig::Vni,
                 modern_style: false,
+                auto_capitalize: true,
+                double_space_period: true,
                 enable_evdev_grab: true,
             },
             &[],
@@ -752,6 +781,8 @@ mod tests {
         let cfg: Config = toml::from_str(&text).unwrap();
         assert_eq!(cfg.method, MethodConfig::Vni);
         assert!(!cfg.modern_style);
+        assert!(cfg.auto_capitalize);
+        assert!(cfg.double_space_period);
         assert!(
             cfg.enable_evdev_grab,
             "enable_evdev_grab persisted on fresh file"
@@ -804,6 +835,7 @@ mod tests {
                 method: MethodConfig::Telex,
                 modern_style: true,
                 enable_evdev_grab: true,
+                ..ConfigChange::default()
             },
             &["sway".into(), "x11".into()],
         );
@@ -847,6 +879,7 @@ evdev_grab_hooks = [
                 method: MethodConfig::Telex,
                 modern_style: true,
                 enable_evdev_grab: true,
+                ..ConfigChange::default()
             },
             &[],
         );
@@ -888,6 +921,8 @@ modern_style = true
             ConfigChange {
                 method: MethodConfig::Vni,
                 modern_style: false,
+                auto_capitalize: true,
+                double_space_period: true,
                 enable_evdev_grab: true,
             },
             &[],
@@ -902,6 +937,8 @@ modern_style = true
         let cfg: Config = toml::from_str(&text).unwrap();
         assert_eq!(cfg.method, MethodConfig::Vni);
         assert!(!cfg.modern_style);
+        assert!(cfg.auto_capitalize);
+        assert!(cfg.double_space_period);
         assert!(cfg.enable_evdev_grab);
 
         let _ = std::fs::remove_dir_all(root);
@@ -951,6 +988,7 @@ modern_style = true
                 method: MethodConfig::Vni,
                 modern_style: false,
                 enable_evdev_grab: true,
+                ..ConfigChange::default()
             },
             &[],
         );
@@ -1054,6 +1092,7 @@ modern_style = true
                 method: MethodConfig::Vni,
                 modern_style: false,
                 enable_evdev_grab: true,
+                ..ConfigChange::default()
             },
             &[],
         );

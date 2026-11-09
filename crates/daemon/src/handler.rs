@@ -116,6 +116,8 @@ impl Daemon {
     ) -> Self {
         let initial_method = config.method;
         let initial_modern_style = config.modern_style;
+        let initial_auto_capitalize = config.auto_capitalize;
+        let initial_double_space_period = config.double_space_period;
         let initial_evdev_grab = config.enable_evdev_grab;
 
         Self {
@@ -127,6 +129,8 @@ impl Daemon {
             last_config: control::ConfigChange {
                 method: initial_method,
                 modern_style: initial_modern_style,
+                auto_capitalize: initial_auto_capitalize,
+                double_space_period: initial_double_space_period,
                 enable_evdev_grab: initial_evdev_grab,
             },
         }
@@ -197,6 +201,26 @@ impl Daemon {
                 tracing::info!(
                     modern_style = change.modern_style,
                     "config: modern_style changed at runtime"
+                );
+            }
+            if change.auto_capitalize != self.last_config.auto_capitalize {
+                self.config.auto_capitalize = change.auto_capitalize;
+                if let Some(c) = self.router.composer.as_mut() {
+                    c.set_auto_capitalize(change.auto_capitalize);
+                }
+                tracing::info!(
+                    auto_capitalize = change.auto_capitalize,
+                    "config: auto_capitalize changed at runtime"
+                );
+            }
+            if change.double_space_period != self.last_config.double_space_period {
+                self.config.double_space_period = change.double_space_period;
+                if let Some(c) = self.router.composer.as_mut() {
+                    c.set_double_space_period(change.double_space_period);
+                }
+                tracing::info!(
+                    double_space_period = change.double_space_period,
+                    "config: double_space_period changed at runtime"
                 );
             }
             self.last_config = change;
@@ -377,6 +401,8 @@ impl Daemon {
             self.config.bracket_shortcuts,
         );
         c.set_modern_style(self.config.modern_style);
+        c.set_auto_capitalize(self.config.auto_capitalize);
+        c.set_double_space_period(self.config.double_space_period);
         c.set_modifiers(self.router.modifiers);
         self.router.current_active = true;
         self.router.synthetic_active = true;
@@ -395,6 +421,8 @@ impl Daemon {
             self.config.bracket_shortcuts,
         );
         c.set_modern_style(self.config.modern_style);
+        c.set_auto_capitalize(self.config.auto_capitalize);
+        c.set_double_space_period(self.config.double_space_period);
         c.set_modifiers(self.router.modifiers);
         self.router.composer = Some(c);
         self.router.current_active = true;
@@ -1027,6 +1055,8 @@ mod tests {
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Vni,
                 modern_style: false,
+                auto_capitalize: true,
+                double_space_period: true,
                 enable_evdev_grab: false,
             });
             d.sync_config();
@@ -1040,6 +1070,8 @@ mod tests {
                 !d.config.modern_style,
                 "modern_style must flip from the same send"
             );
+            assert!(d.config.auto_capitalize);
+            assert!(d.config.double_space_period);
         }
 
         #[test]
@@ -1071,7 +1103,7 @@ mod tests {
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Telex,
                 modern_style: true,
-                enable_evdev_grab: false,
+                ..ConfigChange::default()
             });
             d.sync_config();
 
@@ -1099,12 +1131,12 @@ mod tests {
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Vni,
                 modern_style: true,
-                enable_evdev_grab: false,
+                ..ConfigChange::default()
             });
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Telex,
                 modern_style: false,
-                enable_evdev_grab: false,
+                ..ConfigChange::default()
             });
 
             d.sync_config();
@@ -1122,7 +1154,7 @@ mod tests {
             let (tx, rx) = watch::channel(ConfigChange {
                 method: MethodConfig::Telex,
                 modern_style: false,
-                enable_evdev_grab: false,
+                ..ConfigChange::default()
             });
             let cfg = Config {
                 modern_style: false,
@@ -1138,7 +1170,7 @@ mod tests {
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Vni,
                 modern_style: false,
-                enable_evdev_grab: false,
+                ..ConfigChange::default()
             });
             d.sync_config();
             assert_eq!(d.config.method, MethodConfig::Vni);
@@ -1189,7 +1221,7 @@ mod tests {
             let _ = tx.send(ConfigChange {
                 method: MethodConfig::Vni,
                 modern_style: true,
-                enable_evdev_grab: false,
+                ..ConfigChange::default()
             });
             d.sync_config();
 

@@ -157,7 +157,8 @@ keyboard glyph. While on, it shows the Daklak "Đk" badge coloured by the active
 backend: **green** for the native (Wayland/IBus) backend and **red** for the
 evdev grab backend. When built with `evdev_grab`, the tray also shows an
 "Enable evdev" / "Disable evdev" checkbox to switch between native and evdev
-backends at runtime.
+backends at runtime. The tray menu also provides toggles for tone placement,
+sentence auto-capitalization, and Gboard-style double-space period.
 
 ## Configuration
 
@@ -165,6 +166,22 @@ Configuration is loaded at startup (see [`crates/daemon/src/config.rs`](../crate
 Notable config-file options:
 
 - `DAKLAK_CONFIG=/path/to/file` — alternate config file path (same as `--config`).
+- `auto_capitalize = false` (`DAKLAK_AUTO_CAPITALIZE=1`) — capitalize the first
+  letter at the start of an empty field, after a newline, or after `.`, `!`, `?`
+  followed by whitespace. After a navigation/shortcut reset, Wayland may wait
+  for a client report proving where the typed letter landed before capitalizing
+  it. Editors that send their first surrounding-text frame only after typing
+  can also have that first word capitalized once the frame confirms it starts
+  the field (including an already composed word such as `bạn` → `Bạn`). A new
+  session alone is not evidence of an empty field. In ForwardKey-only
+  apps (such as terminals), capitalization uses locally typed sentence boundaries;
+  after focus/context loss or an idle reset it cannot infer the cursor position.
+- `double_space_period = false` (`DAKLAK_DOUBLE_SPACE_PERIOD=1`) — replace two
+  consecutive spaces typed within 400 ms after a word or number with `". "`.
+  Right after focusing a field (or whenever the context is not yet confirmed),
+  the next surrounding-text frame decides: if it shows the two spaces right
+  after a word or number within 1 s, they become `". "`. Typing another key
+  first cancels it.
 
 Notable logging options:
 

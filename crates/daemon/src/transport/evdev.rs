@@ -17,14 +17,36 @@ impl viet_ime_evdev_adapter::EvdevHandler for Daemon {
         if !self.sync_enabled_edge() {
             return KeyDecision::ForwardRaw;
         }
-        Daemon::handle_char(self, ch)
+        let decision = Daemon::handle_char(self, ch);
+        if let KeyDecision::Apply {
+            backspaces,
+            ref commit,
+            ..
+        } = decision
+        {
+            if let Some(w) = self.router.composer.as_mut() {
+                w.record_applied_edit(backspaces, commit);
+            }
+        }
+        decision
     }
 
     fn handle_backspace(&mut self) -> KeyDecision {
         if !self.sync_enabled_edge() {
             return KeyDecision::ForwardRaw;
         }
-        Daemon::handle_backspace(self)
+        let decision = Daemon::handle_backspace(self);
+        if let KeyDecision::Apply {
+            backspaces,
+            ref commit,
+            ..
+        } = decision
+        {
+            if let Some(w) = self.router.composer.as_mut() {
+                w.record_applied_edit(backspaces, commit);
+            }
+        }
+        decision
     }
 
     fn clear_session(&mut self) {

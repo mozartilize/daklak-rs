@@ -51,3 +51,12 @@ bracket_shortcuts = false
 # true (default) → oà, false → òa (legacy).
 # default: true
 modern_style = true
+
+# Automatically capitalize the first letter of a sentence (at the start of an
+# empty field, after a newline, or after . ! ? followed by whitespace).
+# default: false
+auto_capitalize = false
+
+# Replace two consecutive spaces typed quickly after a word/number with ". ".
+# default: false
+double_space_period = false

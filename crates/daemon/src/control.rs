@@ -27,6 +27,8 @@ impl ControlReply {
 pub struct ConfigChange {
     pub method: MethodConfig,
     pub modern_style: bool,
+    pub auto_capitalize: bool,
+    pub double_space_period: bool,
     pub enable_evdev_grab: bool,
 }
 
@@ -34,10 +36,13 @@ impl ConfigChange {
     /// True when nothing has changed from the given baseline.
     ///
     /// Only compares fields that `Daemon::sync_config()` acts on
-    /// (method, modern_style). `enable_evdev_grab` is persisted by the
-    /// tray but not applied by the handler.
+    /// (`method`, `modern_style`, `auto_capitalize`, `double_space_period`).
+    /// `enable_evdev_grab` is persisted by the tray but not applied by the handler.
     pub fn no_change_from(&self, other: &Self) -> bool {
-        self.method == other.method && self.modern_style == other.modern_style
+        self.method == other.method
+            && self.modern_style == other.modern_style
+            && self.auto_capitalize == other.auto_capitalize
+            && self.double_space_period == other.double_space_period
     }
 }
 
@@ -46,6 +51,8 @@ impl Default for ConfigChange {
         Self {
             method: MethodConfig::Telex,
             modern_style: true,
+            auto_capitalize: false,
+            double_space_period: false,
             enable_evdev_grab: false,
         }
     }
