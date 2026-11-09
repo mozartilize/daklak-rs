@@ -9,7 +9,6 @@ not re-litigate or add ad-hoc workarounds beyond what's described here.
 
 ## Contents
 
-- [GNOME / IBus ForwardKeyEvent fails in Mutter](#gnome--ibus-forwardkeyevent-fails-in-mutter)
 - [Terminals — forwarded-key routing](#terminals--forwarded-key-routing)
 - [KWin / gedit: delayed surrounding cursor updates](#kwin--gedit-delayed-surrounding-cursor-updates)
 - [Byte deletes are measured against the client's last report](#byte-deletes-are-measured-against-the-clients-last-report)
@@ -18,41 +17,6 @@ not re-litigate or add ad-hoc workarounds beyond what's described here.
 - [KWin: keysym on a still-held key](#kwin-keysym-on-a-still-held-key)
 - [KWin: Shift-level passthrough is typed as a keysym](#kwin-shift-level-passthrough-is-typed-as-a-keysym)
 - [Preedit rendering of forwarded keys](#preedit-rendering-of-forwarded-keys)
-
-## GNOME / IBus ForwardKeyEvent fails in Mutter
-
-**Behavior:** IBus exposes a `ForwardKeyEvent` signal and GNOME Shell forwards it
-into Clutter. In the current Mutter path, that forward-key handler builds a
-Clutter key event with a `NULL` source device; `clutter_event_key_new()` rejects
-that with `CLUTTER_IS_INPUT_DEVICE (source_device)`, so the event is not created
-and cannot reach native Wayland clients. The useful IBus/Mutter text-input
-channels are surrounding-text delete, commit text, and preedit. Mutter's
-text-input action channel only covers submit-style actions, not delete/backspace.
-
-**Diagnostic:** The failure appears in the user journal as:
-
-```text
-clutter_event_key_new: assertion 'CLUTTER_IS_INPUT_DEVICE (source_device)' failed
-```
-
-**Decision:** Default GNOME/IBus routing still prefers surrounding-text delete
-plus commit text when the client provides surrounding text. The blanket "no
-ForwardKey fallback on GNOME/IBus" rule above no longer holds: with the
-upstream Mutter ForwardKeyEvent fix and our `IBUS_FORWARD_MASK` on every
-forwarded BackSpace, real key events do reach native Wayland clients on GNOME.
-daklak may still downgrade to ForwardKey at runtime when surrounding-text proves
-non-functional (for example repeated empty frames or unechoed corrections).
-
-Implementation note: IBus surrounding-text echo tracking lives in
-`crates/daemon/src/quirks/ibus.rs`. It nudges the per-backspace decision toward
-ForwardKey when the previous correction was not echoed, capping downgrade rate
-at one per surrounding-text frame. The quirk has no engine or transport
-knowledge — it answers a single yes/no question.
-
-**Rejected alternatives:** Commit-only appends without deleting the old tail;
-preedit conflicts with daklak's direct-commit design; synthetic keyboard/device
-injection belongs to non-IBus transports such as evdev or future compositor-level
-input APIs, not the IBus engine path.
 
 ## Terminals — forwarded-key routing
 

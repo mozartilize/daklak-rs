@@ -171,8 +171,16 @@ Log out and back in if GNOME Settings still does not show Daklak.
 
 > **Compatibility note:** ForwardKey on IBus depends on the compositor/toolkit
 > honoring `ForwardKeyEvent` Backspace. daklak preserves signal ordering with a
-> barrier before the whole replacement `CommitText`; see
-> [Compositor quirks](compositor-quirks.md#gnome--ibus-forwardkeyevent-fails-in-mutter).
+> barrier before the whole replacement `CommitText`.
+
+Some IBus clients advertise surrounding text but silently ignore
+`DeleteSurroundingText` (Google Docs), so each correction's commit lands
+without the old text being deleted (`Tiếng` → `Tieêngếng`). Capability bits
+cannot tell them apart from working clients, but the echo can: a working client
+reports fresh surrounding text after every delete+commit. If a correction that
+deleted text gets no surrounding-text report before the next one, daklak
+switches that client to ForwardKey (real Backspaces). The check is in
+`crates/daemon/src/quirks/ibus.rs` and resets with the composition.
 
 ## evdev
 
