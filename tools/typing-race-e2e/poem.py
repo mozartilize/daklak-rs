@@ -259,7 +259,9 @@ def mut_diacritic_bs(word, clean, rng):
     lower = clean.lower()
     for mod in ("uwow", "aa", "ee", "oo", "aw", "ow", "uw"):
         idx = lower.find(mod)
-        if idx <= 0:
+        # A word may start with the modified vowel (`ước`, `ấy`); only a
+        # missing match skips this modifier.
+        if idx < 0:
             continue
         after_idx = idx + len(mod)
         tail = clean[after_idx:]
@@ -301,8 +303,15 @@ def mut_char_bs(word, clean, rng):
     pos = len(clean) - 2 if clean[-1] in WRONG_TONES and len(clean) >= 3 else len(clean) - 1
     ch = clean[pos].lower()
     wrong = NEIGHBOR_KEYS.get(ch, "k")
-    # Not a Telex modifier/tone key (`s f r x j w`), and not a doubled vowel.
-    if wrong in "sfrxjw" or (pos > 0 and wrong == clean[pos - 1].lower()):
+    # Not a Telex modifier/tone key (`s f r x j w`), not a doubled letter,
+    # and not `a`/`e`/`o`/`d` when the word already has that letter: Telex
+    # reads it as a modifier on it (`lơ` + `o` is `lô`), so one Backspace
+    # would not undo it.
+    if (
+        wrong in "sfrxjw"
+        or (pos > 0 and wrong == clean[pos - 1].lower())
+        or (wrong in "aeod" and wrong in lower[:pos])
+    ):
         wrong = "k"
     seq = clean[:pos] + wrong + "{BS}" + clean[pos:]
     return seq, f"char_bs({word}: {wrong}{{BS}}{clean[pos:]})"

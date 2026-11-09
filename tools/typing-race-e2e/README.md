@@ -192,9 +192,11 @@ tools/typing-race-e2e/run.py -t firefox --field prosemirror -p steady \
   'anwwser{L}{L}{L}{BS}{R}ww' -e 'answer'
 ```
 
-### Poem with realistic mistake corrections (`poem.py`)
+### Poem and short story with realistic mistake corrections (`poem.py`, `story.py`)
 
-`poem.py` types a 26-line Vietnamese poem into any target, injecting mistakes
+`poem.py` types a 26-line Vietnamese poem ("Đánh cho Mỹ cút Ngụy nhào" — Bùi Giáng)
+and `story.py` types a 21-line short story ("Tôi đi học" — Thanh Tịnh) into any
+target, injecting mistakes
 and corrections at `--rate` (default `0.12`, ~12% of words): tone-mark
 overrides (`Ddanhfs` → `Đánh`), missed vowel modifiers fixed with Backspace
 (`nuoc{BS}{BS}wowcs` → `nước`), spillover/consonant typos deleted with
@@ -204,10 +206,13 @@ Ctrl+Backspace (`Myr{CBS}Myx` → `Mỹ`), and cursor-move edits (`{L}{BS}{R}`).
 ```sh
 # inspect the generated Telex + corrections without launching a window
 tools/typing-race-e2e/poem.py --dry-run
-# run all 26 lines into Firefox ProseMirror with rollover timing
+tools/typing-race-e2e/story.py --dry-run
+# run all 26 poem lines or 21 story paragraphs into Firefox ProseMirror
 tools/typing-race-e2e/poem.py -t firefox --field prosemirror -p rollover --seed 42
-# replay a single poem line
+tools/typing-race-e2e/story.py -t firefox --field prosemirror -p rollover --seed 42
+# replay a single line
 tools/typing-race-e2e/poem.py -t firefox --field prosemirror --seed 42 --line 16
+tools/typing-race-e2e/story.py -t firefox --field prosemirror --seed 42 --line 6
 ```
 
 Terminals keep echo on: on KWin, foot and kitty first look like
