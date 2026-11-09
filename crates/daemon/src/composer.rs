@@ -256,6 +256,11 @@ pub struct Composer {
     /// Wayland drains frame-triggered repairs; IBus keeps immediate edits.
     confirm_retroactive_edits: bool,
 
+    /// Whether to route supported IM-v2 replacements through virtual keyboard
+    /// keys rather than text commits, avoiding wlroots serial-mismatch drops.
+    /// Opt-in, default false. Controlled by `Config::v2_key_replacement`.
+    v2_key_replacement: bool,
+
     /// Complete client-frame confirmation state. Keeping provenance, raw key,
     /// repairability, and speculative engine edit in one enum prevents invalid
     /// combinations of independent flags.
@@ -511,6 +516,7 @@ impl Composer {
             previous_client_report: None,
             bracket_shortcuts,
             confirm_retroactive_edits: false,
+            v2_key_replacement: false,
             confirmation: ConfirmationState::Live,
             typed_word: Some(String::new()),
             keys_since_reset: false,
@@ -637,6 +643,11 @@ impl Composer {
     /// Toggle modern-style tone placement. `false` = legacy `òa` instead of `oà`.
     pub fn set_modern_style(&mut self, enabled: bool) {
         self.engine.set_modern_style(enabled);
+    }
+
+    /// Opt in to virtual-keyboard replacement routing for IM-v2 sessions.
+    pub fn set_v2_key_replacement(&mut self, enabled: bool) {
+        self.v2_key_replacement = enabled;
     }
 
     // ── lifecycle ─────────────────────────────────────────────────────────
@@ -926,7 +937,8 @@ impl Composer {
             && self.client_report.as_ref().is_some_and(|(text, cursor)| {
                 !client_byte_delete_agrees(text_before_cursor(text, *cursor), &before, backspaces)
             });
-        let used_forward_key = client_view_disagrees;
+        let used_forward_key = client_view_disagrees
+            || (self.v2_key_replacement && sink.prefer_key_channel_replacement(commit));
         tracing::trace!(
             used_forward_key,
             client_view_disagrees,
@@ -1620,6 +1632,9 @@ mod tests {
         deletes: Vec<(u32, u32, u32, u32)>,
         vk_keys: Vec<(u32, u32, KeyState)>,
         commits: Vec<String>,
+        key_text: Option<String>,
+        key_commits: Vec<String>,
+        serials: Vec<u32>,
     }
 
     impl OutputSink for DeleteCaptureSink {
@@ -1638,7 +1653,27 @@ mod tests {
             self.commits.push(text.to_owned());
         }
 
-        fn commit(&mut self, _serial: u32) {}
+        fn commit(&mut self, serial: u32) {
+            self.serials.push(serial);
+        }
+
+        fn prefer_key_channel_replacement(&self, text: &str) -> bool {
+            self.key_text.as_deref() == Some(text)
+        }
+
+        fn commit_key_channel_text(&mut self, _serial: u32, _time: u32, text: &str) -> bool {
+            if !self.prefer_key_channel_replacement(text) {
+                return false;
+            }
+            // Every deletion key must already be sent before insertion.
+            assert!(
+                self.vk_keys.len().is_multiple_of(2)
+                    && self.vk_keys.iter().all(|&(_, key, _)| key == 14),
+                "delete must precede insertion"
+            );
+            self.key_commits.push(text.to_owned());
+            true
+        }
 
         fn vk_key(&mut self, time: u32, key_code: u32, state: KeyState) {
             self.vk_keys.push((time, key_code, state));
@@ -1696,6 +1731,80 @@ mod tests {
             };
             assert_eq!((backspaces, commit.as_str()), (1, "á"));
         }
+    }
+
+    #[test]
+    fn preferred_key_replacement_keeps_surrounding_tier_and_avoids_serial() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        c.set_v2_key_replacement(true);
+        for ch in "minh".chars() { c.feed_key(ch); }
+        let mut sink = DeleteCaptureSink {
+            key_text: Some("ình".into()), ..Default::default()
+        };
+        c.apply_to_sink(3, "ình", 41, 7, &mut sink);
+        assert_eq!(sink.vk_keys, vec![
+            (7, 14, KeyState::Pressed), (7, 14, KeyState::Released),
+            (7, 14, KeyState::Pressed), (7, 14, KeyState::Released),
+            (7, 14, KeyState::Pressed), (7, 14, KeyState::Released),
+        ]);
+        assert_eq!(sink.key_commits, ["ình"]);
+        assert!(sink.deletes.is_empty());
+        assert!(sink.commits.is_empty());
+        assert!(sink.serials.is_empty());
+        assert_eq!(c.method(), BackspaceMethod::SurroundingText);
+    }
+
+    #[test]
+    fn key_replacement_clears_selection_before_engine_characters() {
+        // Four chars selected after caret versus one before: each needs one
+        // selection Backspace plus two engine Backspaces, never byte counts.
+        for (text, cursor, anchor) in [("abcWXYZ", 3, 7), ("abcQ", 4, 3)] {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            c.set_v2_key_replacement(true);
+            c.edit.strategy.shadow.observe_surrounding(text, cursor, anchor);
+            let mut sink = DeleteCaptureSink {
+                key_text: Some("ình".into()), ..Default::default()
+            };
+            c.apply_to_sink(2, "ình", 41, 7, &mut sink);
+            assert_eq!(sink.vk_keys.len(), 6);
+            assert_eq!(sink.key_commits, ["ình"]);
+            assert_eq!(c.edit.shadow_text(), "aình");
+            assert!(!c.edit.strategy.shadow.has_selection());
+            assert!(sink.commits.is_empty());
+            assert!(sink.serials.is_empty());
+        }
+    }
+
+    #[test]
+    fn default_v2_key_replacement_is_off_and_uses_text_channel() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        for ch in "minh".chars() { c.feed_key(ch); }
+        let mut sink = DeleteCaptureSink {
+            key_text: Some("ình".into()), ..Default::default()
+        };
+        // By default, v2_key_replacement is false, so prefer_key_channel_replacement is ignored.
+        c.apply_to_sink(3, "ình", 41, 7, &mut sink);
+        assert!(sink.vk_keys.is_empty(), "must not emit virtual keys when flag is false");
+        assert!(sink.key_commits.is_empty());
+        assert_eq!(sink.deletes, [(3, 3, 0, 0)]);
+        assert_eq!(sink.commits, ["ình"]);
+        assert_eq!(sink.serials, [41]);
+    }
+
+    #[test]
+    fn unsupported_key_replacement_does_not_delete_via_keys() {
+        let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+        c.set_v2_key_replacement(true);
+        for ch in "minh".chars() { c.feed_key(ch); }
+        let mut sink = DeleteCaptureSink {
+            key_text: Some("ình".into()), ..Default::default()
+        };
+        c.apply_to_sink(3, "ình🙂", 41, 7, &mut sink);
+        assert!(sink.vk_keys.is_empty());
+        assert!(sink.key_commits.is_empty());
+        assert_eq!(sink.deletes, [(3, 3, 0, 0)]);
+        assert_eq!(sink.commits, ["ình🙂"]);
+        assert_eq!(sink.serials, [41]);
     }
 
     /// A text-input-v3 client modelled on GTK's im-wayland module: a byte

@@ -107,6 +107,13 @@ pub trait OutputSink {
         false
     }
 
+    /// Prefer key deletion + insertion over text edits for this replacement.
+    /// Must preflight the entire string without emitting anything. Returning
+    /// true guarantees `commit_key_channel_text` supports the whole string.
+    fn prefer_key_channel_replacement(&self, _text: &str) -> bool {
+        false
+    }
+
     /// Emit `text` as a single whole-replacement through the backend's key
     /// channel (keysym for KWin IMv1, VK synthetic keymap for IMv2+VK).
     /// Returns `true` if the whole text was emitted; `false` if the backend

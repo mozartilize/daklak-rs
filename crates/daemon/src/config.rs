@@ -72,6 +72,13 @@ pub struct Config {
     #[serde(default = "default_modern_style")]
     pub modern_style: bool,
 
+    /// On Wayland input-method-v2 (e.g. wlroots/sway/scroll), route supported
+    /// replacements through virtual keyboard keys rather than text commits,
+    /// avoiding compositor-side serial-mismatch drops during fast typing.
+    /// Default false. Env override `DAKLAK_V2_KEY_REPLACEMENT` (truthy heuristic).
+    #[serde(default)]
+    pub v2_key_replacement: bool,
+
     /// Ordered evdev keymap hook names. Each name resolves to a
     /// `<name>-set` / `<name>-unset` script pair, searched at runtime in:
     /// `$XDG_CONFIG_HOME/daklak/hooks` (user overrides), then
@@ -109,6 +116,7 @@ impl Default for Config {
             ibus_requested: false,
             evdev_grab_hooks: Vec::new(),
             modern_style: default_modern_style(),
+            v2_key_replacement: false,
             config_path: None,
         }
     }
@@ -183,6 +191,13 @@ impl Config {
 
         if let Ok(v) = std::env::var("DAKLAK_MODERN_STYLE") {
             cfg.modern_style = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Ok(v) = std::env::var("DAKLAK_V2_KEY_REPLACEMENT") {
+            cfg.v2_key_replacement = matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );
@@ -321,6 +336,17 @@ log_path = "/tmp/daklak.log"
         )
         .unwrap();
         assert_eq!(cfg.evdev_grab_hooks, vec!["sway", "kde", "x11"]);
+    }
+
+    #[test]
+    fn v2_key_replacement_defaults_false_and_can_be_configured() {
+        assert!(!Config::default().v2_key_replacement);
+
+        let cfg: Config = toml::from_str("v2_key_replacement = true").unwrap();
+        assert!(cfg.v2_key_replacement);
+
+        let cfg: Config = toml::from_str("v2_key_replacement = false").unwrap();
+        assert!(!cfg.v2_key_replacement);
     }
 
     #[test]

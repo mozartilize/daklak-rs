@@ -33,6 +33,13 @@ fn v1_replacement_route(_text: &str, _commit_string_functional: bool) -> V1Repla
     V1ReplacementRoute::WholeKeysym
 }
 
+// V2 serial checks can discard an edit when a client update overtakes it.
+// Preflight before deleting: never mix key deletion with text insertion here.
+fn prefer_v2_key_replacement(is_v2: bool, has_synthetic_keyboard: bool, text: &str) -> bool {
+    is_v2 && has_synthetic_keyboard
+        && text.chars().all(|ch| viet_ime_keymap::char_to_emit(ch).is_some())
+}
+
 fn v1_keysym_needs_modifier_guard(
     is_unmapped: bool,
     commit_string_functional: bool,
@@ -131,6 +138,14 @@ pub struct AdapterSink<'a> {
 }
 
 impl OutputSink for AdapterSink<'_> {
+    fn prefer_key_channel_replacement(&self, text: &str) -> bool {
+        prefer_v2_key_replacement(
+            matches!(&self.text_ops, TextOpsTarget::V2 { .. }),
+            self.synth_keymap_emitter.is_some(),
+            text,
+        )
+    }
+
     fn delete_surrounding_text(
         &mut self,
         before_bytes: u32,
@@ -419,6 +434,18 @@ impl AdapterSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_key_replacement_requires_the_whole_inventory_and_backend() {
+        assert!(prefer_v2_key_replacement(true, true, "ình"));
+        assert!(prefer_v2_key_replacement(true, true, "ĐạA"));
+        assert!(prefer_v2_key_replacement(true, true, "")); // deletion only
+        assert!(!prefer_v2_key_replacement(false, true, "ình"));
+        assert!(!prefer_v2_key_replacement(true, false, "ình"));
+        // Supported prefixes must not permit a partial key-channel edit.
+        assert!(!prefer_v2_key_replacement(true, true, "ình🙂"));
+        assert!(!prefer_v2_key_replacement(true, true, "a\u{0301}"));
+    }
 
     #[test]
     fn v1_mapped_keysym_under_depressed_modifier_needs_modifier_guard() {

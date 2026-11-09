@@ -45,6 +45,7 @@ impl AdapterHandler for Daemon {
                 self.config.bracket_shortcuts,
             );
             c.set_modern_style(self.config.modern_style);
+            c.set_v2_key_replacement(self.config.v2_key_replacement);
             // Cursor-relative retroactive edits are confirmed by the client
             // frame containing the raw key at its actual insertion point.
             // Wayland-only: IBus cannot drain frame-triggered repairs here.
@@ -382,6 +383,7 @@ impl AdapterHandler for Daemon {
                 self.config.bracket_shortcuts,
             );
             c.set_modern_style(self.config.modern_style);
+            c.set_v2_key_replacement(self.config.v2_key_replacement);
             c.set_modifiers(self.router.modifiers);
             // No text-input session exists for this client, so commit_string is
             // dead. Force ForwardKey to route replacements through the virtual

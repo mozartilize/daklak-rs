@@ -9,6 +9,7 @@ not re-litigate or add ad-hoc workarounds beyond what's described here.
 
 ## Contents
 
+- [IM-v2: serial-sensitive replacements](#im-v2-serial-sensitive-replacements)
 - [Terminals — forwarded-key routing](#terminals--forwarded-key-routing)
 - [KWin / gedit: delayed surrounding cursor updates](#kwin--gedit-delayed-surrounding-cursor-updates)
 - [Byte deletes are measured against the client's last report](#byte-deletes-are-measured-against-the-clients-last-report)
@@ -17,6 +18,38 @@ not re-litigate or add ad-hoc workarounds beyond what's described here.
 - [KWin: keysym on a still-held key](#kwin-keysym-on-a-still-held-key)
 - [KWin: Shift-level passthrough is typed as a keysym](#kwin-shift-level-passthrough-is-typed-as-a-keysym)
 - [Preedit rendering of forwarded keys](#preedit-rendering-of-forwarded-keys)
+
+## IM-v2: serial-sensitive replacements
+
+The wlroots input-method-v2 implementation can discard a pending edit when
+`commit(serial)` carries an older serial than its current `done` count. Even a
+cursor-rectangle-only update from the application can advance that count while
+a correction is in flight. Reading the latest available events before sending
+an edit cannot eliminate this cross-client race.
+
+**Opt-in configuration:** Disabled by default. Enable with `v2_key_replacement = true`
+in `config.toml` (or `DAKLAK_V2_KEY_REPLACEMENT=1`). Both are read at startup,
+so restart daklak after changing them.
+
+**Behavior when enabled:** On IM-v2, when a synthetic keyboard is available and
+the entire replacement is in daklak's synthetic keymap, emit Backspaces and
+replacement characters through the virtual keyboard. Preflight the whole string
+before any Backspace. This changes the output route, not the `SurroundingText`
+tier: surrounding-text observation and its idle/composition policy remain active.
+Like every key delete, it first clears a reported selection with one Backspace
+(see [Backspace tiers](backspace-tiers.md#the-shadow-buffer)).
+
+When the flag is false (the default), daklak uses the standard `input-method-v2`
+text commit route. IM-v1 and IBus never use this route regardless of the flag.
+Unsupported replacement strings or unavailable synthetic keyboards also retain
+the previous routing; this does not eliminate serial-related losses on that
+fallback path. Key emission retains its existing modifier guards and held-key
+handling. It is not an atomic edit transaction and does not guarantee
+application-specific undo grouping.
+
+Implementation: `Config::v2_key_replacement`,
+`AdapterSink::prefer_key_channel_replacement`,
+`Composer::apply_to_sink_inner`, and `edit-strategy/src/forward_key.rs`.
 
 ## Terminals — forwarded-key routing
 
