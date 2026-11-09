@@ -186,10 +186,14 @@ impl EngineState {
         let vnkey_restored =
             result.consumed && self.word == self.word_raw && self.word != format!("{before}{ch}");
         if !vnkey_restored && self.word.chars().count() <= MAX_WORD_CHARS {
-            return match self.screen_word.take() {
-                Some(screen) => replace_word(&screen, &self.word, ch),
-                None => result,
-            };
+            match self.screen_word.take() {
+                // The key undid a diacritic only vnkey had (`af` seeded as
+                // `à`, then `f`): the raw letters on screen must not shrink.
+                // Keep them and append the key, like a restore.
+                Some(screen) if self.word.is_ascii() => self.screen_word = Some(screen),
+                Some(screen) => return replace_word(&screen, &self.word, ch),
+                None => return result,
+            }
         }
         // Not Vietnamese (vnkey restored it, or it is longer than any
         // Vietnamese word): put back keys reproducing the word as it was on
@@ -197,8 +201,11 @@ impl EngineState {
         // escapes (`corrr` shows `corr`, so `correct` + `i` is `correcti`)
         // and replaced tones (`hanhjf` shows `hành`, so `p` gives `hanhfp`).
         // Then stop composing until the word ends.
-        let raw = format!("{}{ch}", self.raw_form(&before));
         let screen = self.screen_word.take().unwrap_or(before);
+        // Spell the screen from the keys typed before this one: matching the
+        // new key too lets it stand in for an earlier letter (`bòa` + `a`).
+        self.word_raw.pop();
+        let raw = format!("{}{ch}", self.raw_form(&screen));
         self.word_raw.clear();
         self.engine.reset();
         self.word.clear();
@@ -284,8 +291,10 @@ impl EngineState {
     /// while shorthands survive (`sưi` typed as `swi` is `swi`). Unlike
     /// `keys_for`, the result need not re-type `text` in this method.
     fn raw_form(&self, text: &str) -> String {
+        // No glyph-by-glyph spelling is in typed order (`âc` typed `aca`):
+        // the typed keys are, so never reorder them into canonical keys.
         self.typed_spelling(text)
-            .unwrap_or_else(|| self.keys_for(text))
+            .unwrap_or_else(|| self.word_raw.clone())
     }
 
     /// `text` spelled glyph by glyph as the user could have typed it: a
@@ -413,7 +422,11 @@ impl EngineState {
         }
         if !word.is_empty() && word.chars().all(|ch| ch.is_ascii_alphabetic()) {
             let screen = self.render(word);
-            if self.seed(word, screen) {
+            // This fallback recovers composed Vietnamese (`thoong` -> `thông`),
+            // not an escape replay that only removes literal letters (`surr`
+            // -> `sur`). Such a seed would silently eat the last r on the
+            // next key even though the screen still contains both r's.
+            if !screen.is_ascii() && self.seed(word, screen) {
                 self.screen_word = Some(word.to_owned());
                 return true;
             }
@@ -821,6 +834,36 @@ mod tests {
                 (2, "én"),
                 "modern={modern}"
             );
+        }
+    }
+
+    #[test]
+    fn reseed_after_delete_does_not_replay_literal_escapes() {
+        for word in ["surr", "Surr", "SURR"] {
+            let mut eng = EngineState::new(InputMethod::Telex);
+            assert!(!eng.reseed_after_delete(word));
+            for ch in "os".chars() {
+                assert!(!eng.process_key(ch).consumed, "{word} + {ch}");
+            }
+            // Only this unreproducible raw word is passed through.
+            eng.process_key(' ');
+            assert_eq!(type_str(&mut eng, "as"), "á");
+        }
+    }
+
+    #[test]
+    fn restoring_english_keeps_typed_letter_order() {
+        // Each word restores to exactly its typed keys. Before the fix the
+        // glyph-order spelling reordered them (`academy` -> `aacdemy`: the
+        // `â` of `aca` was spelled `aa`), and the restored key itself
+        // stood in for an earlier letter (legacy `boà`/`bòa` + `a` ->
+        // `bofaa`).
+        for word in ["academy", "acacia", "airing", "boafa"] {
+            for modern in [true, false] {
+                let mut eng = EngineState::new(InputMethod::Telex);
+                eng.set_modern_style(modern);
+                assert_eq!(type_str(&mut eng, word), word, "modern={modern}");
+            }
         }
     }
 

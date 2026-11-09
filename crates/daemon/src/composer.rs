@@ -4746,6 +4746,35 @@ mod tests {
     }
 
     #[test]
+    fn backspace_after_voided_tone_keeps_visible_raw_letters() {
+        // After deleting into raw letters, the next key may compose them like
+        // fresh typing, but must never delete or reorder a visible letter.
+        let cases = [
+            // A voided modifier (`rr`, `ss`) next to a live diacritic (`uw`).
+            ("surrruo<<o", "surro"),
+            ("suwrrruo<<o", "suwrro"),
+            ("suwsssuo<<o", "suwsso"),
+            // The key undoes a tone only vnkey saw (`af` seeded as `à`).
+            ("affa<f", "aff"),
+            ("affnh<f", "afnf"),
+            // A restore spells the screen, not vnkey's `boà`/`bòa`.
+            ("boaffa<a", "boafa"),
+            // Raw letters still compose like fresh typing.
+            ("thoongh<s", "thống"),
+            ("doesnt<<n", "doén"),
+        ];
+        for method in [BackspaceMethod::SurroundingText, BackspaceMethod::ForwardKey] {
+            for modern in [true, false] {
+                for (keys, want) in cases {
+                    let mut c = Composer::new(InputMethod::Telex, method, false);
+                    c.set_modern_style(modern);
+                    assert_eq!(type_echoed(&mut c, "", keys), want, "{keys} {method:?} modern={modern}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn deleting_into_an_unreproducible_word_does_not_compose_a_fragment() {
         // `doesn` (raw on screen) cannot be reproduced by Telex keys, so the
         // keys typed after deleting into it stay raw instead of composing a

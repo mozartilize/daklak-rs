@@ -135,9 +135,15 @@ typed, even when they do not reproduce themselves (`thoongh` minus `h` leaves
 next key acts as if they had just been typed: its result is written over the
 raw letters (`thoong` + `s` → `thống`, `goon` + `g` → `gông`). Until then the
 screen keeps the raw letters, and a further backspace is left to the app rather
-than to vnkey, whose own backspace would edit its composed word. A word that is
-not raw letters and does not round-trip passes keys through unchanged until the
-next word break, so no new syllable starts mid-word.
+than to vnkey, whose own backspace would edit its composed word. This fallback
+requires a Vietnamese rendering, not an ASCII-only escape reduction: `surr`
+would replay as `sur`, silently deleting a literal `r` on the next key. Such
+words, and non-raw words that do not round-trip, pass keys through unchanged
+until the next word break, so no new syllable starts mid-word. The next key
+never shrinks the raw letters either: a key that only undoes a diacritic vnkey
+saw but the screen never showed (`af`, seeded as `à`, then `f`) is appended
+(`aff`), and a restore spells the raw letters on screen, not vnkey's rendering
+(`suwrr` + `o` is `suwrro`, not `suwro`).
 
 Reconstructed keys follow the user's own spelling when it retypes the word:
 shorthands survive (`ửo` typed as `wor`), and the tone key goes where it was
@@ -257,7 +263,11 @@ word **as it was on screen**, plus the new key, then passes keys through
 unchanged until vnkey's next word break. Each glyph is spelled as the user
 could have typed it (`ư` as `uw`, `w` or `u`; a tone key either last or right
 after the glyph's first letter, so `ể` is `eer` or `ere`), choosing the first
-spelling that is a subsequence of the keys actually typed. Kept keys stay in
+spelling that is a subsequence of the keys typed before the new one (the new
+key must not stand in for an earlier letter: legacy-style `bòa` + `a` gives
+`boafa`, not `bofaa`). When no glyph-by-glyph spelling is in typed order
+(`âc` typed `aca`), the typed keys are kept as they are (`academy` stays
+`academy`, not `aacdemy`). Kept keys stay in
 the order typed (`here` showed `hể`, and `a` gives `herea`), and undone keys
 never come back: `corrrect` showed `correct`, and `i` gives `correcti`, not
 `corrrecti`;
