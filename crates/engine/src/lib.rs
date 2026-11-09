@@ -572,6 +572,22 @@ fn spelling_groups(
                 }
             }
         }
+        // The tone key may also be typed before the glyph's other keys, right
+        // after its first letter (`ể` as `ere`, `ớ` as `osw`).
+        if !ch.is_ascii() {
+            for spelling in spellings.clone() {
+                let keys: Vec<char> = spelling.chars().collect();
+                let Some((&tone, letters)) = keys.split_last() else { continue };
+                if letters.len() < 2 || !is_tone_key(tone, method) {
+                    continue;
+                }
+                for at in 1..letters.len() {
+                    let mut moved = letters.to_vec();
+                    moved.insert(at, tone);
+                    spellings.push(moved.into_iter().collect());
+                }
+            }
+        }
         groups.push(spellings);
     }
     flush(&mut groups, w, tone);
@@ -745,6 +761,16 @@ mod tests {
             // Nothing undone: every key typed comes back as before.
             ("tuwjd", "tuwjd"),
             ("doesnt", "doesnt"),
+            // Tone typed inside the vowel's keys (`here` shows `hể`,
+            // `osw` shows `ớ`): typed order is kept, not `heer`/`owsw`.
+            ("herea", "herea"),
+            ("therea", "therea"),
+            ("Herea", "Herea"),
+            ("asak", "asak"),
+            ("loswk", "loswk"),
+            // Undone keys are still dropped around such a tone.
+            ("asasa", "aasa"),
+            ("sixsxi", "sixi"),
         ] {
             let mut eng = EngineState::new(InputMethod::Telex);
             assert_eq!(type_str(&mut eng, keys), expected, "{keys}");

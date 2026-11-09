@@ -255,9 +255,12 @@ the longest Vietnamese word (`nghiêng`; corrections such as a changed tone do
 not count against it). Either way the wrapper writes the raw letters of the
 word **as it was on screen**, plus the new key, then passes keys through
 unchanged until vnkey's next word break. Each glyph is spelled as the user
-could have typed it (`ư` as `uw`, `w` or `u`), choosing the first spelling
-that is a subsequence of the keys actually typed. So undone keys never come
-back: `corrrect` showed `correct`, and `i` gives `correcti`, not `corrrecti`;
+could have typed it (`ư` as `uw`, `w` or `u`; a tone key either last or right
+after the glyph's first letter, so `ể` is `eer` or `ere`), choosing the first
+spelling that is a subsequence of the keys actually typed. Kept keys stay in
+the order typed (`here` showed `hể`, and `a` gives `herea`), and undone keys
+never come back: `corrrect` showed `correct`, and `i` gives `correcti`, not
+`corrrecti`;
 `hanhjf` showed `hành`, and `p` gives `hanhfp`. vnkey's own restore would put
 back its whole key history. Seeding a word longer than the cap passes keys
 through the same way. Separately, one word may
