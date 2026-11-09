@@ -61,12 +61,23 @@ impl EditModel {
         self.strategy.shadow.text()
     }
 
+    /// A forwarded char replaces any selection; the shadow already excludes it.
     fn push_forwarded_char(&mut self, ch: char) {
         self.strategy.shadow.text_mut().push(ch);
+        self.strategy.shadow.clear_selection();
     }
 
     fn pop_forwarded_char(&mut self) {
         self.strategy.shadow.text_mut().pop();
+    }
+
+    /// A forwarded Backspace deletes only the selection when there is one.
+    fn forward_backspace(&mut self) {
+        if self.strategy.shadow.has_selection() {
+            self.strategy.shadow.clear_selection();
+        } else {
+            self.pop_forwarded_char();
+        }
     }
 
     fn on_surrounding_text(&mut self, text: &str, cursor: u32, anchor: u32) {
@@ -844,7 +855,7 @@ impl Composer {
         } else {
             tracing::trace!("BS not consumed → forward");
             self.remember_shadow();
-            self.edit.pop_forwarded_char();
+            self.edit.forward_backspace();
             // vnkey only shortened its key history, which can no longer match
             // the screen: after a non-Vietnamese restore it stays
             // non-composable (`hanhjph` minus `jph`, then `j`, stays raw), and
@@ -1637,6 +1648,53 @@ mod tests {
 
         fn vk_commit_char(&mut self, _time: u32, _ch: char) -> bool {
             false
+        }
+    }
+
+    #[test]
+    fn raw_key_that_replaces_a_selection_clears_it() {
+        // `b` + three selected chars on either side of the caret; `a` replaces
+        // them, so `s` must delete exactly one char (`ba` -> `bá`).
+        for (cursor, anchor) in [(1, 4), (4, 1)] {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            assert!(matches!(c.feed_key('b'), KeyDecision::ForwardRaw));
+            c.observe_surrounding_bytes("bXYZ", ByteCursor(cursor), ByteCursor(anchor), false);
+            assert!(matches!(c.feed_key('a'), KeyDecision::ForwardRaw));
+            assert_eq!(c.edit.shadow_text(), "ba");
+            assert!(!c.edit.strategy.shadow.has_selection());
+            let KeyDecision::Apply { backspaces, commit, .. } = c.feed_key('s') else {
+                panic!("`s` must compose");
+            };
+            assert_eq!((backspaces, commit.as_str()), (1, "á"));
+            let mut sink = DeleteCaptureSink::default();
+            c.apply_to_sink(backspaces, &commit, 41, 7, &mut sink);
+            let key_deletes = sink
+                .vk_keys
+                .iter()
+                .filter(|&&(_, key, state)| key == 14 && state == KeyState::Pressed)
+                .count() as u32;
+            let byte_deletes: u32 = sink.deletes.iter().map(|d| d.1 + d.3).sum();
+            assert_eq!(key_deletes + byte_deletes, 1, "only the `a` is replaced");
+            assert_eq!(c.edit.shadow_text(), "bá");
+        }
+    }
+
+    #[test]
+    fn raw_backspace_on_a_selection_keeps_the_word() {
+        // The Backspace deletes `XYZ` only; `ba` stays and `s` composes it.
+        for (cursor, anchor) in [(2, 5), (5, 2)] {
+            let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+            for ch in "ba".chars() {
+                assert!(matches!(c.feed_key(ch), KeyDecision::ForwardRaw));
+            }
+            c.observe_surrounding_bytes("baXYZ", ByteCursor(cursor), ByteCursor(anchor), false);
+            assert!(matches!(c.feed_backspace(), KeyDecision::ForwardRaw));
+            assert_eq!(c.edit.shadow_text(), "ba");
+            assert!(!c.edit.strategy.shadow.has_selection());
+            let KeyDecision::Apply { backspaces, commit, .. } = c.feed_key('s') else {
+                panic!("`s` must compose");
+            };
+            assert_eq!((backspaces, commit.as_str()), (1, "á"));
         }
     }
 

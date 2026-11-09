@@ -62,6 +62,17 @@ impl ShadowBuffer {
         (byte_count, char_count)
     }
 
+    pub fn has_selection(&self) -> bool {
+        self.selected_before_chars > 0 || self.selected_after_chars > 0
+    }
+
+    /// The shadow already excludes selected text in either direction.
+    pub fn clear_selection(&mut self) {
+        self.selected_before_chars = 0;
+        self.selected_after_bytes = 0;
+        self.selected_after_chars = 0;
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.last_cursor = None;

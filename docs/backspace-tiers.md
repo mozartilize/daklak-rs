@@ -101,6 +101,12 @@ continuously revalidate that confirmation. The trust-and-reseed decision
 is isolated in the `SurroundingObserver`
 (see [Architecture](architecture.md#crate-responsibilities)).
 
+A selection reported by the last surrounding frame is not part of the shadow.
+When daklak deletes with Backspace keys, the first Backspace clears the
+selection, whatever its length or direction, and the rest delete the engine's
+characters. A forwarded key or Backspace consumes the selection, so it is
+forgotten then; a forwarded Backspace on a selection keeps the shadow's text.
+
 > **Re-seed gate caution:** navigation and shortcut keys must *not* count as
 > composing activity, or they block legitimate mid-word reseeds. This is a
 > recurring footgun when editing the composer.

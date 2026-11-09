@@ -20,7 +20,11 @@ pub fn apply(
 ) {
     tracing::debug!(bs = backspaces, commit = %commit, serial,
         "forward_key tier: emit vk_key BS + commit_string");
-    for _ in 0..backspaces {
+    // The first Backspace clears a selection, not an engine character.
+    let key_deletes = backspaces + usize::from(shadow.has_selection());
+    shadow.pop_chars(backspaces);
+    shadow.clear_selection();
+    for _ in 0..key_deletes {
         sink.vk_key(time, KEY_BACKSPACE, KeyState::Pressed);
         sink.vk_key(time, KEY_BACKSPACE, KeyState::Released);
     }
@@ -41,11 +45,6 @@ pub fn apply(
         sink.commit(serial);
     }
 
-    // Shadow tracks char-level view (used by cursor-delta detection).
-    // We don't know what the app deleted — pop by char count.
-    for _ in 0..backspaces {
-        shadow.text_mut().pop();
-    }
     shadow.append(commit);
     shadow.pending_commit = true;
 }

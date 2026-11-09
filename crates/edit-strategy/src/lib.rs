@@ -504,6 +504,27 @@ mod tests {
     }
 
     #[test]
+    fn forward_key_clears_a_selection_before_engine_deletes() {
+        // Four chars selected after the caret, or one before it: either way
+        // one Backspace clears the selection, then two delete `bc`.
+        for (text, cursor, anchor) in [("abcWXYZ", 3, 7), ("abcQ", 4, 3)] {
+            let mut shadow = ShadowBuffer::new();
+            shadow.observe_surrounding(text, cursor, anchor);
+            let mut sink = WholeChannelSink {
+                ops: Vec::new(),
+                key_channel_ok: false,
+            };
+
+            crate::forward_key::apply(&mut shadow, 2, "ình", 1, 0, &mut sink, false);
+
+            let presses = sink.ops.iter().filter(|op| *op == "key:14:Pressed").count();
+            assert_eq!(presses, 3, "{text}");
+            assert_eq!(shadow.text(), "aình");
+            assert!(!shadow.has_selection());
+        }
+    }
+
+    #[test]
     fn forward_key_replacement_does_not_split_when_key_channel_is_available() {
         let mut shadow = ShadowBuffer::new();
         shadow.append("lâp");
