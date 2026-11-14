@@ -183,6 +183,8 @@ mod tests {
         assert_eq!(chars_from_composed('á', InputMethod::Vni), "a1");
         assert_eq!(chars_from_composed('á', InputMethod::Viqr), "a'");
         assert_eq!(chars_from_composed('ơ', InputMethod::Viqr), "o+");
+        assert_eq!(chars_from_composed('ô', InputMethod::Viqr), "o^");
+        assert_eq!(chars_from_composed('ă', InputMethod::Viqr), "a(");
         assert_eq!(chars_from_composed('a', InputMethod::Telex), "a");
         assert_eq!(chars_from_composed('7', InputMethod::Vni), "7");
         assert_eq!(chars_from_composed(' ', InputMethod::Telex), "");

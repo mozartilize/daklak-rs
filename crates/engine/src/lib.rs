@@ -16,6 +16,7 @@
 mod reversal;
 mod telex;
 
+use reversal::chars_from_composed;
 use vnkey_engine::input::CharType;
 use vnkey_engine::{Engine, InputMethod as VnkeyIm};
 
@@ -50,17 +51,32 @@ pub struct ProcessResult {
     pub consumed: bool,
 }
 
-fn decode_engine_output(output: Vec<u8>) -> String {
-    // INVARIANT: vnkey-engine output comes from its internal UTF-8 tables,
-    // never from external byte input.
-    match String::from_utf8(output) {
-        Ok(commit) => commit,
-        Err(error) => panic!("vnkey-engine violated its UTF-8 output invariant: {error}"),
+impl ProcessResult {
+    fn forward() -> Self {
+        Self {
+            backspaces: 0,
+            commit: String::new(),
+            consumed: false,
+        }
+    }
+
+    fn from_vnkey(result: vnkey_engine::engine::ProcessResult) -> Self {
+        // INVARIANT: vnkey-engine output comes from its internal UTF-8 tables,
+        // never from external byte input.
+        let commit = match String::from_utf8(result.output) {
+            Ok(commit) => commit,
+            Err(error) => panic!("vnkey-engine violated its UTF-8 output invariant: {error}"),
+        };
+        Self {
+            backspaces: result.backspaces,
+            commit,
+            consumed: result.processed,
+        }
     }
 }
 
-/// Longest Vietnamese word on screen (`nghiêng`). A longer word is not
-/// Vietnamese, so it is restored to the keys typed and no longer composed.
+/// Maximum Vietnamese syllable length on screen (`nghiêng`). A longer
+/// composition is restored to the keys typed and no longer composed.
 const MAX_WORD_CHARS: usize = 7;
 
 /// Keys one word may feed vnkey before its history is compacted to keys that
@@ -73,16 +89,17 @@ const MAX_WORD_KEYS: usize = 32;
 /// is tracking.
 pub struct EngineState {
     engine: Engine,
-    /// The current word as shown on screen, from this engine's own output.
+    /// Current composed word from the engine's output, not the client's
+    /// surrounding text. `screen_word` records when the two differ after a seed.
     word: String,
-    /// Keys fed to vnkey for the current word: typed keys, or the keys a
-    /// seed or compaction replaced them with. Equal to vnkey's own key
-    /// history, which is how its non-Vietnamese restore is recognised, and
-    /// tells `keys_for` the order the user typed.
+    /// Current word's typing order, replaced by reconstructed keys on a seed
+    /// or backspace. Matches vnkey's history while typing continuously, so a
+    /// rewrite to these keys identifies vnkey's non-Vietnamese restore.
     word_raw: String,
-    /// Keys fed to vnkey for the current word.
+    /// Keys fed since the last reset/reseed. Backspace can shorten `word_raw`
+    /// without rebuilding vnkey's history, so its length is not this budget.
     word_keys: usize,
-    /// The current word grew past `MAX_WORD_CHARS`: pass keys through
+    /// Composition was restored or could not be seeded: pass keys through
     /// unchanged until the next word break.
     raw_word: bool,
     /// The word on screen when it differs from `word`, vnkey's rendering of
@@ -95,7 +112,6 @@ pub struct EngineState {
     /// configuration to round-trip-check a reconstructed seed.
     method: InputMethod,
     bracket_shortcuts: bool,
-    modern_style: bool,
 }
 
 impl EngineState {
@@ -111,7 +127,6 @@ impl EngineState {
             engine.input.set_user_key_map(&key_map);
         }
         engine.set_viet_mode(true);
-        let modern_style = engine.options.modern_style;
         Self {
             engine,
             word: String::new(),
@@ -121,7 +136,6 @@ impl EngineState {
             screen_word: None,
             method,
             bracket_shortcuts,
-            modern_style,
         }
     }
 
@@ -131,20 +145,18 @@ impl EngineState {
     /// telex seed actually round-trips back to the glyphs it came from.
     fn render(&self, raw: &str) -> String {
         let mut scratch = Self::new_with_options(self.method, self.bracket_shortcuts);
-        scratch.set_modern_style(self.modern_style);
-        let mut screen = String::new();
-        for ch in raw.chars() {
-            let r = scratch.process_key(ch);
-            if r.consumed {
-                for _ in 0..r.backspaces {
-                    screen.pop();
-                }
-                screen.push_str(&r.commit);
-            } else {
-                screen.push(ch);
-            }
+        scratch.set_modern_style(self.modern_style());
+        scratch.type_keys(raw)
+    }
+
+    /// Feed `keys` one by one and return what they show.
+    fn type_keys(&mut self, keys: &str) -> String {
+        let mut word = String::new();
+        for ch in keys.chars() {
+            let result = self.process_key(ch);
+            apply_to_word(&mut word, &result, ch);
         }
-        screen
+        word
     }
 
     /// Process a single character keystroke (ASCII printable expected for
@@ -162,19 +174,16 @@ impl EngineState {
             return ProcessResult::forward();
         }
         if word_break {
-            self.word.clear();
-            self.word_raw.clear();
-            self.word_keys = 0;
-            self.screen_word = None;
+            self.forget_word();
             return self.engine_key(ch);
         }
-        if self.word_keys >= MAX_WORD_KEYS {
-            let keys = self.keys_for(&self.word);
-            if !self.engine.feed_context(&keys) {
-                self.engine.reset();
-            }
-            self.word_keys = keys.chars().count();
-            self.word_raw = keys;
+        self.compose_key(ch)
+    }
+
+    /// Add the key `ch` to the current word.
+    fn compose_key(&mut self, ch: char) -> ProcessResult {
+        if self.word_keys >= MAX_WORD_KEYS && !self.rebuild_key_history() {
+            return ProcessResult::forward();
         }
         let before = self.word.clone();
         let result = self.engine_key(ch);
@@ -185,30 +194,56 @@ impl EngineState {
         // to its whole key history.
         let vnkey_restored =
             result.consumed && self.word == self.word_raw && self.word != format!("{before}{ch}");
-        if !vnkey_restored && self.word.chars().count() <= MAX_WORD_CHARS {
-            match self.screen_word.take() {
-                // The key undid a diacritic only vnkey had (`af` seeded as
-                // `à`, then `f`): the raw letters on screen must not shrink.
-                // Keep them and append the key, like a restore.
-                Some(screen) if self.word.is_ascii() => self.screen_word = Some(screen),
-                Some(screen) => return replace_word(&screen, &self.word, ch),
-                None => return result,
+        let vietnamese = !vnkey_restored && self.word.chars().count() <= MAX_WORD_CHARS;
+        match self.screen_word.take() {
+            None if vietnamese => result,
+            Some(screen) if vietnamese && !self.word.is_ascii() => {
+                replace_word(&screen, &self.word, ch)
             }
+            // Not Vietnamese (vnkey restored it, or it is longer than any
+            // Vietnamese word). Or the key undid a diacritic only vnkey had
+            // (`af` seeded as `à`, then `f`): the raw letters on screen must
+            // not shrink, so they are kept and the key appended, like a
+            // restore.
+            screen => self.restore_typed_keys(screen.unwrap_or(before), ch),
         }
-        // Not Vietnamese (vnkey restored it, or it is longer than any
-        // Vietnamese word): put back keys reproducing the word as it was on
-        // screen, plus this key. Keys that were undone are not resurrected:
-        // escapes (`corrr` shows `corr`, so `correct` + `i` is `correcti`)
-        // and replaced tones (`hanhjf` shows `hành`, so `p` gives `hanhfp`).
-        // Then stop composing until the word ends.
-        let screen = self.screen_word.take().unwrap_or(before);
+    }
+
+    fn engine_key(&mut self, ch: char) -> ProcessResult {
+        ProcessResult::from_vnkey(self.engine.process(ch as u32))
+    }
+
+    /// Replace vnkey's key history with keys that retype the current word.
+    /// Its own history cannot be kept once it is too long (`MAX_WORD_KEYS`)
+    /// or vnkey has dropped a key from it (a backspace it handled itself).
+    /// A word no keys retype, such as the literal `af` left by undoing a
+    /// tone, is no longer composed: keys pass through until it ends.
+    fn rebuild_key_history(&mut self) -> bool {
+        let keys = self.keys_for(&self.word);
+        if self.render(&keys) != self.word || !self.engine.feed_context(&keys) {
+            let word_left = !self.word.is_empty();
+            self.reset();
+            self.raw_word = word_left;
+            // An empty word starts fresh; only a remaining literal word
+            // needs pass-through until its next separator.
+            return !word_left;
+        }
+        self.word_keys = keys.chars().count();
+        self.word_raw = keys;
+        true
+    }
+
+    /// Put back keys reproducing `screen`, the word as it was on screen, plus
+    /// the key `ch` that made it stop being Vietnamese. Keys that were undone
+    /// are not resurrected: escapes (`corrr` shows `corr`, so `correct` + `i`
+    /// is `correcti`) and replaced tones (`hanhjf` shows `hành`, so `p` gives
+    /// `hanhfp`). Then stop composing until the word ends.
+    fn restore_typed_keys(&mut self, screen: String, ch: char) -> ProcessResult {
         // Spell the screen from the keys typed before this one: matching the
         // new key too lets it stand in for an earlier letter (`bòa` + `a`).
         self.word_raw.pop();
         let raw = format!("{}{ch}", self.raw_form(&screen));
-        self.word_raw.clear();
-        self.engine.reset();
-        self.word.clear();
+        self.reset();
         self.raw_word = true;
         if raw == format!("{screen}{ch}") {
             return ProcessResult::forward();
@@ -217,15 +252,6 @@ impl EngineState {
             backspaces: screen.chars().count(),
             commit: raw,
             consumed: true,
-        }
-    }
-
-    fn engine_key(&mut self, ch: char) -> ProcessResult {
-        let r = self.engine.process(ch as u32);
-        ProcessResult {
-            backspaces: r.backspaces,
-            commit: decode_engine_output(r.output),
-            consumed: r.processed,
         }
     }
 
@@ -243,20 +269,18 @@ impl EngineState {
             self.word = screen;
             return ProcessResult::forward();
         }
-        let r = self.engine.process_backspace();
-        let result = ProcessResult {
-            backspaces: r.backspaces,
-            commit: decode_engine_output(r.output),
-            consumed: r.processed,
-        };
+        let result = ProcessResult::from_vnkey(self.engine.process_backspace());
         if result.consumed {
+            // vnkey rewrote the word itself (`hoàn` minus `n` is `hòa` in the
+            // legacy style), dropping a key of its own choosing.
             apply_to_word(&mut self.word, &result, '\0');
+            self.rebuild_key_history();
         } else {
+            // The app deletes the letter. Which typed keys it came from is
+            // unknown; keep keys that reproduce what is left on screen.
             self.word.pop();
+            self.word_raw = self.keys_for(&self.word);
         }
-        // Which typed keys a deleted letter came from is unknown; keep keys
-        // that reproduce what is left on screen.
-        self.word_raw = self.keys_for(&self.word);
         result
     }
 
@@ -275,11 +299,11 @@ impl EngineState {
                 return typed;
             }
         }
-        let by_glyph = context_from_surrounding(text, self.method).0;
-        if is_subsequence(&by_glyph, &self.word_raw) {
-            by_glyph
+        let inline = canonical_keys(text, self.method, KeyOrder::INLINE);
+        if is_subsequence(&inline, &self.word_raw) {
+            inline
         } else {
-            tone_last_context(text, self.method)
+            canonical_keys(text, self.method, KeyOrder::TONE_LAST)
         }
     }
 
@@ -301,32 +325,34 @@ impl EngineState {
     /// spelling that is a subsequence of the keys typed for the current word
     /// (`word_raw`), keeping as many of them as the glyphs account for (a
     /// bare `u`/`o` also matches `nguoiwf`, but would drop its `w`). Ties go
-    /// to the earlier key order below. `None` if no spelling matches.
+    /// to the earlier of `KeyOrder::TYPED`. `None` if no spelling matches.
     fn typed_spelling(&self, text: &str) -> Option<String> {
         let typed: Vec<char> = self.word_raw.chars().collect();
-        let mut best: Option<String> = None;
-        for (tone_last, w_last) in [(false, false), (true, false), (true, true), (false, true)] {
-            let groups = spelling_groups(text, self.method, tone_last, w_last);
-            let mut keys = String::new();
-            if pick_typed_spelling(&groups, &typed, 0, &mut keys)
-                && best
-                    .as_ref()
-                    .is_none_or(|b| keys.chars().count() > b.chars().count())
-            {
-                best = Some(keys);
-            }
-        }
-        best
+        // `max_by_key` keeps the last of equals, so walk the orders backwards.
+        KeyOrder::TYPED
+            .into_iter()
+            .rev()
+            .filter_map(|order| {
+                let groups = spelling_groups(text, self.method, order);
+                let mut keys = String::new();
+                pick_typed_spelling(&groups, &typed, 0, &mut keys).then_some(keys)
+            })
+            .max_by_key(|keys| keys.chars().count())
     }
 
     /// Reset engine state. Call on focus loss, click, navigation key, or
     /// any signal that the cursor moved outside the daemon's control.
     pub fn reset(&mut self) {
         self.engine.reset();
+        self.forget_word();
+        self.raw_word = false;
+    }
+
+    /// Forget the word tracked so far; vnkey's own state is left alone.
+    fn forget_word(&mut self) {
         self.word.clear();
         self.word_raw.clear();
         self.word_keys = 0;
-        self.raw_word = false;
         self.screen_word = None;
     }
 
@@ -334,53 +360,30 @@ impl EngineState {
     /// word they show.
     pub fn retype(&mut self, keys: &str) -> String {
         self.reset();
-        let mut word = String::new();
-        for ch in keys.chars() {
-            let result = self.process_key(ch);
-            apply_to_word(&mut word, &result, ch);
-        }
-        word
+        self.type_keys(keys)
     }
 
-    /// Change the active input method at runtime. Resets composition state
-    /// (the new method has different keystroke semantics).
+    /// Change the active input method at runtime. Drops the word in progress
+    /// (the new method gives its keys other meanings); the other options stay.
     pub fn set_input_method(&mut self, method: InputMethod) {
-        self.reset();
-        self.engine.set_input_method(method.to_vnkey());
-        self.engine.options.modern_style = self.modern_style;
-        self.method = method;
+        let modern_style = self.modern_style();
+        *self = Self::new_with_options(method, self.bracket_shortcuts);
+        self.set_modern_style(modern_style);
     }
 
     pub fn modern_style(&self) -> bool {
-        self.modern_style
+        self.engine.options.modern_style
     }
 
     /// Toggle modern-style tone placement. `false` = legacy `òa` instead of `oà`.
     /// Does NOT reset composition — the change takes effect on the next tone.
     pub fn set_modern_style(&mut self, enabled: bool) {
-        self.modern_style = enabled;
         self.engine.options.modern_style = enabled;
     }
 
-    /// Seed engine with text before the cursor — enables retroactive word
-    /// editing when the IME activates mid-word. Returns true if context
-    /// was fed successfully.
-    ///
-    /// NOTE: this takes method keystrokes OR composed glyphs interchangeably
-    /// (`context_from_surrounding` passes ASCII through and reverses
-    /// diacritics for the engine's active input method), so callers seeding
-    /// from raw accumulated keystrokes use it directly. Callers seeding from
-    /// *composed surrounding text* should use [`feed_context_gated`], which
-    /// round-trip-checks the reconstruction. A word longer than any
-    /// Vietnamese word is not seeded; the following keys pass through
-    /// unchanged until the next word break.
-    pub fn feed_context(&mut self, text: &str) -> bool {
-        let context = self.keys_for(text);
-        let screen = self.render(&context);
-        self.seed(&context, screen)
-    }
-
-    /// Seed from **composed** surrounding text, with a render-gate.
+    /// Seed the engine from **composed** text before the cursor, so the next
+    /// key edits that word (retroactive editing when the IME activates
+    /// mid-word). Render-gated.
     ///
     /// The seed is reconstructed by reversing composed glyphs back into
     /// keystrokes for the engine's active input method, which is lossy for a
@@ -436,51 +439,29 @@ impl EngineState {
         false
     }
 
+    /// Load `keys`, which show `screen`, as the current word.
     fn seed(&mut self, keys: &str, screen: String) -> bool {
         if screen.chars().count() > MAX_WORD_CHARS {
             self.reset();
             self.raw_word = true;
             return false;
         }
-        let fed = self.engine.feed_context(keys);
-        self.screen_word = None;
-        if fed {
-            self.word = screen;
-            self.word_raw = keys.to_owned();
-            self.word_keys = keys.chars().count();
-            self.raw_word = false;
-        } else {
+        if !self.engine.feed_context(keys) {
             self.reset();
+            return false;
         }
-        fed
+        self.word = screen;
+        self.word_raw = keys.to_owned();
+        self.word_keys = keys.chars().count();
+        self.raw_word = false;
+        self.screen_word = None;
+        true
     }
 
     /// Returns true if the engine has no pending composition state — i.e.
     /// the next key starts a fresh word.
     pub fn at_word_beginning(&self) -> bool {
         self.engine.at_word_beginning()
-    }
-}
-
-/// Reconstruct input-method keystrokes from composed surrounding text for the
-/// Telex method. Returns the keystroke string and a per-glyph byte-width vector.
-pub fn telex_context_from_surrounding(text: &str) -> (String, Vec<u8>) {
-    context_from_surrounding(text, InputMethod::Telex)
-}
-
-/// Reconstruct input-method keystrokes from composed surrounding text for the
-/// VNI method. Returns the keystroke string and a per-glyph byte-width vector.
-pub fn vni_context_from_surrounding(text: &str) -> (String, Vec<u8>) {
-    context_from_surrounding(text, InputMethod::Vni)
-}
-
-impl ProcessResult {
-    fn forward() -> Self {
-        Self {
-            backspaces: 0,
-            commit: String::new(),
-            consumed: false,
-        }
     }
 }
 
@@ -514,97 +495,130 @@ fn replace_word(screen: &str, word: &str, ch: char) -> ProcessResult {
     }
 }
 
-fn context_from_surrounding(text: &str, method: InputMethod) -> (String, Vec<u8>) {
-    let mut result = String::with_capacity(text.len());
-    let mut widths = Vec::with_capacity(text.chars().count());
-    for ch in text.chars() {
-        let keys = chars_from_composed(ch, method);
-        if !keys.is_empty() {
-            widths.push(keys.len() as u8);
-            result.push_str(keys);
-        }
-    }
-    (result, widths)
+/// Where the user typed a word's tone key and, in Telex, the `w` of its horn
+/// or breve: right after the vowel, or after the word's letters.
+#[derive(Clone, Copy)]
+struct KeyOrder {
+    tone_last: bool,
+    w_last: bool,
 }
 
-fn chars_from_composed(ch: char, method: InputMethod) -> &'static str {
-    reversal::chars_from_composed(ch, method)
+impl KeyOrder {
+    /// Every glyph's keys together: `người` as `nguwowfi`.
+    const INLINE: Self = Self {
+        tone_last: false,
+        w_last: false,
+    };
+    /// The tone key after the word's letters: `nguwowif`.
+    const TONE_LAST: Self = Self {
+        tone_last: true,
+        w_last: false,
+    };
+    /// One `w` after the word's letters, then the tone key: `nguoiwf`.
+    const W_AND_TONE_LAST: Self = Self {
+        tone_last: true,
+        w_last: true,
+    };
+    /// The tone key with its vowel, one `w` after the word's letters:
+    /// `nguofiw`.
+    const W_LAST: Self = Self {
+        tone_last: false,
+        w_last: true,
+    };
+    /// The orders a typed word is matched against, preferred first.
+    const TYPED: [Self; 4] = [
+        Self::INLINE,
+        Self::TONE_LAST,
+        Self::W_AND_TONE_LAST,
+        Self::W_LAST,
+    ];
+}
+
+/// The keys of one glyph: its letter, the key that marks the letter (`â` `ă`
+/// `ơ` `ư` `đ`), and its tone key. `as` is a letter and a tone, `aw` a letter
+/// and a mark, `aws` all three.
+fn glyph_keys(ch: char, method: InputMethod) -> [Option<char>; 3] {
+    let mut keys = chars_from_composed(ch, method).chars();
+    let (letter, mut mark, mut tone) = (keys.next(), keys.next(), keys.next());
+    if tone.is_none() && mark.is_some_and(|key| is_tone_key(key, method)) {
+        tone = mark.take();
+    }
+    [letter, mark, tone]
+}
+
+/// The spellings that type one glyph, preferred first, given its keys
+/// (see `glyph_keys`) less any typed after the word's letters.
+fn glyph_spellings(
+    [letter, mark, tone]: [Option<char>; 3],
+    method: InputMethod,
+) -> Vec<String> {
+    let spell = |keys: [Option<char>; 3]| keys.into_iter().flatten().collect::<String>();
+    let mut spellings = vec![spell([letter, mark, tone])];
+    if is_telex_w(mark, method) {
+        // Telex shorthands: one `w` horns both vowels of `uow`, leaving the
+        // other bare, and a lone `w` is `ư`.
+        spellings.push(spell([letter, None, tone]));
+        if matches!(letter, Some('u' | 'U')) {
+            spellings.push(spell([None, mark, tone]));
+        }
+    }
+    if mark.is_some() && tone.is_some() {
+        // The tone key typed before the mark (`ể` as `ere`, `ớ` as `osw`).
+        spellings.push(spell([letter, tone, mark]));
+    }
+    spellings
+}
+
+/// Whether `mark` is the Telex `w` of a horn or breve.
+fn is_telex_w(mark: Option<char>, method: InputMethod) -> bool {
+    method == InputMethod::Telex && matches!(mark, Some('w' | 'W'))
 }
 
 /// For each glyph of `text`, the spellings that type it, preferred first.
-/// Telex horn/breve glyphs also list shorthands: `ư` as `uw`, `w` or `u` (the
-/// `w` of `uow` horns both vowels), `ơ`/`ă` as `ow`/`aw` or bare. With
-/// `tone_last`, each word's tone key is its own group after its letters.
-/// With `w_last`, the horn/breve `w` is typed once after the word's letters
-/// (`người` as `nguoiwf`), before its tone key.
-fn spelling_groups(
-    text: &str,
-    method: InputMethod,
-    tone_last: bool,
-    w_last: bool,
-) -> Vec<Vec<String>> {
+/// With `order.tone_last`, each word's tone key is its own group after its
+/// letters. With `order.w_last`, the Telex horn/breve `w` is typed once
+/// after the word's letters (`người` as `nguoiwf`), before its tone key.
+fn spelling_groups(text: &str, method: InputMethod, order: KeyOrder) -> Vec<Vec<String>> {
     let mut groups = Vec::new();
-    let mut tone = None;
-    let mut w = None;
-    let flush = |groups: &mut Vec<Vec<String>>, w: Option<char>, tone: Option<char>| {
+    // Keys held back until the word's letters are done.
+    let mut word_w = None;
+    let mut word_tone = None;
+    let end_word = |groups: &mut Vec<Vec<String>>, w: Option<char>, tone: Option<char>| {
         for key in [w, tone].into_iter().flatten() {
             groups.push(vec![key.to_string()]);
         }
     };
     for ch in text.chars() {
-        let mut keys = chars_from_composed(ch, method).to_owned();
         if !ch.is_alphabetic() {
-            flush(&mut groups, w.take(), tone.take());
-            groups.push(vec![keys]);
+            end_word(&mut groups, word_w.take(), word_tone.take());
+            groups.push(vec![chars_from_composed(ch, method).to_owned()]);
             continue;
         }
-        if w_last && method == InputMethod::Telex && !ch.is_ascii() {
-            if let Some(at) = keys.find(['w', 'W']) {
-                w = w.or(keys[at..].chars().next());
-                keys.remove(at);
-            }
+        let [letter, mut mark, mut tone] = glyph_keys(ch, method);
+        if order.w_last && is_telex_w(mark, method) {
+            word_w = word_w.or(mark.take());
         }
-        if tone_last {
-            if let Some((at, key)) = keys.char_indices().last() {
-                if at > 0 && is_tone_key(key, method) {
-                    if let Some(prev) = tone.replace(key) {
-                        flush(&mut groups, w.take(), Some(prev));
-                    }
-                    keys.truncate(at);
+        if order.tone_last {
+            if let Some(key) = tone.take() {
+                // A second tone means a second syllable with no break.
+                if let Some(earlier) = word_tone.replace(key) {
+                    end_word(&mut groups, word_w.take(), Some(earlier));
                 }
             }
         }
-        let mut spellings = vec![keys.clone()];
-        if method == InputMethod::Telex && !ch.is_ascii() {
-            if let Some(w) = keys.find(['w', 'W']) {
-                let mut bare = keys.clone();
-                bare.remove(w);
-                spellings.push(bare);
-                if w == 1 && keys.starts_with(['u', 'U']) {
-                    spellings.push(keys[1..].to_owned());
-                }
-            }
-        }
-        // The tone key may also be typed before the glyph's other keys, right
-        // after its first letter (`ể` as `ere`, `ớ` as `osw`).
-        if !ch.is_ascii() {
-            for spelling in spellings.clone() {
-                let keys: Vec<char> = spelling.chars().collect();
-                let Some((&tone, letters)) = keys.split_last() else { continue };
-                if letters.len() < 2 || !is_tone_key(tone, method) {
-                    continue;
-                }
-                for at in 1..letters.len() {
-                    let mut moved = letters.to_vec();
-                    moved.insert(at, tone);
-                    spellings.push(moved.into_iter().collect());
-                }
-            }
-        }
-        groups.push(spellings);
+        groups.push(glyph_spellings([letter, mark, tone], method));
     }
-    flush(&mut groups, w, tone);
+    end_word(&mut groups, word_w, word_tone);
     groups
+}
+
+/// The keys that type `text` with every glyph spelled out in full.
+fn canonical_keys(text: &str, method: InputMethod, order: KeyOrder) -> String {
+    spelling_groups(text, method, order)
+        .iter()
+        .filter_map(|spellings| spellings.first())
+        .map(String::as_str)
+        .collect()
 }
 
 /// Append to `out` one spelling per group of `groups` that together form a
@@ -656,30 +670,6 @@ fn is_tone_key(key: char, method: InputMethod) -> bool {
     }
 }
 
-/// Like `context_from_surrounding`, but each word's tone key comes after the
-/// word's letters instead of right after its vowel.
-fn tone_last_context(text: &str, method: InputMethod) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut tone = None;
-    for ch in text.chars() {
-        let keys = chars_from_composed(ch, method);
-        if !ch.is_alphabetic() {
-            result.extend(tone.take());
-            result.push_str(keys);
-            continue;
-        }
-        match keys.char_indices().last() {
-            Some((at, key)) if at > 0 && is_tone_key(key, method) => {
-                result.extend(tone.replace(key));
-                result.push_str(&keys[..at]);
-            }
-            _ => result.push_str(keys),
-        }
-    }
-    result.extend(tone);
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,19 +679,19 @@ mod tests {
     /// consumed, the daemon forwards the original key to the app — here we
     /// model that by appending the raw char.
     fn type_str(eng: &mut EngineState, s: &str) -> String {
-        let mut buf = String::new();
+        let mut screen = String::new();
         for ch in s.chars() {
-            let r = eng.process_key(ch);
-            if r.consumed {
-                for _ in 0..r.backspaces {
-                    buf.pop();
+            let result = eng.process_key(ch);
+            if result.consumed {
+                for _ in 0..result.backspaces {
+                    screen.pop();
                 }
-                buf.push_str(&r.commit);
+                screen.push_str(&result.commit);
             } else {
-                buf.push(ch);
+                screen.push(ch);
             }
         }
-        buf
+        screen
     }
 
     fn do_backspace(eng: &mut EngineState, buf: &mut String) {
@@ -721,7 +711,7 @@ mod tests {
 
     #[test]
     fn longest_vietnamese_word_still_composes_with_corrections() {
-        // `nghiêng` is the longest word (7 letters). A tone correction takes
+        // `nghiêng` has the maximum syllable length (7 letters). A tone correction takes
         // it to 10 keys, so a keystroke cap of 9 would wrongly restore it.
         for (method, keys, want) in [
             (InputMethod::Telex, "nghieengx", "nghiễng"),
@@ -784,6 +774,10 @@ mod tests {
             // Undone keys are still dropped around such a tone.
             ("asasa", "aasa"),
             ("sixsxi", "sixi"),
+            // Also with the horn `w` in the vowels' keys, and when one `w`
+            // horned both vowels.
+            ("muwowfsib", "muwowsib"),
+            ("nguowifsk", "nguowisk"),
         ] {
             let mut eng = EngineState::new(InputMethod::Telex);
             assert_eq!(type_str(&mut eng, keys), expected, "{keys}");
@@ -883,6 +877,42 @@ mod tests {
         let mut eng = EngineState::new(InputMethod::Telex);
         let expected = format!("aasas{}", "as".repeat(63));
         assert_eq!(type_str(&mut eng, &"as".repeat(66)), expected);
+        // Compacting the key history must not disturb the word: a repeated
+        // tone key still undoes the tone, and the word is then literal.
+        // Whichever key the compaction falls on, the undo included.
+        for toggles in [13, 14, 15, 16, 17, 20] {
+            let mut eng = EngineState::new(InputMethod::Telex);
+            let toggled = format!("a{}", "sf".repeat(toggles));
+            assert_eq!(type_str(&mut eng, &toggled), "à", "{toggles}");
+            assert_eq!(type_str(&mut eng, "fs"), "afs", "{toggles}");
+        }
+    }
+
+    #[test]
+    fn deleting_last_glyph_at_compaction_boundary_starts_fresh() {
+        // 32 keys show one glyph. Deleting it must start a new composition,
+        // not forward the next `w` merely because the old history was full.
+        let mut eng = EngineState::new(InputMethod::Telex);
+        let mut screen = type_str(&mut eng, &format!("a{}s", "sf".repeat(15)));
+        assert_eq!(screen, "á");
+        do_backspace(&mut eng, &mut screen);
+        assert_eq!(screen, "");
+        assert_eq!(type_str(&mut eng, "w"), "ư");
+    }
+
+    #[test]
+    fn backspace_that_moves_the_tone_is_tracked() {
+        // Legacy placement: `hoàn` minus `n` is `hòa`, an edit vnkey makes
+        // itself. The word is then `hòa`: a restore must not bring `n` back.
+        let mut eng = EngineState::new(InputMethod::Telex);
+        eng.set_modern_style(false);
+        let mut buf = type_str(&mut eng, "hoanf");
+        assert_eq!(buf, "hoàn");
+        do_backspace(&mut eng, &mut buf);
+        assert_eq!(buf, "hòa");
+        let r = eng.process_key('k');
+        apply_to_word(&mut buf, &r, 'k');
+        assert_eq!(buf, "hoafk");
     }
 
     #[test]
@@ -921,13 +951,66 @@ mod tests {
     }
 
     #[test]
+    fn seed_follows_the_tone_placement_style() {
+        // `hoà` is the modern placement and `hòa` the legacy one. Each seeds
+        // only in its own style, and the next tone lands where that style
+        // puts it.
+        for (modern, seed, other, toned) in
+            [(true, "hoà", "hòa", "hoá"), (false, "hòa", "hoà", "hóa")]
+        {
+            let mut eng = EngineState::new(InputMethod::Telex);
+            eng.set_modern_style(modern);
+            assert!(!eng.feed_context_gated(other), "modern={modern}");
+            assert!(eng.feed_context_gated(seed), "modern={modern}");
+            let mut screen = seed.to_owned();
+            let r = eng.process_key('s');
+            apply_to_word(&mut screen, &r, 's');
+            assert_eq!(screen, toned, "modern={modern}");
+        }
+    }
+
+    #[test]
+    fn seed_spells_marked_and_toned_vowels() {
+        // `ờ` takes three keys (`owf`); the tone key goes last in the word.
+        let mut eng = EngineState::new(InputMethod::Telex);
+        assert!(eng.feed_context_gated("người"));
+        assert_eq!(type_str(&mut eng, "k"), "nguwowifk");
+    }
+
+    #[test]
+    fn new_seed_replaces_raw_letters_left_by_a_delete() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        // `thoong` stays on screen as raw letters...
+        assert!(eng.reseed_after_delete("thoong"));
+        // ...until the caret lands on another word, which is then the one
+        // the next key edits.
+        assert!(eng.feed_context_gated("hanh"));
+        let r = eng.process_key('j');
+        assert_eq!((r.backspaces, r.commit.as_str()), (3, "ạnh"));
+    }
+
+    #[test]
+    fn reseed_after_delete_without_a_composable_word_stops_composing() {
+        // Nothing left of the word: start over.
+        let mut eng = EngineState::new(InputMethod::Telex);
+        type_str(&mut eng, "ab");
+        assert!(!eng.reseed_after_delete(""));
+        assert!(eng.at_word_beginning());
+        assert_eq!(type_str(&mut eng, "as"), "á");
+        // A literal `a1` (VNI renders those keys `á`) is not Vietnamese
+        // left over from a restore: keys pass through until the word ends.
+        let mut eng = EngineState::new(InputMethod::Vni);
+        assert!(!eng.reseed_after_delete("a1"));
+        assert_eq!(type_str(&mut eng, "2 a2"), "2 à");
+    }
+
+    #[test]
     fn seed_longer_than_any_word_passes_keys_through_until_word_break() {
         for method in [InputMethod::Telex, InputMethod::Vni, InputMethod::Viqr] {
             let mut eng = EngineState::new(method);
             // A 427-character URL seeded from a URL bar used to crash.
             let url = format!("https://example.test/{}", "as".repeat(203));
             assert!(!eng.feed_context_gated(&url));
-            assert!(!eng.feed_context(&url));
         }
         let mut eng = EngineState::new(InputMethod::Telex);
         assert!(!eng.feed_context_gated("abcdefgh"));
@@ -949,271 +1032,48 @@ mod tests {
         assert_eq!(screen, "nghiềng");
     }
 
-    // ===== Telex basic =====
+    // ===== Typing =====
 
     #[test]
-    fn telex_hieeus_is_hieu() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "hieeus"), "hiếu");
-    }
-
-    /// Pins that `feed_context` rebuilds a vowel cluster from raw ASCII: feeding
-    /// the accumulated prefix before each key and then the key, a tone after a
-    /// cluster transform (`ee`→ê then `s`) must still land on the cluster vowel —
-    /// `hiếu`, not `hiêí`. The continuous word-start seed relies on this
-    /// reconstruction being faithful.
-    #[test]
-    fn feed_context_per_key_preserves_vowel_cluster() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        let mut raw = String::new();
-        let mut screen = String::new();
-        for ch in "hieeus".chars() {
-            let prefix = raw.clone();
-            eng.reset();
-            if !prefix.is_empty() {
-                eng.feed_context(&prefix);
-            }
-            raw.push(ch);
-            let r = eng.process_key(ch);
-            if r.consumed {
-                for _ in 0..r.backspaces {
-                    screen.pop();
-                }
-                screen.push_str(&r.commit);
-            } else {
-                screen.push(ch);
-            }
+    fn keys_compose_vietnamese() {
+        use InputMethod::{Telex, Viqr, Vni};
+        for (method, keys, want) in [
+            (Telex, "aa", "â"),
+            (Telex, "aw", "ă"),
+            (Telex, "ee", "ê"),
+            (Telex, "oo", "ô"),
+            (Telex, "dd", "đ"),
+            (Telex, "as", "á"),
+            (Telex, "af", "à"),
+            (Telex, "ar", "ả"),
+            (Telex, "ax", "ã"),
+            (Telex, "aj", "ạ"),
+            (Telex, "aas", "ấ"),
+            // `o` → o, `oo` → ô, then `w` reinterprets to ơ.
+            (Telex, "oow", "ơ"),
+            // One `w` horns both vowels.
+            (Telex, "uow", "ươ"),
+            (Telex, "hieeus", "hiếu"),
+            (Telex, "tieengs", "tiếng"),
+            // The tone key may come before or after the final consonant.
+            (Telex, "vieejt", "việt"),
+            (Telex, "vieetj", "việt"),
+            (Vni, "a1", "á"),
+            (Vni, "o6", "ô"),
+            (Vni, "u7", "ư"),
+            (Vni, "a61", "ấ"),
+            (Vni, "o61", "ố"),
+            (Vni, "tie61ng", "tiếng"),
+            // Telex keys mean nothing in VNI.
+            (Vni, "as", "as"),
+            (Viqr, "a'", "á"),
+            (Viqr, "o+", "ơ"),
+            (Viqr, "dda~", "đã"),
+            (Viqr, "vie^.t", "việt"),
+        ] {
+            let mut eng = EngineState::new(method);
+            assert_eq!(type_str(&mut eng, keys), want, "{method:?} {keys}");
         }
-        assert_eq!(screen, "hiếu");
-    }
-
-    #[test]
-    fn feed_context_accepts_composed_vietnamese_for_tone_replacement() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert!(eng.feed_context("nó"));
-
-        let r = eng.process_key('r');
-
-        assert!(r.consumed);
-        assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "ỏ");
-    }
-
-    #[test]
-    fn feed_context_accepts_composed_vietnamese_for_raw_restore() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert!(eng.feed_context("ră"));
-
-        let r = eng.process_key('w');
-
-        assert!(r.consumed);
-        assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "aw");
-    }
-
-    #[test]
-    fn telex_plain_a() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "a"), "a");
-    }
-
-    #[test]
-    fn telex_aa_to_acircumflex() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "aa"), "â");
-    }
-
-    #[test]
-    fn telex_aw_to_abreve() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "aw"), "ă");
-    }
-
-    #[test]
-    fn telex_ee_to_ecircumflex() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "ee"), "ê");
-    }
-
-    #[test]
-    fn telex_oo_to_ocircumflex() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "oo"), "ô");
-    }
-
-    #[test]
-    fn telex_dd_to_dstroke() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "dd"), "đ");
-    }
-
-    // ===== Telex tone marks =====
-
-    #[test]
-    fn telex_tones_on_a() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "as"), "á");
-        eng.reset();
-        assert_eq!(type_str(&mut eng, "af"), "à");
-        eng.reset();
-        assert_eq!(type_str(&mut eng, "ar"), "ả");
-        eng.reset();
-        assert_eq!(type_str(&mut eng, "ax"), "ã");
-        eng.reset();
-        assert_eq!(type_str(&mut eng, "aj"), "ạ");
-    }
-
-    // ===== Telex combinations =====
-
-    #[test]
-    fn telex_aas_to_acircumflex_acute() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "aas"), "ấ");
-    }
-
-    #[test]
-    fn telex_oow_to_o_horn() {
-        // vnkey-engine: `o` → o, `oo` → ô, then `w` reinterprets to ơ.
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "oow"), "ơ");
-    }
-
-    #[test]
-    fn telex_uow_to_uow() {
-        // `uow` → `ươ` (canonical Telex digraph).
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "uow"), "ươ");
-    }
-
-    #[test]
-    fn telex_word_tieng() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "tieengs"), "tiếng");
-    }
-
-    #[test]
-    fn telex_word_viet() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "vieejt"), "việt");
-    }
-
-    #[test]
-    fn telex_tone_order_flexible() {
-        // Tone mark may come before or after the trailing consonant.
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert_eq!(type_str(&mut eng, "vieetj"), "việt");
-    }
-
-    // ===== VNI =====
-
-    #[test]
-    fn vni_a1_to_aacute() {
-        let mut eng = EngineState::new(InputMethod::Vni);
-        assert_eq!(type_str(&mut eng, "a1"), "á");
-    }
-
-    #[test]
-    fn vni_o6_to_ocircumflex() {
-        let mut eng = EngineState::new(InputMethod::Vni);
-        assert_eq!(type_str(&mut eng, "o6"), "ô");
-    }
-
-    #[test]
-    fn vni_u7_to_uhorn() {
-        let mut eng = EngineState::new(InputMethod::Vni);
-        assert_eq!(type_str(&mut eng, "u7"), "ư");
-    }
-
-    #[test]
-    fn vni_a61_to_acircumflex_acute() {
-        let mut eng = EngineState::new(InputMethod::Vni);
-        assert_eq!(type_str(&mut eng, "a61"), "ấ");
-    }
-
-    #[test]
-    fn vni_o61_to_ocircumflex_acute() {
-        let mut eng = EngineState::new(InputMethod::Vni);
-        assert_eq!(type_str(&mut eng, "o61"), "ố");
-    }
-
-    #[test]
-    fn vni_word_tieng() {
-        let mut eng = EngineState::new(InputMethod::Vni);
-        assert_eq!(type_str(&mut eng, "tie61ng"), "tiếng");
-    }
-
-    // ===== VNI feed_context (retroactive editing) =====
-
-    #[test]
-    fn vni_feed_context_per_key_preserves_vowel_cluster() {
-        let mut eng = EngineState::new(InputMethod::Vni);
-        let mut raw = String::new();
-        let mut screen = String::new();
-        for ch in "hie61u".chars() {
-            let prefix = raw.clone();
-            eng.reset();
-            if !prefix.is_empty() {
-                eng.feed_context(&prefix);
-            }
-            raw.push(ch);
-            let r = eng.process_key(ch);
-            if r.consumed {
-                for _ in 0..r.backspaces {
-                    screen.pop();
-                }
-                screen.push_str(&r.commit);
-            } else {
-                screen.push(ch);
-            }
-        }
-        assert_eq!(screen, "hiếu");
-    }
-
-    #[test]
-    fn vni_feed_context_accepts_composed_vietnamese_for_tone_replacement() {
-        let mut eng = EngineState::new(InputMethod::Vni);
-        assert!(eng.feed_context("nó"));
-
-        let r = eng.process_key('3');
-
-        assert!(r.consumed);
-        assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "ỏ");
-    }
-
-    #[test]
-    fn vni_feed_context_accepts_composed_vietnamese_inside_word() {
-        let mut eng = EngineState::new(InputMethod::Vni);
-
-        assert!(eng.feed_context("pho"));
-        let r = eng.process_key('7');
-        assert!(r.consumed);
-        assert_eq!(r.commit, "ơ");
-
-        eng.reset();
-        assert!(eng.feed_context("phơ"));
-        let r = eng.process_key('3');
-        assert!(r.consumed);
-        assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "ở");
-    }
-
-    #[test]
-    fn vni_feed_context_accepts_faithful_reconstruction() {
-        let mut e = EngineState::new(InputMethod::Vni);
-        assert!(e.feed_context_gated("tiê"));
-        let r = e.process_key('1');
-        assert_eq!((r.backspaces, r.commit.as_str()), (1, "ế"));
-    }
-
-    #[test]
-    fn vni_feed_context_rejects_lossy_reconstruction() {
-        let mut e = EngineState::new(InputMethod::Vni);
-        assert!(!e.feed_context_gated("ơiời"));
-        assert!(
-            e.at_word_beginning(),
-            "rejected seed must leave the engine untouched"
-        );
     }
 
     // ===== Backspace mid-word =====
@@ -1228,16 +1088,13 @@ mod tests {
     }
 
     #[test]
-    fn telex_backspace_unwinds_transform() {
-        // After `aa` → `â`, a backspace should leave the user at `a` again
-        // (engine restores soft-reset state, daemon's BS deletes `â`).
+    fn telex_backspace_deletes_the_whole_glyph() {
+        // `aa` shows one glyph, `â`; a backspace removes it, not one key.
         let mut eng = EngineState::new(InputMethod::Telex);
         let mut buf = type_str(&mut eng, "aa");
         assert_eq!(buf, "â");
         do_backspace(&mut eng, &mut buf);
-        // After 1 backspace, `â` is gone — the visible buffer reflects the
-        // delete that BS caused in the app.
-        assert!(buf.is_empty() || buf == "a");
+        assert_eq!(buf, "");
     }
 
     // ===== Word boundary flushes state =====
@@ -1280,6 +1137,38 @@ mod tests {
         assert_eq!(r.commit, "ơ");
     }
 
+    // ===== Switching input method =====
+
+    #[test]
+    fn switching_method_changes_what_keys_mean() {
+        let mut eng = EngineState::new(InputMethod::Telex);
+        // A word in progress is dropped: the `a` typed as Telex must not take
+        // the VNI tone.
+        let _ = eng.process_key('a');
+        eng.set_input_method(InputMethod::Vni);
+        assert!(eng.at_word_beginning());
+        assert_eq!(type_str(&mut eng, "1"), "1");
+        assert_eq!(type_str(&mut eng, " a1 as"), " á as");
+        // Seeds are spelled in the new method's keys too.
+        assert!(eng.feed_context_gated("nó"));
+        let r = eng.process_key('3');
+        assert_eq!((r.backspaces, r.commit.as_str()), (1, "ỏ"));
+    }
+
+    #[test]
+    fn switching_method_keeps_the_other_options() {
+        for brackets in [false, true] {
+            for (modern, expected) in [(false, " hòa"), (true, " hoà")] {
+                let mut eng = EngineState::new_with_options(InputMethod::Telex, brackets);
+                eng.set_modern_style(modern);
+                eng.set_input_method(InputMethod::Vni);
+                eng.set_input_method(InputMethod::Telex);
+                assert_eq!(type_str(&mut eng, "["), if brackets { "ơ" } else { "[" });
+                assert_eq!(type_str(&mut eng, " hoaf"), expected);
+            }
+        }
+    }
+
     // ===== Reset =====
 
     #[test]
@@ -1291,164 +1180,95 @@ mod tests {
         assert!(eng.at_word_beginning());
     }
 
-    // ===== feed_context (retroactive editing) =====
+    // ===== Seeding from composed text (retroactive editing) =====
 
     #[test]
-    fn feed_context_enables_retroactive_tone() {
-        // Scenario from protocol-behavior.md:
-        // Existing text "phow", cursor positioned after 'o' (offset 3).
-        // Seed engine with "pho", then type Telex tone keys.
-        //
-        // Engine returns the patch to apply: backspaces=1, commit="ơ".
-        // The daemon turns that into delete_surrounding_text(before=1, after=0)
-        // + commit_string("ơ"), preserving the trailing 'w' that sits after
-        // the cursor.
+    fn seeded_word_is_edited_by_the_next_key() {
+        use InputMethod::{Telex, Viqr, Vni};
+        // The key rewrites the last glyph of the seeded word: one backspace,
+        // then the new glyph.
+        for (method, seed, key, commit) in [
+            // A tone replaces the tone already there.
+            (Telex, "nó", 'r', "ỏ"),
+            (Vni, "nó", '3', "ỏ"),
+            (Viqr, "nó", '?', "ỏ"),
+            // A mark lands on the bare vowel, then a tone on the marked one.
+            (Telex, "pho", 'w', "ơ"),
+            (Vni, "pho", '7', "ơ"),
+            (Viqr, "pho", '+', "ơ"),
+            (Telex, "phơ", 'r', "ở"),
+            (Vni, "phơ", '3', "ở"),
+            (Viqr, "phơ", '?', "ở"),
+            // The tone goes on the cluster's marked vowel.
+            (Telex, "tiê", 's', "ế"),
+            (Vni, "tiê", '1', "ế"),
+            // A second `w` undoes the breve and stays as a letter.
+            (Telex, "ră", 'w', "aw"),
+        ] {
+            let mut eng = EngineState::new(method);
+            assert!(eng.feed_context_gated(seed), "{method:?} {seed}");
+            let r = eng.process_key(key);
+            assert!(r.consumed, "{method:?} {seed} + {key}");
+            assert_eq!(
+                (r.backspaces, r.commit.as_str()),
+                (1, commit),
+                "{method:?} {seed} + {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn seeded_word_keeps_composing_key_after_key() {
+        // Existing text "phow", cursor after 'o'. Seed with "pho", then type
+        // Telex keys: each returns the patch for the glyph before the cursor,
+        // so the 'w' that sits after the cursor is preserved.
         let mut eng = EngineState::new(InputMethod::Telex);
-        let fed = eng.feed_context("pho");
-        assert!(fed);
+        assert!(eng.feed_context_gated("pho"));
 
         let r = eng.process_key('w');
         assert!(r.consumed);
-        assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "ơ");
+        assert_eq!((r.backspaces, r.commit.as_str()), (1, "ơ"));
 
-        // Adding `r` should change `ơ` to `ở` — engine deletes 1 char and
-        // commits the toned glyph. Net visible: ph + ở + (w after cursor).
         let r = eng.process_key('r');
         assert!(r.consumed);
-        assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "ở");
+        assert_eq!((r.backspaces, r.commit.as_str()), (1, "ở"));
     }
 
     #[test]
-    fn feed_context_empty_returns_false() {
-        let mut eng = EngineState::new(InputMethod::Telex);
-        assert!(!eng.feed_context(""));
+    fn seed_that_does_not_round_trip_is_refused() {
+        // "ơiời" reverse-telexes to "owiowfi", which renders back to "owiowfi"
+        // (NOT "ơiời") — a lossy reconstruction. The render-gate must refuse to
+        // seed and leave the engine pristine, so a following key starts a fresh
+        // word rather than composing against corrupt state.
+        for method in [InputMethod::Telex, InputMethod::Vni] {
+            let mut e = EngineState::new(method);
+            assert!(!e.feed_context_gated("ơiời"), "{method:?}");
+            assert!(
+                e.at_word_beginning(),
+                "{method:?}: rejected seed must leave the engine untouched"
+            );
+        }
     }
 
     #[test]
-    fn feed_context_accepts_composed_vietnamese_inside_word() {
+    fn empty_seed_is_refused() {
         let mut eng = EngineState::new(InputMethod::Telex);
-
-        assert!(eng.feed_context("pho"));
-        let r = eng.process_key('w');
-        assert!(r.consumed);
-        assert_eq!(r.commit, "ơ");
-
-        eng.reset();
-        assert!(eng.feed_context("phơ"));
-        let r = eng.process_key('r');
-        assert!(r.consumed);
-        assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "ở");
+        assert!(!eng.feed_context_gated(""));
+        // It still ends the word in progress: nothing is before the caret.
+        type_str(&mut eng, "a");
+        assert!(!eng.feed_context_gated(""));
+        assert!(eng.at_word_beginning());
     }
-
-    // ===== Switching methods =====
-
-    // ===== Regression: auto-restore after "work" → "push" =====
-    //
-    // After "work" triggers auto-escape (typing 'k' after 'r' tone on 'o'),
-    // the engine should still properly auto-restore "push" when 's' acts
-    // as a tone on 'u'. The 's' is Tone1 (sắc) in Telex, so it will
-    // temporarily produce "pú". But 'h' should trigger auto-restore back
-    // to "push".
 
     #[test]
     fn telex_work_space_push() {
-        // In Telex, 's' is Tone1 (sắc), so "push" produces "púh"
-        // at the engine level.  Auto-restore does NOT fire because
-        // 'h' is correctly accepted as a CVC final consonant in
-        // Vietnamese phonology, and auto-restore reverts the whole
-        // word when the composition becomes invalid.
+        // vnkey accepts the intermediate spelling `púh` rather than restoring
+        // `push`. This records its behavior, not a valid Vietnamese syllable:
+        // bare `h` is not a Vietnamese final consonant.
         let mut eng = EngineState::new(InputMethod::Telex);
         let mut buf = type_str(&mut eng, "work");
         assert_eq!(buf, "work", "auto-restore should revert 'work'");
         buf = type_str(&mut eng, " push");
         assert_eq!(buf, " púh", "'push' in Telex = 'púh' — s is Tone1");
-    }
-
-    #[test]
-    fn vni_and_telex_isolated() {
-        // Sanity: same engine, different method produces different output.
-        let mut t = EngineState::new(InputMethod::Telex);
-        let mut v = EngineState::new(InputMethod::Vni);
-        assert_eq!(type_str(&mut t, "as"), "á");
-        assert_eq!(type_str(&mut v, "as"), "as");
-    }
-
-    #[test]
-    fn feed_context_accepts_faithful_reconstruction() {
-        // A real single syllable reverse-telexes faithfully ("tiê" → "tiee" →
-        // renders "tiê"), so the gate passes and the engine is seeded: a tone
-        // key then edits the existing vowel instead of starting fresh.
-        let mut e = EngineState::new(InputMethod::Telex);
-        assert!(e.feed_context_gated("tiê"));
-        let r = e.process_key('s');
-        assert_eq!((r.backspaces, r.commit.as_str()), (1, "ế"));
-    }
-
-    #[test]
-    fn feed_context_rejects_lossy_reconstruction() {
-        // "ơiời" reverse-telexes to "owiowfi", which renders back to "owiowfi"
-        // (NOT "ơiời") — a lossy reconstruction. The render-gate must refuse to
-        // seed and leave the engine pristine, so a following key starts a fresh
-        // word rather than composing against corrupt state.
-        let mut e = EngineState::new(InputMethod::Telex);
-        assert!(!e.feed_context_gated("ơiời"));
-        assert!(
-            e.at_word_beginning(),
-            "rejected seed must leave the engine untouched"
-        );
-    }
-
-    // ===== VIQR surrounding-text reconstruction =====
-
-    #[test]
-    fn viqr_context_reversal_uses_viqr_keystrokes() {
-        // VIQR uses punctuation marks for tones/diacritics, not Telex letters.
-        let (keys, widths) = context_from_surrounding("nó", InputMethod::Viqr);
-        assert_eq!(keys, "no'", "VIQR acute tone is apostrophe, not 's'");
-        assert_eq!(widths, &[1, 2]);
-    }
-
-    #[test]
-    fn viqr_context_reversal_circumflex_and_horn() {
-        let (keys, _) = context_from_surrounding("ơ", InputMethod::Viqr);
-        assert_eq!(keys, "o+", "VIQR horn is '+'");
-
-        let (keys, _) = context_from_surrounding("ô", InputMethod::Viqr);
-        assert_eq!(keys, "o^", "VIQR circumflex is '^'");
-
-        let (keys, _) = context_from_surrounding("ă", InputMethod::Viqr);
-        assert_eq!(keys, "a(", "VIQR breve is '('");
-    }
-
-    #[test]
-    fn viqr_feed_context_accepts_composed_vietnamese_for_tone_replacement() {
-        let mut eng = EngineState::new(InputMethod::Viqr);
-        assert!(eng.feed_context("nó"));
-
-        let r = eng.process_key('?');
-
-        assert!(r.consumed);
-        assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "ỏ");
-    }
-
-    #[test]
-    fn viqr_feed_context_accepts_composed_vietnamese_inside_word() {
-        let mut eng = EngineState::new(InputMethod::Viqr);
-
-        assert!(eng.feed_context("pho"));
-        let r = eng.process_key('+');
-        assert!(r.consumed);
-        assert_eq!(r.commit, "ơ");
-
-        eng.reset();
-        assert!(eng.feed_context("phơ"));
-        let r = eng.process_key('?');
-        assert!(r.consumed);
-        assert_eq!(r.backspaces, 1);
-        assert_eq!(r.commit, "ở");
     }
 }
