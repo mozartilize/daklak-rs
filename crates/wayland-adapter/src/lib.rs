@@ -21,7 +21,7 @@
 //! Does NOT own:
 //! - Engine state / composition logic
 //! - Strategy / shadow buffer (lives in `edit-strategy`)
-//! - Per-window routing decisions / capability probe
+//! - Session routing and tier selection (the daemon)
 //! - Config, IPC, killer-feature seeding
 //!
 //! Daemon implements `AdapterHandler` and is called as protocol events fire.
@@ -116,11 +116,6 @@ pub trait AdapterHandler: 'static {
         raw_mods: (u32, u32, u32, u32),
     );
 
-    /// User released a key. Adapter has already forwarded the release and
-    /// dropped the key from the held set before this call — daemon impl is
-    /// usually a no-op.
-    fn on_key_released(&mut self, _ctx: &mut AdapterCtx<'_>, _time: u32, _evdev: u32) {}
-
     /// Modifier mask changed (post-suppression of synthetic echoes + xkb-state
     /// already updated adapter-side + vk.modifiers already mirrored).
     fn on_modifiers(&mut self, ctx: &mut AdapterCtx<'_>, mods: ModifierState);
@@ -148,10 +143,6 @@ impl<'a> AdapterCtx<'a> {
         self.state.raw_mods
     }
 
-    pub fn modifier_state(&self) -> ModifierState {
-        self.state.modifiers
-    }
-
     /// Replacement text can be typed as keysyms through the IMv1 context.
     pub fn has_keysym_commit(&self) -> bool {
         self.state.wire.has_keysym_commit()
@@ -161,18 +152,6 @@ impl<'a> AdapterCtx<'a> {
     /// that never activates text-input.
     pub fn supports_focus_session(&self) -> bool {
         self.state.wire.supports_focus_session()
-    }
-
-    /// Forward a raw press through vk (or v1 context) and mark the key held.
-    /// Used by daemon when a key bypasses composition (no active window, xkb
-    /// has no char for it, nav key, etc.).
-    pub fn forward_press(&mut self, time: u32, key: u32) {
-        let value = self.state.press_value();
-        self.state.emit_forward_key(time, key, value);
-        // A repeat is not a fresh press; the held set already reflects it.
-        if !self.state.forwarding_repeat {
-            self.state.held_forwarded.press(key);
-        }
     }
 
     /// Forward a raw press WITHOUT marking the key held. Used by the
@@ -293,10 +272,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         // focused app sees a balanced press/release pair.
         self.state.emit_forward_key(time, key, 0);
         self.state.held_forwarded.release(key);
-        let mut ctx = AdapterCtx {
-            state: &mut self.state,
-        };
-        self.handler.on_key_released(&mut ctx, time, key);
     }
 
     pub(crate) fn dispatch_key_press(&mut self, time: u32, key: u32) {
@@ -321,9 +296,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
                 self.state.held_forwarded.press(key);
             }
             KeyDecision::Apply {
-                // `method` is carried for diagnostics/parity but the emit path
-                // is selected inside the sink via `commit_string_functional`.
-                method: _,
                 backspaces,
                 commit,
             } => {
@@ -339,7 +311,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
 
                 // (Tail-char drop on space-after-tone on Tier 2
                 // ForwardKey + foot/KWin is handled per-keysym inside
-                // `AdapterSink::commit_via_keysym` — see that fn for
+                // `AdapterSink::commit_via_keysym_v1` — see that fn for
                 // the kc 247 forwardKeySym race explanation. No
                 // additional post-apply sleep needed at this boundary.)
 
@@ -395,7 +367,6 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             // (backspaces / forwarded commit) must be normal press/release, not
             // value=2, so clear forwarding_repeat for the apply.
             KeyDecision::Apply {
-                method: _,
                 backspaces,
                 commit,
             } => {
@@ -625,7 +596,6 @@ mod tests {
             _ch: Option<char>,
         ) -> KeyDecision {
             KeyDecision::Apply {
-                method: BackspaceMethod::ForwardKey,
                 backspaces: 0,
                 commit: "o".to_owned(),
             }
@@ -731,7 +701,6 @@ mod tests {
         ) -> KeyDecision {
             if key == 36 {
                 KeyDecision::Apply {
-                    method: BackspaceMethod::ForwardKey,
                     backspaces: 3,
                     commit: "ạnh".to_owned(),
                 }

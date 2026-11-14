@@ -322,8 +322,8 @@ that deleted `n`.
 
 ### `edit-strategy`
 The policy layer, independent of any transport:
-- `BackspaceMethod` enum and `detect_method()` — tier selection.
-- `CapabilityProbe` — the inputs to tier selection.
+- `BackspaceMethod` enum and `Strategy`, which executes an edit through the
+  current tier. The daemon chooses the tier.
 - `OutputSink` trait — the abstract edit interface the brain calls.
 - The shadow buffer and selection-aware byte/character deletion spans.
   The Composer decides when to adopt a frame or invalidate context.

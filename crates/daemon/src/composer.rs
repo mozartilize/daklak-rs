@@ -2,13 +2,10 @@
 //! surrounding-text reseed gate, transport-neutral. Each transport
 //! (wayland / ibus / evdev) is thin glue that translates its wire events
 //! into `Composer` calls; the composition logic lives here once.
-//!
-//! Evolved from the old `WindowState` (state) + the composition methods that
-//! used to live on `Daemon` (behavior). State and behavior now sit together.
 
 use std::time::{Duration, Instant};
 
-use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, KeyDecision, Strategy};
+use viet_ime_edit_strategy::{BackspaceMethod, KeyDecision, Strategy};
 use viet_ime_engine::{EngineState, InputMethod, ProcessResult};
 
 #[cfg(feature = "ibus")]
@@ -115,10 +112,9 @@ impl EditModel {
         serial: u32,
         time: u32,
         sink: &mut S,
-        delete_unit: DeleteUnit,
     ) {
         self.strategy
-            .apply(backspaces, commit, serial, time, sink, delete_unit);
+            .apply(backspaces, commit, serial, time, sink);
     }
 
     fn apply_forward_key<S: viet_ime_edit_strategy::OutputSink>(
@@ -380,16 +376,6 @@ impl ConfirmationState {
             Self::PendingRaw(pending) => pending.from_frame,
             Self::Live | Self::LiveConfirmed | Self::AwaitingFrame => false,
         }
-    }
-
-    #[cfg(test)]
-    fn replacement_pending(&self, ch: char, edit: Option<PendingEngineEdit>) -> Self {
-        Self::PendingRaw(PendingRaw {
-            ch,
-            repairable: !matches!(self, Self::PendingRaw(_)),
-            edit,
-            from_frame: self.is_frame_derived(),
-        })
     }
 
     #[cfg(test)]
@@ -885,7 +871,6 @@ impl Composer {
         if capitalize && !result.consumed {
             self.confirmation = ConfirmationState::Live;
             return KeyDecision::Apply {
-                method: self.method(),
                 backspaces: 0,
                 commit: typed.to_string(),
             };
@@ -929,7 +914,6 @@ impl Composer {
         self.last_keystroke_at = now;
         self.confirmation = ConfirmationState::Live;
         KeyDecision::Apply {
-            method: self.method(),
             backspaces: 1,
             commit: ". ".to_owned(),
         }
@@ -977,7 +961,6 @@ impl Composer {
             KeyFinishPlan::Apply { backspaces, commit } => {
                 self.confirmation = ConfirmationState::Live;
                 KeyDecision::Apply {
-                    method: self.method(),
                     backspaces,
                     commit,
                 }
@@ -1052,9 +1035,7 @@ impl Composer {
 
         if r.consumed {
             self.last_keystroke_at = Instant::now();
-            let method = self.method();
             KeyDecision::Apply {
-                method,
                 backspaces: r.backspaces,
                 commit: r.commit,
             }
@@ -1109,7 +1090,7 @@ impl Composer {
         sink: &mut S,
     ) {
         self.edit
-            .apply(backspaces, commit, 0, time, sink, DeleteUnit::Bytes);
+            .apply(backspaces, commit, 0, time, sink);
         self.refresh_retroactive_context_after_apply(backspaces);
     }
 
@@ -1169,7 +1150,7 @@ impl Composer {
                 .apply_forward_key(backspaces, commit, serial, time, sink);
         } else {
             self.edit
-                .apply(backspaces, commit, serial, time, sink, DeleteUnit::Bytes);
+                .apply(backspaces, commit, serial, time, sink);
         }
 
         if !preserve_engine {
@@ -2008,7 +1989,7 @@ mod tests {
     use super::{current_word_before_cursor, current_word_before_insertion_point};
     use super::{ByteCursor, Composer};
     use viet_ime_edit_strategy::KeyDecision;
-    use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, KeyState, OutputSink};
+    use viet_ime_edit_strategy::{BackspaceMethod, KeyState, OutputSink};
     use viet_ime_engine::InputMethod;
 
     // Re-exports for nested test modules
@@ -2069,12 +2050,6 @@ mod tests {
 
         fn vk_key(&mut self, time: u32, key_code: u32, state: KeyState) {
             self.vk_keys.push((time, key_code, state));
-        }
-
-        fn vk_modifiers(&mut self, _depressed: u32, _latched: u32, _locked: u32, _group: u32) {}
-
-        fn vk_commit_char(&mut self, _time: u32, _ch: char) -> bool {
-            false
         }
     }
 
@@ -2306,12 +2281,6 @@ mod tests {
             if key_code == 14 && state == KeyState::Pressed {
                 self.delete_chars_before_caret(1);
             }
-        }
-
-        fn vk_modifiers(&mut self, _: u32, _: u32, _: u32, _: u32) {}
-
-        fn vk_commit_char(&mut self, _time: u32, _ch: char) -> bool {
-            false
         }
     }
 
@@ -4712,23 +4681,6 @@ mod tests {
                 .is_none());
         }
 
-        #[test]
-        fn overlapping_pending_key_becomes_non_repairable() {
-            let state = super::ConfirmationState::PendingRaw(super::PendingRaw {
-                ch: 's',
-                repairable: true,
-                edit: None,
-                from_frame: false,
-            });
-
-            let replacement = state.replacement_pending('f', None);
-            let pending = replacement
-                .pending_raw()
-                .expect("pending replacement state");
-
-            assert_eq!(pending.ch, 'f');
-            assert!(!pending.repairable);
-        }
 
         #[test]
         fn selected_frame_preserves_pending_frame_provenance() {
@@ -4804,7 +4756,7 @@ mod tests {
             assert_eq!(edit.shadow_text(), "a");
 
             let mut sink = DeleteCaptureSink::default();
-            edit.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
+            edit.apply(1, "â", 1, 0, &mut sink);
 
             assert_eq!(sink.deletes.len(), 1);
             assert_eq!(sink.commits, vec!["â".to_owned()]);

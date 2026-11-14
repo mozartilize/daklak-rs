@@ -109,7 +109,7 @@ pub struct AdapterSink<'a> {
     /// keysym KWin maps to that keycode) would be dropped as a duplicate, so
     /// the sink emits a prelude release first and removes the key here.
     pub(crate) held: &'a mut HeldKeys,
-    /// Wayland connection — used by `commit_via_keysym` to flush after
+    /// Wayland connection — used by the key-channel commit to flush after
     /// the batch of emissions so they reach the compositor in one round.
     pub(crate) conn: &'a wayland_client::Connection,
     /// Reverse lookup for held-key releases and the IMv1 modifier guard.
@@ -213,34 +213,9 @@ impl OutputSink for AdapterSink<'_> {
         }
     }
 
-    fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        self.keys
-            .emit_modifiers(depressed, latched, locked, group);
-    }
-
-    fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
-        if !self.keys.has_synthetic_keymap() {
-            return false;
-        }
-        viet_ime_key_emitter::emit_char(
-            &mut self.keys,
-            &mut self.echo.emission(),
-            viet_ime_key_emitter::EmitCharParams {
-                raw_mods: self.raw_mods,
-                held: self.held,
-                time,
-                c,
-            },
-        )
-    }
-
-    fn commit_via_keysym(&mut self, serial: u32, time: u32, text: &str) -> bool {
+    fn commit_key_channel_text(&mut self, _serial: u32, time: u32, text: &str) -> bool {
         // Never emit a supported prefix and fall back with the remainder: that
         // reorders characters across keyboard and text-input delivery queues.
-        self.commit_key_channel_text(serial, time, text)
-    }
-
-    fn commit_key_channel_text(&mut self, _serial: u32, time: u32, text: &str) -> bool {
         match self.keys {
             // Preflight the entire text before emitting any key.
             KeyOutput::VirtualKeyboard { .. } => {
@@ -269,6 +244,25 @@ impl OutputSink for AdapterSink<'_> {
 }
 
 impl AdapterSink<'_> {
+    /// Emit `c` through the virtual keyboard using daklak's synthesized
+    /// Vietnamese keymap. Returns `false` if there is no synthetic keymap or
+    /// `c` is not in its inventory.
+    pub(crate) fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
+        if !self.keys.has_synthetic_keymap() {
+            return false;
+        }
+        viet_ime_key_emitter::emit_char(
+            &mut self.keys,
+            &mut self.echo.emission(),
+            viet_ime_key_emitter::EmitCharParams {
+                raw_mods: self.raw_mods,
+                held: self.held,
+                time,
+                c,
+            },
+        )
+    }
+
     /// ImV1 keysym-path commit. Emits the whole replacement through the
     /// keysym channel to avoid non-atomic split-channel edits (keysym for
     /// Vietnamese chars + commit_string for ASCII tails), which terminals
@@ -287,7 +281,7 @@ impl AdapterSink<'_> {
             return false;
         }
 
-        tracing::trace!(text = %text, "commit_via_keysym: enter (v1 keysym path)");
+        tracing::trace!(text = %text, "commit_via_keysym_v1: enter (v1 keysym path)");
 
         for c in text.chars() {
             let is_unmapped = match self.xkb {
@@ -302,7 +296,7 @@ impl AdapterSink<'_> {
             // Unicode form so KWin resolves them to daklak's own slot (see
             // `commit_keysym`). Latin-1 chars keep their legacy keysyms.
             let Some(sym) = viet_ime_keymap::xkb::commit_keysym(c) else {
-                tracing::debug!(c = %c, "commit_via_keysym: no keysym for char, falling back");
+                tracing::debug!(c = %c, "commit_via_keysym_v1: no keysym for char, falling back");
                 return false;
             };
 
@@ -343,7 +337,7 @@ impl AdapterSink<'_> {
             tracing::trace!(
                 c = %c,
                 sym = sym.raw(),
-                "commit_via_keysym: keysym emit + barrier (unmapped)"
+                "commit_via_keysym_v1: keysym emit + barrier (unmapped)"
             );
         }
 

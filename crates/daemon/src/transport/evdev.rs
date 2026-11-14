@@ -50,10 +50,7 @@ impl viet_ime_evdev_adapter::EvdevHandler for Daemon {
     }
 
     fn clear_session(&mut self) {
-        self.router.current_active = false;
-        self.router.synthetic_active = false;
-        self.router.composer = None;
-        self.router.focused_app_id = None;
+        self.end_session();
     }
 
     fn clear_last_input_char(&mut self) {
@@ -93,7 +90,6 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             noop_config_rx(),
         );
-        d.router.current_active = true;
         d.router.composer = Some(Composer::new(
             InputMethod::Telex,
             BackspaceMethod::SurroundingText,

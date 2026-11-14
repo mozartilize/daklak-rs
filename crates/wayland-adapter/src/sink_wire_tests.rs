@@ -74,7 +74,7 @@ fn unsupported_middle_character_emits_nothing_before_whole_text_fallback() {
         h.requests();
         let mut adapter = AdapterCtx { state: &mut h.app.state };
         adapter.with_sink((0, 0, 0, 0), true, |sink| {
-            assert!(!sink.commit_via_keysym(0, 7, text));
+            assert!(!sink.commit_key_channel_text(0, 7, text));
         });
         assert!(h.requests().is_empty(), "no supported prefix may escape before fallback");
     }

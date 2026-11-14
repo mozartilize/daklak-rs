@@ -56,11 +56,13 @@ channels (see below).
 
 ## Selection logic
 
-The strategy code chooses a tier from the current client and transport
-capabilities. The important rules:
+The daemon chooses a tier when a client activates text-input
+(`Daemon::detect_capability`) and can switch it at runtime. The important rules:
 
-- **Surrounding text wins.** If the probe shows surrounding-text was observed,
-  use Tier 1.
+- **Surrounding text wins.** If the activate frame carried surrounding-text
+  (even an empty string), use Tier 1. A client whose activate frame had none
+  (Chromium on wlroots) is upgraded to Tier 1 on its first surrounding-text
+  frame.
 - **Terminals are not special-cased at detection.** The compositor's terminal
   content purpose no longer forces a tier. A terminal that advertises an empty
   surrounding-text frame (foot on KWin) is initially detected as Tier 1
@@ -122,5 +124,5 @@ forgotten then; a forwarded Backspace on a selection keeps the shadow's text.
 ## Next
 
 - [Transports](transports.md) — how each tier maps onto each wire protocol.
-- [Capability model](capability-model.md) — where the `CapabilityProbe` inputs
-  come from.
+- [Capability model](capability-model.md) — the transport capability facts
+  that tier and emit decisions read.

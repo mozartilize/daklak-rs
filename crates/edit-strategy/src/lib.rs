@@ -7,14 +7,12 @@
     )
 )]
 
-pub mod capability;
 pub mod shadow;
 
 mod forward_key;
 mod surrounding;
 pub mod uinput_device;
 
-pub use capability::{detect_method, CapabilityProbe};
 pub use shadow::ShadowBuffer;
 
 use bitflags::bitflags;
@@ -26,12 +24,6 @@ use bitflags::bitflags;
 pub enum BackspaceMethod {
     SurroundingText, // Tier 1 — delete_surrounding_text
     ForwardKey,      // Tier 2 — zwp_virtual_keyboard_v1 synthetic BS
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeleteUnit {
-    Bytes,
-    Chars,
 }
 
 /// Daemon's decision after processing a single key press. Returned from
@@ -47,7 +39,6 @@ pub enum KeyDecision {
     /// Engine consumed and produced an edit. The adapter's sink releases any
     /// still-held user key the edit re-presses (tail-char-drop fix).
     Apply {
-        method: BackspaceMethod,
         backspaces: usize,
         commit: String,
     },
@@ -78,9 +69,8 @@ pub trait OutputSink {
     // Tier 1
     /// Delete text around the cursor. `before_bytes`/`after_bytes` are
     /// UTF-8 byte counts (what wlroots v2/v3 IM and all spec-compliant
-    /// v3 clients want); `before_chars`/`after_chars` are Unicode scalar
-    /// counts for callers explicitly requesting character-count compatibility.
-    /// The sink receives the unit requested by the current correction.
+    /// v3 clients want); `before_chars`/`after_chars` are the same span in
+    /// Unicode scalars, for transports that count characters (IBus).
     fn delete_surrounding_text(
         &mut self,
         before_bytes: u32,
@@ -93,19 +83,6 @@ pub trait OutputSink {
     fn commit(&mut self, serial: u32);
     // Tier 2 — zwp_virtual_keyboard_v1
     fn vk_key(&mut self, time: u32, key_code: u32, state: KeyState);
-    fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32);
-    /// ForwardKey synthetic-keymap channel — emit `c` via `vk_key()` using
-    /// daklak's synthesized Vietnamese keymap. Returns `false` if `c` isn't
-    /// in the keymap inventory (caller should fall back).
-    fn vk_commit_char(&mut self, time: u32, c: char) -> bool;
-
-    /// Emit `text` as a sequence of `(press, release)` keysym pairs.
-    /// Implemented on ImV1 via `zwp_input_method_context_v1::keysym`.
-    /// Returns `true` if emitted; `false` if the backend has no keysym
-    /// path (caller falls back to `commit_string` + `commit`).
-    fn commit_via_keysym(&mut self, _serial: u32, _time: u32, _text: &str) -> bool {
-        false
-    }
 
     /// Prefer key deletion + insertion over text edits for this replacement.
     /// Must preflight the entire string without emitting anything. Returning
@@ -149,30 +126,13 @@ impl Strategy {
         serial: u32,
         time: u32,
         sink: &mut impl OutputSink,
-        delete_unit: DeleteUnit,
     ) {
         match self.method {
             BackspaceMethod::SurroundingText => {
-                surrounding::apply(
-                    &mut self.shadow,
-                    backspaces,
-                    commit,
-                    serial,
-                    time,
-                    sink,
-                    delete_unit,
-                );
+                surrounding::apply(&mut self.shadow, backspaces, commit, serial, time, sink);
             }
             BackspaceMethod::ForwardKey => {
-                forward_key::apply(
-                    &mut self.shadow,
-                    backspaces,
-                    commit,
-                    serial,
-                    time,
-                    sink,
-                    false,
-                );
+                forward_key::apply(&mut self.shadow, backspaces, commit, serial, time, sink);
             }
         }
     }
@@ -189,15 +149,7 @@ impl Strategy {
         time: u32,
         sink: &mut impl OutputSink,
     ) {
-        forward_key::apply(
-            &mut self.shadow,
-            backspaces,
-            commit,
-            serial,
-            time,
-            sink,
-            true,
-        );
+        forward_key::apply(&mut self.shadow, backspaces, commit, serial, time, sink);
     }
 
     /// Observe a surrounding_text frame from the compositor. Resets shadow on
@@ -248,8 +200,6 @@ mod tests {
         CommitString(String),
         Commit(u32),
         VkKey(u32, u32, KeyState),
-        VkModifiers(u32, u32, u32, u32),
-        VkCommitChar(u32, char),
     }
 
     impl OutputSink for MockSink {
@@ -276,14 +226,6 @@ mod tests {
         fn vk_key(&mut self, time: u32, key_code: u32, state: KeyState) {
             self.calls.push(Call::VkKey(time, key_code, state));
         }
-        fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
-            self.calls
-                .push(Call::VkModifiers(depressed, latched, locked, group));
-        }
-        fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
-            self.calls.push(Call::VkCommitChar(time, c));
-            true
-        }
     }
 
     // ── Tier 1 — SurroundingText ──────────────────────────────────────────────
@@ -293,7 +235,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("a");
         let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
+        s.apply(1, "â", 1, 0, &mut sink);
         assert_eq!(
             sink.calls,
             vec![
@@ -311,25 +253,12 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("â");
         let mut sink = MockSink::default();
-        s.apply(1, "ầ", 1, 0, &mut sink, DeleteUnit::Bytes);
+        s.apply(1, "ầ", 1, 0, &mut sink);
         assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 1, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("ầ".to_owned()));
         assert_eq!(s.shadow.text(), "ầ");
     }
 
-    #[test]
-    fn tier1_multibyte_delete_can_emit_char_count_primary_length() {
-        // Explicit compatibility API: the primary length is one scalar even
-        // though the glyph spans two UTF-8 bytes. This is not the byte-length
-        // contract used by the composer's cached-report client tests.
-        let mut s = Strategy::new(BackspaceMethod::SurroundingText);
-        s.shadow.append("ư");
-        let mut sink = MockSink::default();
-        s.apply(1, "ự", 1, 0, &mut sink, DeleteUnit::Chars);
-        assert_eq!(sink.calls[0], Call::DeleteSurroundingText(1, 1, 0, 0));
-        assert_eq!(sink.calls[1], Call::CommitString("ự".to_owned()));
-        assert_eq!(s.shadow.text(), "ự");
-    }
 
     #[test]
     fn tier1_retroactive_pho_horn_to_pho_hook() {
@@ -340,7 +269,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("phơ");
         let mut sink = MockSink::default();
-        s.apply(1, "ở", 1, 0, &mut sink, DeleteUnit::Bytes);
+        s.apply(1, "ở", 1, 0, &mut sink);
         assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 1, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("ở".to_owned()));
         assert_eq!(s.shadow.text(), "phở");
@@ -353,7 +282,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.shadow.append("tieê");
         let mut sink = MockSink::default();
-        s.apply(4, "tiến", 1, 0, &mut sink, DeleteUnit::Bytes);
+        s.apply(4, "tiến", 1, 0, &mut sink);
         assert_eq!(sink.calls[0], Call::DeleteSurroundingText(5, 4, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("tiến".to_owned()));
     }
@@ -365,7 +294,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::ForwardKey);
         s.shadow.append("a");
         let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
+        s.apply(1, "â", 1, 0, &mut sink);
         assert_eq!(
             sink.calls,
             vec![
@@ -382,7 +311,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::ForwardKey);
         s.shadow.append("abc");
         let mut sink = MockSink::default();
-        s.apply(3, "x", 2, 5, &mut sink, DeleteUnit::Bytes);
+        s.apply(3, "x", 2, 5, &mut sink);
         // 3×(Pressed,Released) = 6 calls, then CommitString, Commit
         assert_eq!(sink.calls.len(), 8);
         assert_eq!(sink.calls[0], Call::VkKey(5, 14, KeyState::Pressed));
@@ -400,7 +329,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::ForwardKey);
         s.shadow.append("abc");
         let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
+        s.apply(1, "â", 1, 0, &mut sink);
         assert_eq!(s.shadow.text(), "abâ");
     }
 
@@ -423,7 +352,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.on_surrounding_text("châ", 4, 4); // "châ" = 4 bytes
         let mut sink = MockSink::default();
-        s.apply(1, "ầ", 1, 0, &mut sink, DeleteUnit::Bytes);
+        s.apply(1, "ầ", 1, 0, &mut sink);
         assert_eq!(sink.calls[0], Call::DeleteSurroundingText(2, 1, 0, 0));
         assert_eq!(sink.calls[1], Call::CommitString("ầ".to_owned()));
     }
@@ -448,7 +377,7 @@ mod tests {
         let mut s = Strategy::new(BackspaceMethod::SurroundingText);
         s.on_surrounding_text("translate", 3, 9);
         let mut sink = MockSink::default();
-        s.apply(1, "â", 1, 0, &mut sink, DeleteUnit::Bytes);
+        s.apply(1, "â", 1, 0, &mut sink);
         assert_eq!(
             sink.calls,
             vec![
@@ -488,10 +417,6 @@ mod tests {
         fn vk_key(&mut self, _: u32, key_code: u32, state: KeyState) {
             self.ops.push(format!("key:{key_code}:{state:?}"));
         }
-        fn vk_modifiers(&mut self, _: u32, _: u32, _: u32, _: u32) {}
-        fn vk_commit_char(&mut self, _: u32, _c: char) -> bool {
-            false
-        }
         fn commit_key_channel_text(&mut self, _: u32, _: u32, text: &str) -> bool {
             if !self.key_channel_ok {
                 return false;
@@ -515,7 +440,7 @@ mod tests {
                 key_channel_ok: false,
             };
 
-            crate::forward_key::apply(&mut shadow, 2, "ình", 1, 0, &mut sink, false);
+            crate::forward_key::apply(&mut shadow, 2, "ình", 1, 0, &mut sink);
 
             let presses = sink.ops.iter().filter(|op| *op == "key:14:Pressed").count();
             assert_eq!(presses, 3, "{text}");
@@ -533,7 +458,7 @@ mod tests {
             key_channel_ok: true,
         };
 
-        crate::forward_key::apply(&mut shadow, 2, "ập", 1, 0, &mut sink, true);
+        crate::forward_key::apply(&mut shadow, 2, "ập", 1, 0, &mut sink);
 
         assert!(sink.ops.iter().any(|op| op == "vk_char:ậ"));
         assert!(sink.ops.iter().any(|op| op == "vk_char:p"));
@@ -549,28 +474,11 @@ mod tests {
             key_channel_ok: false,
         };
 
-        crate::forward_key::apply(&mut shadow, 2, "ập", 1, 0, &mut sink, true);
+        crate::forward_key::apply(&mut shadow, 2, "ập", 1, 0, &mut sink);
 
         assert!(sink.ops.iter().any(|op| op == "commit_string:ập"));
         assert!(!sink.ops.iter().any(|op| op == "commit_string:p"));
         assert!(!sink.ops.iter().any(|op| op == "commit_string:ậ"));
     }
 
-    #[test]
-    fn forward_key_replacement_uses_whole_commit_string_on_normal_path() {
-        let mut shadow = ShadowBuffer::new();
-        shadow.append("lâp");
-        let mut sink = WholeChannelSink {
-            ops: Vec::new(),
-            key_channel_ok: false,
-        };
-
-        // Normal path (prefer_key_channel_commit=false) falls through to
-        // commit_via_keysym which returns false → whole commit_string.
-        crate::forward_key::apply(&mut shadow, 2, "ập", 1, 0, &mut sink, false);
-
-        assert!(sink.ops.iter().any(|op| op == "commit_string:ập"));
-        assert!(!sink.ops.iter().any(|op| op == "commit_string:p"));
-        assert!(!sink.ops.iter().any(|op| op == "commit_string:ậ"));
-    }
 }

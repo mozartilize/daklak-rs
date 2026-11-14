@@ -1,17 +1,15 @@
-//! Wayland transport glue: `AdapterHandler` impl. Translates text_input_v1/v2
+//! Wayland transport glue: `AdapterHandler` impl. Translates input-method-v1/v2
 //! frames into `Composer` calls. Owns the wayland-only frame bookkeeping (the
-//! late-tier-upgrade probe, the duplicate-frame guard's activate/deactivate
+//! late tier upgrade, the duplicate-frame guard's activate/deactivate
 //! framing, `AdapterCtx` plumbing). The reseed gate itself lives once on
 //! `Composer::observe_surrounding_bytes`.
 
 use std::sync::atomic::Ordering;
 
-use viet_ime_edit_strategy::{
-    detect_method, BackspaceMethod, CapabilityProbe, KeyDecision, ModifierState,
-};
+use viet_ime_edit_strategy::{BackspaceMethod, KeyDecision, ModifierState};
 use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, FrameSnapshot};
 
-use crate::composer::{ByteCursor, Composer};
+use crate::composer::ByteCursor;
 use crate::handler::{Daemon, KEY_BACKSPACE, NAV_KEYS};
 
 impl AdapterHandler for Daemon {
@@ -22,32 +20,20 @@ impl AdapterHandler for Daemon {
             tracing::info!(
                 "real Activate received while synthetic session active → drop synthetic"
             );
-            self.router.current_active = false;
-            self.router.synthetic_active = false;
-            self.router.composer = None;
-            self.router.focused_app_id = None;
+            self.end_session();
         }
 
-        let activate = frame.activate && !self.router.current_active;
-        let deactivate = frame.deactivate && self.router.current_active;
+        let activate = frame.activate && self.router.composer.is_none();
+        let deactivate = frame.deactivate && self.router.composer.is_some();
 
         if activate {
             let app_id = frame.app_id.clone();
             tracing::info!(app_id = ?app_id, "activate");
-            self.router.current_active = true;
             self.router.focused_app_id = app_id;
 
             let method = self.detect_capability(frame);
             tracing::info!("capability detected: {:?}", method);
-            let mut c = Composer::new(
-                self.config.method.to_engine(),
-                method,
-                self.config.bracket_shortcuts,
-            );
-            c.set_modern_style(self.config.modern_style);
-            c.set_v2_key_replacement(self.config.v2_key_replacement);
-            c.set_auto_capitalize(self.config.auto_capitalize);
-            c.set_double_space_period(self.config.double_space_period);
+            let mut c = self.new_composer(method);
             // Cursor-relative retroactive edits are confirmed by the client
             // frame containing the raw key at its actual insertion point.
             // Wayland-only: IBus cannot drain frame-triggered repairs here.
@@ -60,9 +46,7 @@ impl AdapterHandler for Daemon {
             self.router.composer = Some(c);
         } else if deactivate {
             tracing::debug!("deactivate");
-            self.router.current_active = false;
-            self.router.composer = None;
-            self.router.focused_app_id = None;
+            self.end_session();
         }
 
         // After deactivate, composer is None — nothing more to do.
@@ -130,18 +114,8 @@ impl AdapterHandler for Daemon {
             // autocomplete-selection handling works. Upgrade-only: never
             // downgrade ST → FK here.
             if !activate && w.method() == BackspaceMethod::ForwardKey {
-                let probe = CapabilityProbe {
-                    surrounding_text_seen: true,
-                };
-                let upgraded = detect_method(&probe);
-                if upgraded == BackspaceMethod::SurroundingText {
-                    tracing::info!(
-                        from = ?BackspaceMethod::ForwardKey,
-                        to = ?upgraded,
-                        "late tier upgrade on first surrounding_text"
-                    );
-                    w.set_method(upgraded);
-                }
+                tracing::info!("late tier upgrade on first surrounding_text: ForwardKey → SurroundingText");
+                w.set_method(BackspaceMethod::SurroundingText);
             }
 
             // The ONE reseed gate. force_reseed on activate (always seed from
@@ -206,13 +180,6 @@ impl AdapterHandler for Daemon {
             self.sync_enabled_edge()
         };
         if !enabled {
-            return KeyDecision::ForwardRaw;
-        }
-
-        // When the supervisor has layered evdev on top (suspended=true),
-        // pass all keys through raw — the evdev grab owns the keyboard.
-        if self.suspended.load(Ordering::Acquire) {
-            self.with_composer(|w| w.full_reset());
             return KeyDecision::ForwardRaw;
         }
 
@@ -303,18 +270,11 @@ impl AdapterHandler for Daemon {
                 return KeyDecision::Consumed;
             }
             // No keysym route: commit the char as text instead.
-            let method = self
-                .router
-                .composer
-                .as_mut()
-                .map(|w| {
-                    w.take_forwarded_char_for_commit();
-                    w.method()
-                })
-                .unwrap_or(BackspaceMethod::ForwardKey);
+            if let Some(w) = self.router.composer.as_mut() {
+                w.take_forwarded_char_for_commit();
+            }
             tracing::debug!(ch = %ch, "level-shifted passthrough → commit (v1 keycode loses modifier level)");
             return KeyDecision::Apply {
-                method,
                 backspaces: 0,
                 commit: ch.to_string(),
             };
@@ -366,23 +326,14 @@ impl AdapterHandler for Daemon {
         let synthetic_target_changed =
             self.router.synthetic_active && matched && self.router.focused_app_id != app_id;
 
-        if matched && (!self.router.current_active || synthetic_target_changed) {
+        if matched && (self.router.composer.is_none() || synthetic_target_changed) {
             let id = app_id.clone().unwrap_or_default();
 
             tracing::info!(app_id = %id, is_xwayland,
                 "synthetic activate → ForwardKey (focus without text-input)");
-            self.router.current_active = true;
             self.router.synthetic_active = true;
             self.router.focused_app_id = app_id;
-            let mut c = Composer::new(
-                self.config.method.to_engine(),
-                BackspaceMethod::ForwardKey,
-                self.config.bracket_shortcuts,
-            );
-            c.set_modern_style(self.config.modern_style);
-            c.set_v2_key_replacement(self.config.v2_key_replacement);
-            c.set_auto_capitalize(self.config.auto_capitalize);
-            c.set_double_space_period(self.config.double_space_period);
+            let mut c = self.new_composer(BackspaceMethod::ForwardKey);
             // No text-input session exists for this client, so commit_string is
             // dead. Force ForwardKey to route replacements through the virtual
             // keyboard's synthetic keymap instead.
@@ -395,10 +346,7 @@ impl AdapterHandler for Daemon {
                 is_xwayland,
                 "synthetic deactivate (focus lost / no virtual keyboard)"
             );
-            self.router.current_active = false;
-            self.router.synthetic_active = false;
-            self.router.composer = None;
-            self.router.focused_app_id = None;
+            self.end_session();
         } else if !self.router.synthetic_active && matched {
             tracing::trace!("focus_changed skipped: already active via IM");
         }

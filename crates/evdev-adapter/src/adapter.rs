@@ -592,7 +592,6 @@ mod tests {
         let mut adapter = test_adapter(emitter);
         let mut handler = MockHandler {
             backspace_decision: Some(KeyDecision::Apply {
-                method: viet_ime_edit_strategy::BackspaceMethod::ForwardKey,
                 backspaces: 3,
                 commit: "òa".into(),
             }),
@@ -686,7 +685,6 @@ mod tests {
             char_decisions: vec![
                 KeyDecision::Consumed,
                 KeyDecision::Apply {
-                    method: viet_ime_edit_strategy::BackspaceMethod::ForwardKey,
                     backspaces: 1,
                     commit: "a".into(),
                 },

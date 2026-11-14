@@ -29,7 +29,7 @@ Before changing anything, hold these three facts:
 | You want to change… | Go to |
 | ------------------- | ----- |
 | The Vietnamese composition behavior | `engine` (wraps vendored vnkey — never edit `vendors/`) |
-| When/which tier is chosen | `edit-strategy` (`detect_method`) |
+| When/which tier is chosen | `daemon::handler` (`detect_capability`) at activation; runtime switches in `daemon::composer` and `daemon::transport::wayland` |
 | How an edit is executed on the wire | the relevant transport adapter's sink |
 | Composition state / shadow / reseed | `daemon::composer` |
 | Key routing per transport | `daemon::handler` |
@@ -84,7 +84,7 @@ cargo test --features ibus  # IBus-gated tests too
 ```
 
 Favor unit tests that don't need a live compositor — channel negotiation and
-`detect_method` tier selection are both testable in isolation, and the Wayland
+tier selection are both testable in isolation, and the Wayland
 adapter's test state runs on a real connection whose requests can be read back.
 Prefer adding such a test over a manual end-to-end check where possible.
 

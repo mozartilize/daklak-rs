@@ -1,4 +1,4 @@
-use crate::{DeleteUnit, KeyState, OutputSink, ShadowBuffer};
+use crate::{KeyState, OutputSink, ShadowBuffer};
 
 /// Linux evdev keycode for Backspace.
 const KEY_BACKSPACE: u32 = 14;
@@ -7,9 +7,8 @@ const KEY_BACKSPACE: u32 = 14;
 /// (Tier 1 — BackspaceMethod::SurroundingText).
 ///
 /// Pass both byte and char counts: per the v2/v3 spec
-/// (zwp-input-method-unstable-v2.xml:262-281) `before_length` is bytes.
-/// Callers may explicitly request character-count compatibility; normal
-/// composer corrections use the spec-compliant byte counts.
+/// (zwp-input-method-unstable-v2.xml:262-281) `before_length` is bytes, while
+/// IBus counts characters; each sink uses the unit its transport needs.
 ///
 /// When the compositor reports a selection (anchor ≠ cursor), Chromium may
 /// reject `delete_surrounding_text` because the client's selection state
@@ -26,7 +25,6 @@ pub fn apply(
     serial: u32,
     time: u32,
     sink: &mut impl OutputSink,
-    delete_unit: DeleteUnit,
 ) {
     let (before_bytes, before_chars, after_bytes, after_chars) = shadow.pop_delete_span(backspaces);
 
@@ -55,27 +53,11 @@ pub fn apply(
     tracing::debug!(
         before_bytes,
         before_chars,
-        ?delete_unit,
         commit,
         serial,
         "surrounding tier: emit delete_surrounding_text + commit_string"
     );
-    let (emit_before, emit_after) = match delete_unit {
-        DeleteUnit::Bytes => (before_bytes, after_bytes),
-        DeleteUnit::Chars => (before_chars, after_chars),
-    };
-    if delete_unit == DeleteUnit::Chars {
-        tracing::info!(
-            before_bytes,
-            before_chars,
-            after_bytes,
-            after_chars,
-            emit_before,
-            emit_after,
-            "surrounding tier: emitting char-count delete fallback"
-        );
-    }
-    sink.delete_surrounding_text(emit_before, before_chars, emit_after, after_chars);
+    sink.delete_surrounding_text(before_bytes, before_chars, after_bytes, after_chars);
     sink.commit_string(commit);
     sink.commit(serial);
     shadow.append(commit);

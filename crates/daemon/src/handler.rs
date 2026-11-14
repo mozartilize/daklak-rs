@@ -8,9 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use viet_ime_edit_strategy::{
-    detect_method, BackspaceMethod, CapabilityProbe, KeyDecision, ModifierState,
-};
+use viet_ime_edit_strategy::{BackspaceMethod, KeyDecision, ModifierState};
 use viet_ime_wayland_adapter::FrameSnapshot;
 
 #[cfg(feature = "ibus")]
@@ -34,22 +32,19 @@ pub(crate) const NAV_KEYS: &[u32] = &[
 /// `Router` holds the active session, focus, modifiers, and enabled edge state.
 pub struct Router {
     pub modifiers: ModifierState,
-    pub current_active: bool,
 
-    /// True when `current_active` was synthesized by daklak (a focused
-    /// toplevel exposed a virtual keyboard but never enabled text-input, so
-    /// no compositor `Activate` fired) rather than driven by a compositor
-    /// `zwp_input_method_v2::Activate` event. Real activate always wins.
-    pub synthetic_active: bool,
-
-    /// Single live composition state. Shape unchanged from the old
-    /// `window: Option<WindowState>` — only the type name changed. The
-    /// per-session HashMap is a deferred follow-up, not here.
+    /// The live session's composition state; `Some` exactly while a session
+    /// is active. There is one session at a time.
     pub composer: Option<Composer>,
 
-    /// Focused window's `app_id` captured at activate. Threaded into the
-    /// capability probe so known-broken-on-ForwardKey terminals can
-    /// auto-escalate. None outside an active session.
+    /// True when the session was synthesized by daklak (a focused toplevel
+    /// that never enabled text-input, or evdev mode) rather than started by
+    /// a compositor `Activate`. A real activate always replaces it.
+    pub synthetic_active: bool,
+
+    /// Focused window's `app_id` captured when the session started; `None`
+    /// outside a session. A focus-synthesized session restarts when it
+    /// changes, so a half-typed word never carries over to another window.
     pub focused_app_id: Option<String>,
 
     /// Previous value of `enabled`; used for edge-detection (on→off triggers
@@ -61,9 +56,8 @@ impl Router {
     fn new() -> Self {
         Self {
             modifiers: ModifierState::empty(),
-            current_active: false,
-            synthetic_active: false,
             composer: None,
+            synthetic_active: false,
             focused_app_id: None,
             last_enabled: true,
         }
@@ -80,15 +74,13 @@ pub struct Daemon {
     /// Shared on/off flag — written by the control task, read each keystroke.
     pub enabled: Arc<AtomicBool>,
 
-    /// Passthrough flag: when true, the transport passes all keys through raw
-    /// (passthrough, no composition). Used by the ibus transport (true
-    /// layering — ibus connection stays alive while evdev owns the keyboard)
-    /// and the wayland transport (hand-off — evdev replaces wayland, and
-    /// wayland reconnects when the system switches back to native). Prevents
-    /// double-processing of keys by both backends. Distinct from `enabled`
-    /// which is the user's on/off gate. Never reset by the control task.
-    /// Written by the supervisor only.
-    #[cfg_attr(not(any(feature = "ibus", feature = "evdev_grab")), allow(dead_code))]
+    /// Passthrough flag for the IBus transport: while a layered evdev grab
+    /// owns the keyboard, the IBus connection stays alive and passes every key
+    /// through raw so both backends never compose the same key. (The Wayland
+    /// transport is torn down for evdev instead, so it never reads this.)
+    /// Distinct from `enabled`, the user's on/off gate. Written by the
+    /// supervisor only.
+    #[cfg_attr(not(feature = "ibus"), allow(dead_code))]
     pub suspended: Arc<AtomicBool>,
 
     /// Receiver for config changes sent by the tray / IPC menu actions.
@@ -143,11 +135,40 @@ impl Daemon {
         self.suspended.clone()
     }
 
+    /// A composer set up from the current config. Every transport starts its
+    /// session with this, so a config option is applied in one place.
+    pub(crate) fn new_composer(&self, method: BackspaceMethod) -> Composer {
+        let mut c = Composer::new(
+            self.config.method.to_engine(),
+            method,
+            self.config.bracket_shortcuts,
+        );
+        c.set_modern_style(self.config.modern_style);
+        c.set_v2_key_replacement(self.config.v2_key_replacement);
+        c.set_auto_capitalize(self.config.auto_capitalize);
+        c.set_double_space_period(self.config.double_space_period);
+        c
+    }
+
+    /// End the current session, whether real or synthesized.
+    pub(crate) fn end_session(&mut self) {
+        self.router.composer = None;
+        self.router.synthetic_active = false;
+        self.router.focused_app_id = None;
+    }
+
+    /// Tier at activation: `SurroundingText` if the client sent a
+    /// surrounding-text frame (even an empty one), else `ForwardKey`.
+    /// Clients without text-input never activate; they get a focus-synthesized
+    /// `ForwardKey` session instead (`on_focus_changed`). The surrounding-text
+    /// liveness check can downgrade a session at runtime; a session whose
+    /// activate frame lacked surrounding text can upgrade on a later frame.
     pub(crate) fn detect_capability(&self, frame: &FrameSnapshot) -> BackspaceMethod {
-        let probe = CapabilityProbe {
-            surrounding_text_seen: frame.surrounding_text.is_some(),
-        };
-        detect_method(&probe)
+        if frame.surrounding_text.is_some() {
+            BackspaceMethod::SurroundingText
+        } else {
+            BackspaceMethod::ForwardKey
+        }
     }
 
     // ── transport-neutral key routing (non-wayland: ibus, evdev) ────────────
@@ -395,45 +416,22 @@ impl Daemon {
     /// only a label.
     #[cfg(feature = "evdev_grab")]
     pub fn activate_evdev(&mut self) {
-        let mut c = Composer::new(
-            self.config.method.to_engine(),
-            BackspaceMethod::ForwardKey,
-            self.config.bracket_shortcuts,
-        );
-        c.set_modern_style(self.config.modern_style);
-        c.set_auto_capitalize(self.config.auto_capitalize);
-        c.set_double_space_period(self.config.double_space_period);
-        self.router.current_active = true;
+        self.router.composer = Some(self.new_composer(BackspaceMethod::ForwardKey));
         self.router.synthetic_active = true;
-        self.router.composer = Some(c);
     }
 
     /// Create a composer session for a non-Wayland transport (IBus). Idempotent.
     #[cfg(feature = "ibus")]
     pub fn activate_ibus(&mut self, method: viet_ime_edit_strategy::BackspaceMethod) {
-        if self.router.current_active {
-            return;
+        if self.router.composer.is_none() {
+            self.router.composer = Some(self.new_composer(method));
         }
-        let mut c = Composer::new(
-            self.config.method.to_engine(),
-            method,
-            self.config.bracket_shortcuts,
-        );
-        c.set_modern_style(self.config.modern_style);
-        c.set_auto_capitalize(self.config.auto_capitalize);
-        c.set_double_space_period(self.config.double_space_period);
-        self.router.composer = Some(c);
-        self.router.current_active = true;
     }
 
     /// Tear down the IBus session. Clears composition state.
     #[cfg(feature = "ibus")]
     pub fn deactivate_ibus(&mut self) {
-        if let Some(w) = self.router.composer.as_mut() {
-            w.full_reset();
-        }
-        self.router.composer = None;
-        self.router.current_active = false;
+        self.end_session();
     }
 
     /// React to an IBus routing change while a session is live.
@@ -467,9 +465,8 @@ mod tests {
     fn daemon_initializes_router_lifecycle_state() {
         let d = test_daemon();
 
-        assert!(!d.router.current_active);
-        assert!(!d.router.synthetic_active);
         assert!(d.router.composer.is_none());
+        assert!(!d.router.synthetic_active);
         assert!(d.router.focused_app_id.is_none());
         assert!(d.router.last_enabled);
     }
@@ -512,10 +509,6 @@ mod tests {
             fn vk_key(&mut self, time: u32, key_code: u32, state: KeyState) {
                 self.vk_keys.push((time, key_code, state));
             }
-            fn vk_modifiers(&mut self, _depressed: u32, _latched: u32, _locked: u32, _group: u32) {}
-            fn vk_commit_char(&mut self, _time: u32, _c: char) -> bool {
-                false
-            }
         }
 
         fn frame(text: &str, cursor: u32, anchor: u32) -> FrameSnapshot {
@@ -527,6 +520,29 @@ mod tests {
                 app_id: None,
                 is_xwayland: false,
             }
+        }
+
+        /// Apply each key decision immediately, without client frame reports.
+        fn typed(daemon: &mut Daemon, keys: &str) -> String {
+            let mut visible = String::new();
+            for ch in keys.chars() {
+                match daemon.handle_char(ch) {
+                    KeyDecision::ForwardRaw => visible.push(ch),
+                    KeyDecision::Apply { backspaces, commit } => {
+                        // As a transport does: the composer tracks its edit.
+                        if let Some(w) = daemon.router.composer.as_mut() {
+                            let mut sink = DeleteCaptureSink::default();
+                            w.apply_to_sink(backspaces, &commit, 0, 0, &mut sink);
+                        }
+                        for _ in 0..backspaces {
+                            visible.pop();
+                        }
+                        visible.push_str(&commit);
+                    }
+                    KeyDecision::Consumed => {}
+                }
+            }
+            visible
         }
 
         #[test]
@@ -548,23 +564,134 @@ mod tests {
             activate.surrounding_text = None;
             daemon.on_done_frame(&mut ctx, &activate);
 
-            let mut visible = String::new();
-            for ch in "hoaf".chars() {
-                match daemon.handle_char(ch) {
-                    KeyDecision::ForwardRaw => visible.push(ch),
-                    KeyDecision::Apply {
-                        backspaces, commit, ..
-                    } => {
-                        for _ in 0..backspaces {
-                            visible.pop();
-                        }
-                        visible.push_str(&commit);
-                    }
-                    KeyDecision::Consumed => {}
+            assert_eq!(typed(&mut daemon, "hoaf"), "hòa");
+        }
+
+        #[test]
+        fn every_session_kind_takes_its_options_from_the_config() {
+            let daemon = || {
+                Daemon::new(
+                    Config {
+                        modern_style: false,
+                        auto_capitalize: true,
+                        double_space_period: true,
+                        ..Config::default()
+                    },
+                    Arc::new(AtomicBool::new(true)),
+                    super::super::noop_config_rx(),
+                )
+            };
+            // Double space → ". ", then a capitalized word with legacy tone
+            // placement (`hòa`, where the modern style gives `hoà`).
+            let check = |d: &mut Daemon, kind: &str| {
+                assert_eq!(typed(d, "a  hoaf"), "a. Hòa", "{kind}");
+            };
+            let (mut state, _peer) = AdapterState::for_test(ImProtocol::ImV2);
+            let mut ctx = AdapterCtx { state: &mut state };
+
+            let mut d = daemon();
+            let mut activate = frame("", 0, 0);
+            activate.activate = true;
+            activate.surrounding_text = None;
+            d.on_done_frame(&mut ctx, &activate);
+            check(&mut d, "text-input activate");
+
+            let mut d = daemon();
+            d.on_focus_changed(&mut ctx, Some("com.mitchellh.ghostty".to_owned()), false);
+            check(&mut d, "focus without text-input");
+
+            #[cfg(feature = "evdev_grab")]
+            {
+                let mut d = daemon();
+                d.activate_evdev();
+                check(&mut d, "evdev");
+            }
+            #[cfg(feature = "ibus")]
+            {
+                let mut d = daemon();
+                d.activate_ibus(BackspaceMethod::ForwardKey);
+                check(&mut d, "ibus");
+            }
+        }
+
+        #[test]
+        fn key_replacement_option_reaches_a_surrounding_text_session() {
+            struct KeyChannel(Vec<String>);
+            impl OutputSink for KeyChannel {
+                fn delete_surrounding_text(&mut self, _: u32, _: u32, _: u32, _: u32) {}
+                fn commit_string(&mut self, _: &str) {}
+                fn commit(&mut self, _: u32) {}
+                fn vk_key(&mut self, _: u32, _: u32, _: KeyState) {}
+                fn prefer_key_channel_replacement(&self, _: &str) -> bool {
+                    true
+                }
+                fn commit_key_channel_text(&mut self, _: u32, _: u32, text: &str) -> bool {
+                    self.0.push(text.to_owned());
+                    true
                 }
             }
 
-            assert_eq!(visible, "hòa");
+            for (enabled, expected) in [(true, vec!["a".to_owned()]), (false, vec![])] {
+                let mut daemon = Daemon::new(
+                    Config {
+                        v2_key_replacement: enabled,
+                        ..Config::default()
+                    },
+                    Arc::new(AtomicBool::new(true)),
+                    super::super::noop_config_rx(),
+                );
+                let (mut state, _peer) = AdapterState::for_test(ImProtocol::ImV2);
+                let mut ctx = AdapterCtx { state: &mut state };
+                let mut activate = frame("", 0, 0);
+                activate.activate = true;
+                daemon.on_done_frame(&mut ctx, &activate);
+
+                let mut sink = KeyChannel(Vec::new());
+                let composer = daemon.router.composer.as_mut().expect("composer");
+                assert_eq!(composer.method(), BackspaceMethod::SurroundingText);
+                composer.apply_to_sink(0, "a", 0, 0, &mut sink);
+                assert_eq!(sink.0, expected, "v2_key_replacement={enabled}");
+            }
+        }
+
+        #[test]
+        fn deactivate_and_focus_loss_end_the_session() {
+            let mut daemon = Daemon::new(
+                Config::default(),
+                Arc::new(AtomicBool::new(true)),
+                super::super::noop_config_rx(),
+            );
+            let (mut state, _peer) = AdapterState::for_test(ImProtocol::ImV2);
+            let mut ctx = AdapterCtx { state: &mut state };
+            let app = || Some("com.mitchellh.ghostty".to_owned());
+            let mut activate = frame("", 0, 0);
+            activate.activate = true;
+            activate.app_id = Some("org.gnome.TextEditor".to_owned());
+            let mut deactivate = frame("", 0, 0);
+            deactivate.deactivate = true;
+
+            // A real activation replaces a focus-synthesized session.
+            daemon.on_focus_changed(&mut ctx, app(), false);
+            assert!(daemon.router.synthetic_active);
+            daemon.on_done_frame(&mut ctx, &activate);
+            assert!(!daemon.router.synthetic_active);
+            assert_eq!(daemon.router.focused_app_id, activate.app_id);
+            assert_eq!(
+                daemon.router.composer.as_ref().map(Composer::method),
+                Some(BackspaceMethod::SurroundingText)
+            );
+
+            daemon.on_done_frame(&mut ctx, &deactivate);
+            assert!(daemon.router.composer.is_none());
+            assert!(daemon.router.focused_app_id.is_none());
+
+            // Focus leaving every toplevel ends a synthesized session.
+            daemon.on_focus_changed(&mut ctx, app(), false);
+            assert!(daemon.router.composer.is_some());
+            daemon.on_focus_changed(&mut ctx, None, false);
+            assert!(daemon.router.composer.is_none());
+            assert!(!daemon.router.synthetic_active);
+            assert!(daemon.router.focused_app_id.is_none());
         }
 
         #[test]
@@ -599,6 +726,29 @@ mod tests {
         }
 
         #[test]
+        fn first_surrounding_frame_upgrades_a_forward_key_activation() {
+            // Chromium on wlroots activates without surrounding text, then
+            // reports it with the first keystroke.
+            let mut daemon = Daemon::new(
+                Config::default(),
+                Arc::new(AtomicBool::new(true)),
+                super::super::noop_config_rx(),
+            );
+            let (mut state, _peer) = AdapterState::for_test(ImProtocol::ImV2);
+            let mut ctx = AdapterCtx { state: &mut state };
+            let method = |d: &Daemon| d.router.composer.as_ref().map(Composer::method);
+
+            let mut activate = frame("", 0, 0);
+            activate.activate = true;
+            activate.surrounding_text = None;
+            daemon.on_done_frame(&mut ctx, &activate);
+            assert_eq!(method(&daemon), Some(BackspaceMethod::ForwardKey));
+
+            daemon.on_done_frame(&mut ctx, &frame("a", 1, 1));
+            assert_eq!(method(&daemon), Some(BackspaceMethod::SurroundingText));
+        }
+
+        #[test]
         fn native_focus_without_text_input_synthesizes_forward_key_session() {
             let mut daemon = Daemon::new(
                 Config::default(),
@@ -610,7 +760,7 @@ mod tests {
 
             daemon.on_focus_changed(&mut ctx, Some("com.mitchellh.ghostty".to_owned()), false);
 
-            assert!(daemon.router.current_active);
+            assert!(daemon.router.composer.is_some());
             assert!(daemon.router.synthetic_active);
             assert_eq!(
                 daemon.router.focused_app_id.as_deref(),
@@ -638,9 +788,8 @@ mod tests {
 
             daemon.on_focus_changed(&mut ctx, Some("com.mitchellh.ghostty".to_owned()), false);
 
-            assert!(!daemon.router.current_active);
-            assert!(!daemon.router.synthetic_active);
             assert!(daemon.router.composer.is_none());
+            assert!(!daemon.router.synthetic_active);
         }
 
         #[test]
@@ -660,7 +809,6 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 super::super::noop_config_rx(),
             );
-            daemon.router.current_active = true;
             daemon.router.composer = Some(Composer::new(
                 InputMethod::Telex,
                 BackspaceMethod::SurroundingText,
@@ -715,7 +863,6 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 super::super::noop_config_rx(),
             );
-            d.router.current_active = true;
             d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
                 BackspaceMethod::SurroundingText,
@@ -837,7 +984,6 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 super::super::noop_config_rx(),
             );
-            d.router.current_active = true;
             d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
                 BackspaceMethod::SurroundingText,
@@ -949,7 +1095,6 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 super::super::noop_config_rx(),
             );
-            d.router.current_active = true;
             d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
                 BackspaceMethod::ForwardKey,
@@ -1078,7 +1223,6 @@ mod tests {
             // `set_input_method` (which resets the engine word).
             let (tx, rx) = watch::channel(ConfigChange::default());
             let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), rx);
-            d.router.current_active = true;
             d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
                 BackspaceMethod::SurroundingText,
@@ -1159,7 +1303,6 @@ mod tests {
                 ..Config::default()
             };
             let mut d = Daemon::new(cfg, Arc::new(AtomicBool::new(true)), rx);
-            d.router.current_active = true;
             let mut composer =
                 Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
             composer.set_modern_style(false);
@@ -1198,7 +1341,6 @@ mod tests {
             // and reset the in-flight composition.
             let (tx, rx) = watch::channel(ConfigChange::default());
             let mut d = Daemon::new(Config::default(), Arc::new(AtomicBool::new(true)), rx);
-            d.router.current_active = true;
             d.router.composer = Some(Composer::new(
                 InputMethod::Telex,
                 BackspaceMethod::SurroundingText,
