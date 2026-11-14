@@ -100,20 +100,8 @@ pub async fn core_loop_with_wayland_shutdown(
         }
     }
 
+    // Dropping the handle releases the grab and flushes.
     wayland.focus_backend = fb;
-
-    if let Some(grab) = wayland.app.state.grab.take() {
-        grab.release();
-    }
-    if let Some(im) = wayland.app.state.im.take() {
-        im.destroy();
-    }
-    if let Some(vk) = wayland.app.state.vk.take() {
-        vk.destroy();
-    }
-    if let Err(error) = wayland.flush_nonblocking() {
-        tracing::warn!(%error, "flush Wayland teardown requests failed");
-    }
 
     Ok(())
 }

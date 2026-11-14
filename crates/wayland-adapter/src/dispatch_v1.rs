@@ -31,29 +31,10 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV1, ()> for WaylandAdapter<H> {
                     ctx_id = ?id.id(),
                     "im_v1: Activate — creating keyboard grab"
                 );
-                let ctx = id;
-                let keyboard = ctx.grab_keyboard(qh, ());
-                tracing::trace!(
-                    ctx_id = ?ctx.id(),
-                    kbd_id = ?keyboard.id(),
-                    "im_v1: keyboard grab created"
-                );
-                // Send modifier map (matching fcitx5 — Shift, Control, Mod1, Mod4).
-                // Each name is NUL-terminated in the array; fcitx5 uses
-                // `sizeof("Shift\0Control\0Mod1\0Mod4")` = 24 (the C string's
-                // implicit trailing `\0`). Rust string literals drop the
-                // trailing NUL via `as_bytes()` — append it explicitly so
-                // KWin parses all four names. Without it KWin's v1
-                // implementation silently leaves the grab inactive.
-                let mod_map = b"Shift\0Control\0Mod1\0Mod4\0";
-                ctx.modifiers_map(mod_map.to_vec());
-                tracing::trace!(
-                    ctx_id = ?ctx.id(),
-                    bytes = mod_map.len(),
-                    "im_v1: modifiers_map sent"
-                );
-                state.state.im_ctx_v1 = Some(ctx);
-                state.state.v1_keyboard = Some(keyboard);
+                state.state.wire.activate_v1(id, qh);
+                state.state.serial = 0;
+                state.state.pending_frame.reset();
+                state.state.pending_frame.end_session();
                 state.state.apply_event(crate::frame::FrameEvent::Activate);
                 // Don't fire apply_done_frame yet — wait for CommitState so
                 // that surrounding_text and purpose are available when the
@@ -65,8 +46,9 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV1, ()> for WaylandAdapter<H> {
                     ctx_id = ?context.id(),
                     "im_v1: Deactivate — dropping context + keyboard"
                 );
-                state.state.im_ctx_v1 = None;
-                state.state.v1_keyboard = None;
+                if !state.state.wire.deactivate_v1(&context) {
+                    return;
+                }
                 state.state.client_repeat.cancel();
                 state.state.held_forwarded.clear();
                 state.state.apply_event(crate::frame::FrameEvent::Deactivate);
@@ -95,6 +77,9 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodContextV1, ()> for WaylandAdapter
         _conn: &wayland_client::Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        if !state.state.wire.is_active_context(proxy) {
+            return;
+        }
         match event {
             zwp_input_method_context_v1::Event::SurroundingText {
                 text,
@@ -132,8 +117,8 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodContextV1, ()> for WaylandAdapter
                     "im_v1: CommitState — applying frame"
                 );
                 state.state.serial = serial;
-                if state.state.pending_commit || state.state.pending_frame.pending_activate {
-                    state.state.pending_commit = false;
+                let pending = state.state.wire.take_pending_commit();
+                if pending || state.state.pending_frame.pending_activate {
                     state.apply_done_frame();
                 }
             }
@@ -170,8 +155,13 @@ impl<H: AdapterHandler> Dispatch<WlKeyboard, ()> for WaylandAdapter<H> {
         _conn: &wayland_client::Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        if !state.state.wire.is_active_keyboard(keyboard) {
+            return;
+        }
         match event {
-            wl_keyboard::Event::Keymap { format: _, fd, size } => {
+            wl_keyboard::Event::Keymap { format, fd, size } => {
+                use std::os::fd::AsFd;
+                state.state.wire.on_keymap(format.into(), fd.as_fd(), size);
                 tracing::trace!(
                     kbd_id = ?keyboard.id(),
                     size,

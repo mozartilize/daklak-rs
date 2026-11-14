@@ -285,7 +285,7 @@ impl AdapterHandler for Daemon {
         // common unshifted case) keep raw-keycode forwarding; control keys
         // (Enter/Tab) are never retyped.
         if matches!(decision, KeyDecision::ForwardRaw)
-            && ctx.profile().has_keysym_commit
+            && ctx.has_keysym_commit()
             && ctx.is_level_shifted(key, ch)
             && !ch.is_control()
         {
@@ -361,8 +361,7 @@ impl AdapterHandler for Daemon {
         // `zwp_virtual_keyboard_v1` — the route that reliably reaches
         // no-text-input clients (incl. XWayland). A real `Activate` always
         // wins and replaces this synthetic session (see `on_done_frame`).
-        let vk_available = ctx.profile().has_vk_keyboard;
-        let matched = app_id.is_some() && vk_available;
+        let matched = app_id.is_some() && ctx.supports_focus_session();
 
         let synthetic_target_changed =
             self.router.synthetic_active && matched && self.router.focused_app_id != app_id;

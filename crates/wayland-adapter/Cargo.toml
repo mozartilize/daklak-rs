@@ -6,9 +6,11 @@ license.workspace = true
 
 [features]
 default = []
-# Enables the KDE Plasma window-management focus backend + v1 IM dispatch.
+# Enables KDE Plasma window-management focus tracking (IMv1 is always built).
 # wlroots-only builds can omit this to keep dependencies slim.
 kde = ["dep:wayland-protocols-plasma"]
+# Exposes `AdapterState::for_test` to other crates' tests.
+test-util = []
 
 [dependencies]
 viet-ime-edit-strategy = { path = "../edit-strategy" }

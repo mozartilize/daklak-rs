@@ -1,40 +1,12 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
 use viet_ime_edit_strategy::ModifierState;
 use viet_ime_key_emitter::HeldKeys;
-use wayland_client::backend::ObjectId;
-use wayland_client::Connection;
-
-use crate::focus::wlr::ToplevelEntry;
-use crate::focus::x11::X11Bridge;
-use crate::focus::FocusEvent;
+use crate::focus::{FocusEvent, FocusTracker};
 use crate::frame::DoneFrame;
-use crate::keymap::{self, DaklakKeymap};
+use crate::wire::Wire;
 use viet_ime_keymap::xkb::XkbState;
-use wayland_protocols_misc::{
-    zwp_input_method_v2::client::{
-        zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
-        zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
-        zwp_input_method_v2::ZwpInputMethodV2,
-    },
-    zwp_virtual_keyboard_v1::client::{
-        zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
-        zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
-    },
-};
-use wayland_protocols::wp::input_method::zv1::client::{
-    zwp_input_method_v1::ZwpInputMethodV1,
-    zwp_input_method_context_v1::ZwpInputMethodContextV1,
-};
-use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
-
-#[cfg(feature = "kde")]
-use crate::focus::kde::PlasmaToplevelEntry;
-#[cfg(feature = "kde")]
-use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_window_management::OrgKdePlasmaWindowManagement;
 
 /// Adapter-side state. Owns Wayland proxies + emit-history. The handler
 /// (daemon) never sees these directly — it interacts via `AdapterCtx`.
@@ -117,28 +89,10 @@ impl ClientRepeat {
 }
 
 pub struct AdapterState {
-    // Wayland proxies (set after globals binding + setup)
-    pub seat: Option<wayland_client::protocol::wl_seat::WlSeat>,
-    pub im_manager: Option<ZwpInputMethodManagerV2>,
-    pub vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
-    pub im: Option<ZwpInputMethodV2>,
-    pub grab: Option<ZwpInputMethodKeyboardGrabV2>,
-    pub vk: Option<ZwpVirtualKeyboardV1>,
+    pub(crate) wire: Wire,
 
-    /// Connection clone used for explicit flushes after batched key emits.
-    pub conn: Option<Connection>,
-
-    // xkb state (set on first Keymap event from the grab)
+    // Arrives asynchronously from the keyboard grab.
     pub xkb: Option<XkbState>,
-    pub keymap_init: bool,
-
-    /// Synthetic xkb keymap with Vietnamese precomposed chars at evdev
-    /// 200+. Handed to `vk.keymap()` on the first Keymap event so vk_key
-    /// events can deliver Vietnamese chars without `commit_string` / a
-    /// `zwp_text_input_v3` activate (Qt5/XWayland path). `None` if
-    /// xkbcommon rejects the synthesized keymap — daklak then falls back
-    /// to forwarding the compositor's keymap to `vk.keymap()`.
-    pub daklak_keymap: Option<DaklakKeymap>,
 
     // Protocol state
     pub serial: u32,
@@ -148,25 +102,7 @@ pub struct AdapterState {
     // Pending double-buffered frame (applied at Done)
     pub pending_frame: DoneFrame,
 
-    // v1-only: set on SurroundingText/ContentType, consumed on CommitState.
-    // Prevents apply_done_frame spam when KWin sends events in batches.
-    pub pending_commit: bool,
-
-
-    /// Counter of outgoing `vk.modifiers` calls daklak has made but not yet
-    /// seen mirrored back through the IM grab's `Modifiers` event. Used by
-    /// `vk_commit_char`'s level-selecting dance (key-channel commit).
-    pub synthetic_mods_pending: u32,
-
-    /// Exact modifier masks daklak expects to see echoed back from its own
-    /// synthetic `vk.modifiers` dance. A real user modifier update may arrive
-    /// while synthetic echoes are pending; only masks matching the front of this
-    /// queue are skipped as echoes.
-    pub synthetic_mods_expected: VecDeque<(u32, u32, u32, u32)>,
-
-    /// Timestamp of the last `vk.modifiers` emit that bumped
-    /// `synthetic_mods_pending`. TTL safety net (50ms).
-    pub synthetic_mods_emitted_at: Option<Instant>,
+    pub(crate) echo: ModifierEcho,
 
     /// User keys whose press daklak forwarded to the focused client and whose
     /// release it has not forwarded yet (tail-char-drop fix, see
@@ -184,58 +120,42 @@ pub struct AdapterState {
     /// focused client itself.
     pub(crate) client_repeat: ClientRepeat,
 
-    /// Set true by `AdapterSink::commit()` (V2 path) whenever daklak emits
-    /// `zwp_input_method_v2.commit`. Reset at the start of every
-    /// `apply_done_frame`. If still false after the handler runs, daklak
-    /// emits a bare ack-commit so wlroots' `handle_im_commit` fires and
-    /// sends `text_input_v3.done` back to the v3 client — unblocking
-    /// chromium's state machine which otherwise stops sending
-    /// `set_surrounding_text` after the initial enable.
-    pub pending_im_commit_ack: bool,
-
     pub should_exit: bool,
 
-    // ── Compositor backend selection ─────────────────────────────────────────
-    /// Process-scoped transport capability profile. Set during `connect()`.
-    pub profile: crate::TransportProfile,
-    /// v1 IM global (only on KWin/Plasma). `None` on wlroots.
-    pub im_v1: Option<ZwpInputMethodV1>,
-    /// v1 context proxy — short-lived, one per text-input session.
-    /// Replaced on each `activate` event and dropped on `deactivate`.
-    pub im_ctx_v1: Option<ZwpInputMethodContextV1>,
-    /// wl_keyboard obtained via `grab_keyboard()` on the v1 context.
-    /// Delivers keymap / key / modifiers events in v1, mirroring v2's
-    /// `ZwpInputMethodKeyboardGrabV2`.
-    pub v1_keyboard: Option<wayland_client::protocol::wl_keyboard::WlKeyboard>,
-
-    // ── wlr-foreign-toplevel-management focus tracking ───────────────────────
-    /// Manager proxy, bound when the compositor exports the global.
-    pub ftl_manager: Option<ZwlrForeignToplevelManagerV1>,
-    /// Per-handle accumulated app_id/title/activated state, keyed by ObjectId.
-    pub(crate) toplevels: HashMap<ObjectId, ToplevelEntry>,
-    /// ObjectId of the currently-activated toplevel, if any.
-    pub active_toplevel: Option<ObjectId>,
-    /// Sender into the active focus backend's channel. Populated by both wlr
-    /// and sway backends so dispatch can push focus diffs uniformly.
-    pub focus_tx: Option<mpsc::UnboundedSender<FocusEvent>>,
-    /// Shared snapshot of the currently-focused app. Written by dispatch
-    /// (wlr) or the sway poller; read synchronously from
-    /// `apply_done_frame` at activate time.
-    pub focus_current: Arc<Mutex<Option<FocusEvent>>>,
-    /// X11 bridge for XWayland detection. `Some` when `$DISPLAY` is set and
-    /// the x11rb connection succeeded.
-    pub(crate) x11_bridge: Option<X11Bridge>,
-
-    // ── KDE Plasma window-management focus tracking ─────────────────────────
-    #[cfg(feature = "kde")]
-    pub(crate) plasma_toplevels: HashMap<ObjectId, PlasmaToplevelEntry>,
-    #[cfg(feature = "kde")]
-    pub(crate) plasma_manager: Option<OrgKdePlasmaWindowManagement>,
+    /// Optional metadata for focus-driven sessions; text-input works without it.
+    pub(crate) focus: Option<FocusTracker>,
 }
 
-impl Default for AdapterState {
-    fn default() -> Self {
-        Self::new()
+/// Suppress only expected modifier echoes; unrelated physical updates survive.
+#[derive(Default)]
+pub(crate) struct ModifierEcho {
+    pub pending: u32,
+    pub expected: VecDeque<(u32, u32, u32, u32)>,
+    pub emitted_at: Option<Instant>,
+}
+
+impl ModifierEcho {
+    pub fn suppress(&mut self, incoming: (u32, u32, u32, u32)) -> bool {
+        if self.pending > 0 && self.emitted_at.is_some_and(|t| t.elapsed() > Duration::from_millis(50)) {
+            *self = Self::default();
+        }
+        if self.expected.front() != Some(&incoming) {
+            return false;
+        }
+        self.expected.pop_front();
+        self.pending = self.expected.len() as u32;
+        if self.pending == 0 {
+            self.emitted_at = None;
+        }
+        true
+    }
+
+    pub fn emission(&mut self) -> viet_ime_key_emitter::SyntheticMods<'_> {
+        viet_ime_key_emitter::SyntheticMods {
+            pending: &mut self.pending,
+            expected: &mut self.expected,
+            emitted_at: &mut self.emitted_at,
+        }
     }
 }
 
@@ -250,72 +170,35 @@ impl AdapterState {
         }
     }
 
-    pub fn new() -> Self {
+    pub(crate) fn new(wire: Wire, focus: Option<FocusTracker>) -> Self {
         Self {
-            seat: None,
-            im_manager: None,
-            vk_manager: None,
-            im: None,
-            grab: None,
-            vk: None,
-            conn: None,
+            wire,
             xkb: None,
-            keymap_init: false,
-            daklak_keymap: match keymap::build() {
-                Ok(km) => {
-                    tracing::info!(
-                        size = km.size,
-                        vn_pairs = keymap::vn_pairs(),
-                        "synthetic Vietnamese keymap built (key-channel commit, FOUR_LEVEL ≤255)"
-                    );
-                    Some(km)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "daklak keymap synthesis failed → falling back to compositor passthrough: {e:#}"
-                    );
-                    None
-                }
-            },
             serial: 0,
-            pending_commit: false,
             modifiers: ModifierState::empty(),
             raw_mods: (0, 0, 0, 0),
             pending_frame: DoneFrame::default(),
-            synthetic_mods_pending: 0,
-            synthetic_mods_expected: VecDeque::new(),
-            synthetic_mods_emitted_at: None,
+            echo: ModifierEcho::default(),
             held_forwarded: HeldKeys::default(),
             forwarding_repeat: false,
             client_repeat: ClientRepeat::default(),
-            pending_im_commit_ack: false,
             should_exit: false,
-            // Placeholder until `connect()` builds the real profile. Never
-            // observed before connect overwrites it.
-            profile: crate::TransportProfile::for_protocol(crate::ImProtocol::ImV2),
-            im_v1: None,
-            im_ctx_v1: None,
-            v1_keyboard: None,
-            ftl_manager: None,
-            toplevels: HashMap::new(),
-            active_toplevel: None,
-            focus_tx: None,
-            focus_current: Arc::new(Mutex::new(None)),
-            x11_bridge: None,
-            #[cfg(feature = "kde")]
-            plasma_toplevels: HashMap::new(),
-            #[cfg(feature = "kde")]
-            plasma_manager: None,
+            focus,
         }
     }
 
-    /// Forward-path key emit. Falls through to `zwp_virtual_keyboard_v1`
-    /// (v2) or `zwp_input_method_context_v1.key` (v1). Used by
-    /// `forward_press` / `dispatch_key_release` / `KeyDecision::ForwardRaw`.
-    ///
-    /// Vietnamese precomposed chars committed via the synthetic keymap do
-    /// NOT route here; they go through `with_sink → synth_keymap_emitter`
-    /// which is always vk_v2.
+    /// A state on a real wire whose requests go to the returned peer instead
+    /// of a compositor. Keep the peer alive for the duration of the test.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_test(protocol: crate::ImProtocol) -> (Self, crate::wire::TestPeer) {
+        let (wire, peer) = Wire::for_test(protocol);
+        (Self::new(wire, None), peer)
+    }
+
+    pub fn focus_snapshot(&self) -> Option<FocusEvent> {
+        self.focus.as_ref().and_then(FocusTracker::current)
+    }
+
     /// The wl_keyboard key state for a press: `2` (Repeated) while dispatching
     /// a repeat, else `1` (Pressed). Release is always `0` (passed explicitly).
     pub fn press_value(&self) -> u32 {
@@ -326,20 +209,9 @@ impl AdapterState {
         }
     }
 
+    /// Raw passthrough through the connection's selected key channel.
     pub fn emit_forward_key(&mut self, time: u32, key: u32, value: u32) {
-        let serial = self.serial;
-        match self.profile.protocol {
-            crate::ImProtocol::ImV2 => {
-                if let Some(vk) = &self.vk {
-                    vk.key(time, key, value);
-                }
-            }
-            crate::ImProtocol::ImV1 => {
-                if let Some(ctx) = &self.im_ctx_v1 {
-                    ctx.key(serial, time, key, value);
-                }
-            }
-        }
+        self.wire.forward_key(self.serial, time, key, value);
     }
 
     /// Single funnel for input-method events that mutate `pending_frame`.
@@ -354,7 +226,7 @@ impl AdapterState {
                 self.pending_frame.pending_activate = true;
                 // v1 resets pending_commit at activate (CommitState
                 // batch starts fresh). v2 doesn't track this field.
-                self.pending_commit = false;
+                self.wire.mark_pending_commit(false);
             }
             FrameEvent::Deactivate => {
                 tracing::trace!("im: Deactivate");
@@ -364,12 +236,12 @@ impl AdapterState {
                 tracing::trace!(text = %text, cursor, anchor, "im: SurroundingText");
                 self.pending_frame.surrounding_text =
                     Some(SurroundingText { text, cursor, anchor });
-                self.pending_commit = true;
+                self.wire.mark_pending_commit(true);
             }
             FrameEvent::Purpose(purpose) => {
                 tracing::trace!(purpose, "im: ContentType");
                 self.pending_frame.purpose = purpose;
-                self.pending_commit = true;
+                self.wire.mark_pending_commit(true);
             }
             FrameEvent::ChangeCause(cause) => {
                 tracing::trace!(cause, "im: TextChangeCause");

@@ -1,60 +1,63 @@
-//! KDE Plasma window-management focus backend.
-//!
-//! Uses `org_kde_plasma_window_management` to track focused window changes.
-//! Dispatch (in `dispatch.rs`) accumulates per-window state and on each state
-//! change pushes a `FocusEvent` through the channel this backend exposes.
+//! Plasma toplevel driver. Metadata changes are immediate, without WLR's Done.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use wayland_client::{backend::ObjectId, Connection, Dispatch, Proxy, QueueHandle};
+use wayland_protocols_plasma::plasma_window_management::client::{
+    org_kde_plasma_window::{self, OrgKdePlasmaWindow},
+    org_kde_plasma_window_management::{self, OrgKdePlasmaWindowManagement},
+};
+use super::WaylandToplevel;
+use crate::{AdapterHandler, WaylandAdapter};
 
-use async_trait::async_trait;
-use tokio::sync::mpsc;
-use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_window::OrgKdePlasmaWindow;
-
-use super::{FocusBackend, FocusEvent};
-
-/// Per-window state accumulated from plasma window management events.
-/// Unlike wlr-foreign-toplevel, there is no batched `Done` event — each
-/// field is updated immediately as the corresponding event fires.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct PlasmaToplevelEntry {
-    #[allow(dead_code)]
-    pub uuid: String,
-    pub app_id: Option<String>,
-    pub title: Option<String>,
-    pub activated: bool,
-    pub pid: Option<u32>,
-    /// Proxy handle for the window object.
-    pub handle: Option<OrgKdePlasmaWindow>,
+pub(super) struct KdeState {
+    _manager: OrgKdePlasmaWindowManagement,
+    handles: HashMap<ObjectId, OrgKdePlasmaWindow>,
 }
 
-pub struct KdePlasmaBackend {
-    rx: mpsc::UnboundedReceiver<FocusEvent>,
-    current: Arc<Mutex<Option<FocusEvent>>>,
-}
-
-impl KdePlasmaBackend {
-    /// Build the backend + sender. Caller installs `tx` into
-    /// `AdapterState::focus_tx` and shares `current` via
-    /// `AdapterState::focus_current` so dispatch handlers can update both.
-    pub(crate) fn new(
-        current: Arc<Mutex<Option<FocusEvent>>>,
-    ) -> (Self, mpsc::UnboundedSender<FocusEvent>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (Self { rx, current }, tx)
+impl KdeState {
+    pub fn new(manager: OrgKdePlasmaWindowManagement) -> Self {
+        Self { _manager: manager, handles: HashMap::new() }
     }
 }
 
-#[async_trait]
-impl FocusBackend for KdePlasmaBackend {
-    async fn next_event(&mut self) -> Option<FocusEvent> {
-        self.rx.recv().await
+impl Drop for KdeState {
+    fn drop(&mut self) {
+        for handle in self.handles.values() {
+            handle.destroy();
+        }
     }
+}
 
-    fn current(&self) -> Option<FocusEvent> {
-        self.current.lock().ok().and_then(|g| g.clone())
+impl<H: AdapterHandler> Dispatch<OrgKdePlasmaWindowManagement, ()> for WaylandAdapter<H> {
+    fn event(state: &mut Self, manager: &OrgKdePlasmaWindowManagement, event: org_kde_plasma_window_management::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+        let Some(focus) = &mut state.state.focus else { return };
+        let WaylandToplevel::Kde(driver) = &mut focus.wayland else { return };
+        if let org_kde_plasma_window_management::Event::WindowWithUuid { uuid, .. } = event {
+            let window = manager.get_window_by_uuid(uuid, qh, ());
+            driver.handles.insert(window.id(), window);
+        }
     }
+}
 
-    fn name(&self) -> &'static str {
-        "kde-plasma-window-management"
+impl<H: AdapterHandler> Dispatch<OrgKdePlasmaWindow, ()> for WaylandAdapter<H> {
+    fn event(state: &mut Self, handle: &OrgKdePlasmaWindow, event: org_kde_plasma_window::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        let Some(focus) = &mut state.state.focus else { return };
+        let WaylandToplevel::Kde(driver) = &mut focus.wayland else { return };
+        let id = handle.id();
+        if !driver.handles.contains_key(&id) { return; }
+        let mut window = focus.state.windows.get(&id).cloned().unwrap_or_default();
+        match event {
+            org_kde_plasma_window::Event::AppIdChanged { app_id } => window.app_id = Some(app_id),
+            org_kde_plasma_window::Event::TitleChanged { title } => window.title = Some(title),
+            org_kde_plasma_window::Event::StateChanged { flags } => window.activated = (flags & 1) != 0,
+            org_kde_plasma_window::Event::Unmapped => {
+                driver.handles.remove(&id);
+                focus.state.remove(&id);
+                handle.destroy();
+                return;
+            }
+            _ => return,
+        }
+        focus.state.set(id, window);
     }
 }

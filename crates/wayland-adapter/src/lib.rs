@@ -10,11 +10,12 @@
 //! Wayland adapter — pure Wayland protocol I/O layer for the daklak Vietnamese IME.
 //!
 //! Owns:
-//! - `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` proxies
+//! - Wayland input-method negotiation and protocol lifecycles
+//! - independently selected text and key output channels
 //! - xkb keymap loading + char translation
 //! - Daklak synthetic keymap upload to vk (key-channel Vietnamese emit)
 //! - Synthetic-mods echo suppression
-//! - Focus tracking via `wlr-foreign-toplevel-management-v1` + X11 bridge
+//! - Optional toplevel focus tracking + XWayland metadata
 //! - Held forwarded-key bookkeeping for the tail-char-drop fix
 //!
 //! Does NOT own:
@@ -36,32 +37,19 @@ mod dispatch;
 mod dispatch_v1;
 mod sink;
 mod state;
+mod wire;
 
 use std::os::fd::AsFd;
 use std::os::unix::io::AsRawFd;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use wayland_client::{
-    globals::registry_queue_init, protocol::wl_seat::WlSeat, Connection, QueueHandle,
+    globals::registry_queue_init, Connection,
 };
 
-use crate::focus::{x11::X11Bridge, FocusBackend};
-
-#[cfg(feature = "kde")]
-use crate::focus::kde::KdePlasmaBackend;
-use wayland_protocols::wp::input_method::zv1::client::zwp_input_method_v1::ZwpInputMethodV1;
-use wayland_protocols_misc::{
-    zwp_input_method_v2::client::zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
-    zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
-};
-#[cfg(feature = "kde")]
-use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_window_management::OrgKdePlasmaWindowManagement;
-use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
-
-use crate::focus::wlr::WlrForeignToplevelBackend;
+use crate::focus::FocusTracker;
 
 pub use crate::sink::AdapterSink;
 pub use crate::state::AdapterState;
@@ -69,83 +57,14 @@ pub use viet_ime_edit_strategy::{BackspaceMethod, KeyState, ModifierState, Outpu
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
-/// Which input-method protocol the connected compositor speaks.
-/// Set during `connect()` and surfaced via `AdapterCtx::protocol()`.
-/// The daemon matches on this to adjust tier routing (e.g. the key-channel
-/// synthetic-keymap commit is unavailable on v1 because there's no separate
-/// vk keyboard).
+/// The input-method protocol negotiated at `connect()`. IMv2 always comes
+/// with a virtual keyboard; see the adapter's negotiation rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImProtocol {
-    /// `zwp_input_method_v2` + `zwp_virtual_keyboard_v1` — wlroots path.
+    /// `zwp_input_method_v2` + `zwp_virtual_keyboard_v1`.
     ImV2,
-    /// `zwp_input_method_v1` (KWin/Plasma) — no vk, v1 context is the
-    /// key-emission path.
+    /// `zwp_input_method_v1`.
     ImV1,
-}
-
-/// Everything daklak learns about the transport at `connect()` — fixed for the
-/// life of the process. The single source of every process-scoped capability;
-/// no use site re-derives a capability by matching on the protocol/backend name.
-/// `focus` is added in a later milestone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransportProfile {
-    /// IM protocol the compositor speaks. Identity only — capability decisions
-    /// read the bools below, never this.
-    pub protocol: ImProtocol,
-    /// Focus-tracking source, probed independently of `protocol`.
-    /// `for_protocol` leaves this `None`; `connect()` overwrites it after the
-    /// focus probe.
-    pub focus: crate::focus::FocusSource,
-    /// `zwp_virtual_keyboard_v1` is available. Required for ForwardKey's BS
-    /// emit on v2 and for the key-channel synthetic-keymap commit. False on
-    /// the v1 IM relay.
-    pub has_vk_keyboard: bool,
-    /// Commit chars can be synthesized via `zwp_input_method_context_v1::keysym`
-    /// (the v1 terminal path). True on ImV1, false on ImV2.
-    pub has_keysym_commit: bool,
-    /// `commit_string` actually reaches the client (false on evdev or when
-    /// routing through the synthetic-keymap channel).
-    pub delivers_commit_string: bool,
-    /// The transport auto-acks the v3 client's `done` (v1 `CommitState`
-    /// heartbeat); v2 needs daklak's bare commit to drive the ack.
-    pub heartbeats_done: bool,
-    /// The protocol can carry surrounding-text at all. This is the PROCESS
-    /// capability — distinct from whether a frame has actually been *seen*
-    /// (that runtime evidence lives in `CapabilityProbe.surrounding_text_seen`).
-    pub can_receive_surrounding: bool,
-}
-
-impl TransportProfile {
-    /// The capability bundle implied by an IM protocol. `connect()` calls this,
-    /// then may override `has_vk_keyboard` from the actual VK-manager bind and
-    /// fills `focus` from an independent probe (a per-connection fact, not a
-    /// function of the protocol). Pure — unit-testable without a compositor.
-    pub fn for_protocol(protocol: ImProtocol) -> Self {
-        match protocol {
-            // wlroots v2: separate vk keyboard, no keysym path, v2 has no
-            // implicit `done` heartbeat.
-            ImProtocol::ImV2 => Self {
-                protocol,
-                focus: crate::focus::FocusSource::None,
-                has_vk_keyboard: true,
-                has_keysym_commit: false,
-                delivers_commit_string: true,
-                heartbeats_done: false,
-                can_receive_surrounding: true,
-            },
-            // v1 IM relay: no vk keyboard (BS via the v1 context), keysym commit
-            // available, v1 `CommitState` heartbeats the v3 client.
-            ImProtocol::ImV1 => Self {
-                protocol,
-                focus: crate::focus::FocusSource::None,
-                has_vk_keyboard: false,
-                has_keysym_commit: true,
-                delivers_commit_string: true,
-                heartbeats_done: true,
-                can_receive_surrounding: true,
-            },
-        }
-    }
 }
 
 /// Frame snapshot delivered to the handler at each Done event.
@@ -233,15 +152,15 @@ impl<'a> AdapterCtx<'a> {
         self.state.modifiers
     }
 
-    pub fn protocol(&self) -> ImProtocol {
-        self.state.profile.protocol
+    /// Replacement text can be typed as keysyms through the IMv1 context.
+    pub fn has_keysym_commit(&self) -> bool {
+        self.state.wire.has_keysym_commit()
     }
 
-    /// The process-scoped transport capability profile, built once at
-    /// `connect()`. Read this for capability decisions — never re-match the
-    /// protocol/backend name at a use site.
-    pub fn profile(&self) -> TransportProfile {
-        self.state.profile
+    /// A ForwardKey session can be created from focus alone, for a client
+    /// that never activates text-input.
+    pub fn supports_focus_session(&self) -> bool {
+        self.state.wire.supports_focus_session()
     }
 
     /// Forward a raw press through vk (or v1 context) and mark the key held.
@@ -329,64 +248,21 @@ impl<'a> AdapterCtx<'a> {
     ) where
         F: FnOnce(&mut AdapterSink<'_>),
     {
-        let serial = self.state.serial;
-        let conn = self.state.conn.as_ref();
-        match self.state.profile.protocol {
-            ImProtocol::ImV2 => {
-                let im = match &self.state.im {
-                    Some(x) => x,
-                    None => return,
-                };
-                let vk = match &self.state.vk {
-                    Some(x) => x,
-                    None => return,
-                };
-                // synth_keymap_emitter always points at vk_v2 — only it can
-                // drive daklak's uploaded keymap. forward_emitter is vk_v2.
-                let mut vk_forward = viet_ime_key_emitter::VkV2Emitter::new(vk);
-                let mut vk_synth = viet_ime_key_emitter::VkV2Emitter::new(vk);
-                let synth_dyn: &mut dyn viet_ime_key_emitter::KeyEmitter = &mut vk_synth;
-
-                let mut sink = AdapterSink {
-                    text_ops: crate::sink::TextOpsTarget::V2 { im },
-                    forward_emitter: &mut vk_forward,
-                    synth_keymap_emitter: Some(synth_dyn),
-                    synthetic_mods_pending: &mut self.state.synthetic_mods_pending,
-                    synthetic_mods_expected: &mut self.state.synthetic_mods_expected,
-                    synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
-                    raw_mods,
-                    held: &mut self.state.held_forwarded,
-                    commit_string_functional,
-                    conn,
-                    xkb: self.state.xkb.as_ref(),
-                    pending_im_commit_ack: &mut self.state.pending_im_commit_ack,
-                };
-                f(&mut sink);
-            }
-            ImProtocol::ImV1 => {
-                let ctx = match &self.state.im_ctx_v1 {
-                    Some(x) => x,
-                    None => return,
-                };
-                // ImV1: forward_emitter is VkV1Emitter (ctx.key).
-                let mut vk_forward = viet_ime_key_emitter::VkV1Emitter::new(ctx, serial);
-                let mut sink = AdapterSink {
-                    text_ops: crate::sink::TextOpsTarget::V1 { ctx, serial },
-                    forward_emitter: &mut vk_forward,
-                    synth_keymap_emitter: None,
-                    synthetic_mods_pending: &mut self.state.synthetic_mods_pending,
-                    synthetic_mods_expected: &mut self.state.synthetic_mods_expected,
-                    synthetic_mods_emitted_at: &mut self.state.synthetic_mods_emitted_at,
-                    raw_mods,
-                    held: &mut self.state.held_forwarded,
-                    commit_string_functional,
-                    conn,
-                    xkb: self.state.xkb.as_ref(),
-                    pending_im_commit_ack: &mut self.state.pending_im_commit_ack,
-                };
-                f(&mut sink);
-            }
-        }
+        // None only between IMv1 text-input contexts.
+        let Some((conn, text_ops, keys)) = self.state.wire.outputs(self.state.serial) else {
+            return;
+        };
+        let mut sink = AdapterSink {
+            text_ops,
+            keys,
+            echo: &mut self.state.echo,
+            raw_mods,
+            held: &mut self.state.held_forwarded,
+            commit_string_functional,
+            conn,
+            xkb: self.state.xkb.as_ref(),
+        };
+        f(&mut sink);
     }
 }
 
@@ -395,7 +271,6 @@ impl<'a> AdapterCtx<'a> {
 pub struct WaylandAdapter<H: AdapterHandler> {
     pub handler: H,
     pub state: AdapterState,
-    pub qh: Option<QueueHandle<WaylandAdapter<H>>>,
 }
 
 fn repeat_forward_values(client_timer: bool) -> &'static [u32] {
@@ -537,8 +412,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
     }
 
     pub(crate) fn apply_done_frame(&mut self) {
-        self.state.serial = self.state.serial.wrapping_add(1);
-        self.state.pending_im_commit_ack = false;
+        self.state.wire.begin_frame();
 
         let activate = self.state.pending_frame.pending_activate;
         let deactivate = self.state.pending_frame.pending_deactivate;
@@ -552,7 +426,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
             .map(|st| (st.text.clone(), st.cursor, st.anchor));
 
         let (app_id, is_xwayland) = if activate {
-            match self.state.focus_current.lock().ok().and_then(|g| g.clone()) {
+            match self.state.focus_snapshot() {
                 Some(ev) => (ev.app_id, ev.is_xwayland),
                 None => (None, false),
             }
@@ -591,13 +465,7 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         // chromium) never sees its commit ack'd — its state machine stalls
         // and it stops sending `set_surrounding_text` updates. Emit a bare
         // commit so sway's `handle_im_commit` fires and acks the v3 client.
-        if matches!(self.state.profile.protocol, ImProtocol::ImV2)
-            && !self.state.pending_im_commit_ack
-        {
-            if let Some(im) = &self.state.im {
-                im.commit(self.state.serial);
-            }
-        }
+        self.state.wire.ack_frame(self.state.serial);
 
         if deactivate {
             self.state.pending_frame.end_session();
@@ -612,39 +480,8 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         mods_locked: u32,
         group: u32,
     ) {
-        const SYNTHETIC_MODS_TTL: Duration = Duration::from_millis(50);
-        if self.state.synthetic_mods_pending > 0
-            && self
-                .state
-                .synthetic_mods_emitted_at
-                .is_some_and(|t| t.elapsed() > SYNTHETIC_MODS_TTL)
-        {
-            tracing::trace!(
-                pending = self.state.synthetic_mods_pending,
-                "on_modifiers: synthetic echo TTL expired, force-reset"
-            );
-            self.state.synthetic_mods_pending = 0;
-            self.state.synthetic_mods_expected.clear();
-            self.state.synthetic_mods_emitted_at = None;
-        }
-
         let incoming_mods = (mods_depressed, mods_latched, mods_locked, group);
-        if self
-            .state
-            .synthetic_mods_expected
-            .front()
-            .is_some_and(|expected| *expected == incoming_mods)
-        {
-            self.state.synthetic_mods_expected.pop_front();
-            self.state.synthetic_mods_pending = self.state.synthetic_mods_expected.len() as u32;
-            if self.state.synthetic_mods_pending == 0 {
-                self.state.synthetic_mods_emitted_at = None;
-            }
-            tracing::trace!(
-                ?incoming_mods,
-                pending_after = self.state.synthetic_mods_pending,
-                "on_modifiers: skipping expected synthetic echo"
-            );
+        if self.state.echo.suppress(incoming_mods) {
             return;
         }
 
@@ -671,67 +508,13 @@ impl<H: AdapterHandler> WaylandAdapter<H> {
         self.state.modifiers = m;
         self.state.raw_mods = (mods_depressed, mods_latched, mods_locked, group);
 
-        let serial = self.state.serial;
-        match self.state.profile.protocol {
-            ImProtocol::ImV2 => {
-                if let Some(vk) = &self.state.vk {
-                    vk.modifiers(mods_depressed, mods_latched, mods_locked, group);
-                }
-            }
-            ImProtocol::ImV1 => {
-                if let Some(ctx) = &self.state.im_ctx_v1 {
-                    ctx.modifiers(serial, mods_depressed, mods_latched, mods_locked, group);
-                }
-            }
-        }
+        self.state.wire.forward_modifiers(self.state.serial, incoming_mods);
 
         let mut ctx = AdapterCtx {
             state: &mut self.state,
         };
         self.handler.on_modifiers(&mut ctx, m);
     }
-}
-
-/// Probe the focus-tracking source, independent of the IM protocol.
-/// Order: `wlr-foreign-toplevel-management` (wlroots and anything exposing it),
-/// then KDE Plasma (only under the `kde` feature), else none. Runs for both v1
-/// and v2 — a non-KDE v1 compositor that exposes wlr gets focus tracking, and a
-/// v2 compositor on KDE could get Plasma. Installs the winner's proxies + the
-/// X11 bridge into `app.state`.
-fn probe_focus<H: AdapterHandler>(
-    globals: &wayland_client::globals::GlobalList,
-    qh: &QueueHandle<WaylandAdapter<H>>,
-    app: &mut WaylandAdapter<H>,
-) -> (crate::focus::FocusSource, Option<Box<dyn FocusBackend>>) {
-    use crate::focus::FocusSource;
-
-    match globals.bind::<ZwlrForeignToplevelManagerV1, _, _>(qh, 1..=3, ()) {
-        Ok(m) => {
-            app.state.ftl_manager = Some(m);
-            app.state.x11_bridge = X11Bridge::spawn();
-            let (b, tx) = WlrForeignToplevelBackend::new(app.state.focus_current.clone());
-            app.state.focus_tx = Some(tx);
-            tracing::info!("focus backend: wlr-foreign-toplevel-management v3");
-            return (FocusSource::WlrForeignToplevel, Some(Box::new(b)));
-        }
-        Err(e) => tracing::debug!("wlr-foreign-toplevel unavailable ({e:#})"),
-    }
-
-    #[cfg(feature = "kde")]
-    match globals.bind::<OrgKdePlasmaWindowManagement, _, _>(qh, 1..=18, ()) {
-        Ok(m) => {
-            app.state.plasma_manager = Some(m.clone());
-            app.state.x11_bridge = X11Bridge::spawn();
-            let (b, tx) = KdePlasmaBackend::new(app.state.focus_current.clone());
-            app.state.focus_tx = Some(tx);
-            tracing::info!("focus backend: org_kde_plasma_window_management v20");
-            return (FocusSource::KdePlasma, Some(Box::new(b)));
-        }
-        Err(e) => tracing::debug!("org_kde_plasma_window_management unavailable ({e:#})"),
-    }
-
-    tracing::warn!("no focus backend available; focus tracking disabled");
-    (FocusSource::None, None)
 }
 
 pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::WaylandHandle<H>> {
@@ -759,85 +542,13 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
     }
 
     let qh = event_queue.handle();
-    let state = AdapterState::new();
-    let mut app = WaylandAdapter {
-        handler,
-        state,
-        qh: Some(qh.clone()),
-    };
+    let wire = wire::Wire::connect(&globals, &qh, conn.clone())?;
+    tracing::info!(?wire, "Wayland channels ready");
+    let (focus, backend) = FocusTracker::probe(&globals, &qh);
+    let mut app = WaylandAdapter { handler, state: AdapterState::new(wire, focus) };
 
-    let seat = globals
-        .bind::<WlSeat, _, _>(&qh, 1..=8, ())
-        .context("bind wl_seat")?;
-    app.state.seat = Some(seat.clone());
-
-    // ── Compositor backend detection: v2 (wlroots) or v1 (KWin/Plasma) ─────
-    let mut profile = if let Ok(v2) = globals.bind::<ZwpInputMethodManagerV2, _, _>(&qh, 1..=1, ())
-    {
-        // ── v2 (wlroots) path ────────────────────────────────────────────────
-        app.state.im_manager = Some(v2.clone());
-
-        let vk_manager = globals
-            .bind::<ZwpVirtualKeyboardManagerV1, _, _>(&qh, 1..=1, ())
-            .context("bind zwp_virtual_keyboard_manager_v1")?;
-        app.state.vk_manager = Some(vk_manager.clone());
-
-        // Focus source is probed once, after protocol detection, in
-        // `probe_focus` — independent of v1/v2.
-
-        event_queue
-            .roundtrip(&mut app)
-            .context("initial roundtrip")?;
-
-        let im = v2.get_input_method(&seat, &qh, ());
-        let grab = im.grab_keyboard(&qh, ());
-        let vk = vk_manager.create_virtual_keyboard(&seat, &qh, ());
-        tracing::info!("input method and virtual keyboard created (v2/wlroots)");
-
-        // Pre-upload daklak synthetic keymap to vk
-        if let Some(km) = &app.state.daklak_keymap {
-            vk.keymap(1, km.fd.as_fd(), km.size);
-            app.state.keymap_init = true;
-            tracing::info!(
-                size = km.size,
-                "vk.keymap → daklak synthetic keymap (pre-uploaded at connect)"
-            );
-        } else {
-            tracing::warn!(
-                    "daklak keymap unavailable at connect; vk awaits compositor keymap passthrough via IM grab"
-                );
-        }
-
-        app.state.im = Some(im);
-        app.state.grab = Some(grab);
-        app.state.vk = Some(vk);
-        app.state.conn = Some(conn.clone());
-
-        // v2/wlroots: vk_manager is bound above (required, errors otherwise)
-        // so the vk keyboard is always present.
-        TransportProfile::for_protocol(ImProtocol::ImV2)
-    } else if let Ok(v1) = globals.bind::<ZwpInputMethodV1, _, _>(&qh, 1..=1, ()) {
-        // ── v1 (KWin/Plasma) path ────────────────────────────────────────────
-        app.state.im_v1 = Some(v1.clone());
-        app.state.conn = Some(conn.clone());
-
-        // Focus source is probed once, after protocol detection, in
-        // `probe_focus` — independent of v1/v2.
-
-        event_queue
-            .roundtrip(&mut app)
-            .context("initial roundtrip")?;
-
-        tracing::info!("input method v1 bound (KWin/Plasma)");
-        TransportProfile::for_protocol(ImProtocol::ImV1)
-    } else {
-        anyhow::bail!("neither zwp_input_method_v2 nor zwp_input_method_v1 exposed by compositor");
-    };
-
-    // Focus source — probed once, independent of the IM protocol.
-    let (focus_source, backend) = probe_focus(&globals, &qh, &mut app);
-    profile.focus = focus_source;
-    app.state.profile = profile;
+    // The complete state must exist before any activation callback.
+    event_queue.roundtrip(&mut app).context("initial roundtrip")?;
 
     event_queue
         .roundtrip(&mut app)
@@ -860,66 +571,9 @@ pub fn connect<H: AdapterHandler>(handler: H) -> Result<crate::wayland_handle::W
 mod tests {
     use super::*;
 
-    #[test]
-    fn profile_for_imv2_has_vk_no_keysym() {
-        let p = TransportProfile::for_protocol(ImProtocol::ImV2);
-        assert_eq!(p.protocol, ImProtocol::ImV2);
-        assert!(p.has_vk_keyboard, "v2 has a virtual keyboard");
-        assert!(!p.has_keysym_commit, "v2 has no keysym commit path");
-        assert!(!p.heartbeats_done, "v2 needs daklak's bare commit to ack");
-        assert!(p.delivers_commit_string && p.can_receive_surrounding);
-    }
-
-    #[test]
-    fn profile_for_imv1_no_vk_has_keysym() {
-        let p = TransportProfile::for_protocol(ImProtocol::ImV1);
-        assert_eq!(p.protocol, ImProtocol::ImV1);
-        assert!(!p.has_vk_keyboard, "v1 IM relay exposes no vk keyboard");
-        assert!(p.has_keysym_commit, "v1 commits chars via context keysym");
-        assert!(p.heartbeats_done, "v1 CommitState heartbeats the v3 client");
-        assert!(p.delivers_commit_string && p.can_receive_surrounding);
-    }
-
-    #[test]
-    fn vk_keyboard_capability_follows_protocol_not_name() {
-        // The whole point of #3/#5: feasibility reads the bool, and the bool
-        // differs by protocol — v1 cannot run the vk synthetic-keymap commit,
-        // v2 can.
-        assert!(!TransportProfile::for_protocol(ImProtocol::ImV1).has_vk_keyboard);
-        assert!(TransportProfile::for_protocol(ImProtocol::ImV2).has_vk_keyboard);
-    }
-
-    #[test]
-    fn focus_is_not_implied_by_protocol() {
-        // `for_protocol` leaves focus unset — connect()'s independent probe owns
-        // it. Protocol must NOT carry a focus assumption.
-        use crate::focus::FocusSource;
-        assert_eq!(
-            TransportProfile::for_protocol(ImProtocol::ImV1).focus,
-            FocusSource::None
-        );
-        assert_eq!(
-            TransportProfile::for_protocol(ImProtocol::ImV2).focus,
-            FocusSource::None
-        );
-    }
-
-    #[test]
-    fn profile_can_pair_any_protocol_with_any_focus() {
-        // The combination the old V1Kde/V2Wlroots enum could not represent:
-        // a v1 compositor tracking focus via wlr-foreign-toplevel, and a v2
-        // compositor tracking via KDE Plasma. Both are now expressible.
-        use crate::focus::FocusSource;
-        let mut v1_wlr = TransportProfile::for_protocol(ImProtocol::ImV1);
-        v1_wlr.focus = FocusSource::WlrForeignToplevel;
-        assert_eq!(v1_wlr.protocol, ImProtocol::ImV1);
-        assert_eq!(v1_wlr.focus, FocusSource::WlrForeignToplevel);
-        assert!(!v1_wlr.has_vk_keyboard, "still v1: no vk keyboard");
-
-        let mut v2_plasma = TransportProfile::for_protocol(ImProtocol::ImV2);
-        v2_plasma.focus = FocusSource::KdePlasma;
-        assert_eq!(v2_plasma.protocol, ImProtocol::ImV2);
-        assert_eq!(v2_plasma.focus, FocusSource::KdePlasma);
+    fn app<H: AdapterHandler>(handler: H) -> (WaylandAdapter<H>, crate::wire::TestPeer) {
+        let (state, peer) = AdapterState::for_test(ImProtocol::ImV2);
+        (WaylandAdapter { handler, state }, peer)
     }
 
     struct NoopHandler;
@@ -1000,11 +654,7 @@ mod tests {
 
     #[test]
     fn applied_key_arms_client_repeat_until_release() {
-        let mut app = WaylandAdapter {
-            handler: ApplyHandler,
-            state: AdapterState::new(),
-            qh: None,
-        };
+        let (mut app, _peer) = app(ApplyHandler);
         app.state.xkb = Some(viet_ime_keymap::xkb::XkbState::us_for_test());
         app.state.client_repeat.set_info(25, 600);
 
@@ -1017,11 +667,7 @@ mod tests {
 
     #[test]
     fn applied_nonrepeatable_key_does_not_arm_client_repeat() {
-        let mut app = WaylandAdapter {
-            handler: ApplyHandler,
-            state: AdapterState::new(),
-            qh: None,
-        };
+        let (mut app, _peer) = app(ApplyHandler);
         app.state.xkb = Some(viet_ime_keymap::xkb::XkbState::us_for_test());
         app.state.client_repeat.set_info(25, 600);
 
@@ -1032,14 +678,11 @@ mod tests {
 
     #[test]
     fn real_modifier_update_is_not_swallowed_by_pending_synthetic_echo() {
-        let mut app = WaylandAdapter {
-            handler: NoopHandler,
-            state: AdapterState::new(),
-            qh: None,
-        };
+        let (mut app, _peer) = app(NoopHandler);
         app.state.xkb = Some(viet_ime_keymap::xkb::XkbState::us_for_test());
-        app.state.synthetic_mods_pending = 1;
-        app.state.synthetic_mods_emitted_at = Some(std::time::Instant::now());
+        app.state.echo.pending = 1;
+        app.state.echo.expected.push_back((0, 0, 0, 0));
+        app.state.echo.emitted_at = Some(std::time::Instant::now());
 
         app.handle_modifiers(0x01, 0, 0, 0);
 
@@ -1061,7 +704,7 @@ mod tests {
         // The whole repeat fix hinges on this: a fresh press forwards as
         // wl_keyboard state=1, a key-repeat (state=2) as state=2 so rate-0
         // clients (Chromium on KWin) see continuous-key.
-        let mut s = AdapterState::new();
+        let (mut s, _peer) = AdapterState::for_test(ImProtocol::ImV2);
         assert_eq!(s.press_value(), 1, "default press = state 1");
         s.forwarding_repeat = true;
         assert_eq!(s.press_value(), 2, "repeat press = state 2");
@@ -1128,11 +771,7 @@ mod tests {
         const A: u32 = 30;
         const N: u32 = 49;
         const J: u32 = 36;
-        let mut app = WaylandAdapter {
-            handler: ToneOnJHandler::default(),
-            state: AdapterState::new(),
-            qh: None,
-        };
+        let (mut app, _peer) = app(ToneOnJHandler::default());
         app.dispatch_key_press(0, H);
         app.dispatch_key_press(1, A);
         app.dispatch_key_release(2, H);
@@ -1154,11 +793,7 @@ mod tests {
 
     #[test]
     fn key_repeat_does_not_mark_a_released_key_held() {
-        let mut app = WaylandAdapter {
-            handler: ToneOnJHandler::default(),
-            state: AdapterState::new(),
-            qh: None,
-        };
+        let (mut app, _peer) = app(ToneOnJHandler::default());
         app.dispatch_key_press(0, 30);
         app.dispatch_key_release(1, 30);
         app.dispatch_key_repeat(2, 30);
@@ -1167,7 +802,7 @@ mod tests {
 
     #[test]
     fn is_level_shifted_compares_decoded_char_to_base_level() {
-        let mut s = AdapterState::new();
+        let (mut s, _peer) = AdapterState::for_test(ImProtocol::ImV2);
         // No keymap → can't compare → never diverts (raw-forward default).
         {
             let ctx = AdapterCtx { state: &mut s };
@@ -1188,7 +823,7 @@ mod tests {
     fn ctx_is_repeat_mirrors_state_flag() {
         // The daemon reads ctx.is_repeat() to skip engine mutation; it must
         // track forwarding_repeat exactly.
-        let mut s = AdapterState::new();
+        let (mut s, _peer) = AdapterState::for_test(ImProtocol::ImV2);
         {
             let ctx = AdapterCtx { state: &mut s };
             assert!(!ctx.is_repeat());

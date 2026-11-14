@@ -60,13 +60,10 @@ impl<H: AdapterHandler> WaylandHandle<H> {
         // unprocessed forever. After draining the queue, if v1
         // `pending_commit` is still set, force the frame apply here so
         // the daemon sees the text change.
-        if self.app.state.pending_commit
-            && matches!(self.app.state.profile.protocol, crate::ImProtocol::ImV1)
-        {
+        if self.app.state.wire.take_pending_commit() {
             tracing::debug!(
                 "v1: dispatch end — pending_commit still set, forcing apply_done_frame"
             );
-            self.app.state.pending_commit = false;
             self.app.apply_done_frame();
         }
         Ok(!self.app.state.should_exit)
@@ -93,12 +90,7 @@ impl<H: AdapterHandler> WaylandHandle<H> {
     }
 
     pub fn focus_snapshot(&self) -> Option<FocusEvent> {
-        self.app
-            .state
-            .focus_current
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
+        self.app.state.focus_snapshot()
     }
 
     pub fn focus_backend(&mut self) -> &mut Option<Box<dyn FocusBackend>> {

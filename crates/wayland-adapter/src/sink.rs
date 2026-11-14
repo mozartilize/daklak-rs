@@ -1,11 +1,13 @@
-use std::time::Instant;
-
 use viet_ime_edit_strategy::{KeyState, OutputSink};
 use viet_ime_key_emitter::{HeldKeys, KeyEmitter};
 use viet_ime_keymap::xkb::XkbState;
 
 use wayland_protocols::wp::input_method::zv1::client::zwp_input_method_context_v1::ZwpInputMethodContextV1;
-use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2;
+use wayland_protocols_misc::{
+    zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2,
+    zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+};
+use crate::state::ModifierEcho;
 
 /// Backend selection for the text-input-v3-shaped operations (the ones
 /// `KeyEmitter` doesn't cover): `commit_string`, `commit(serial)`,
@@ -13,6 +15,7 @@ use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::Zw
 pub(crate) enum TextOpsTarget<'a> {
     V2 {
         im: &'a ZwpInputMethodV2,
+        acked: &'a mut bool,
     },
     V1 {
         ctx: &'a ZwpInputMethodContextV1,
@@ -20,17 +23,37 @@ pub(crate) enum TextOpsTarget<'a> {
     },
 }
 
-/// Routing decision for an entire KWin IMv1 replacement string.
-/// Always emit whole replacement through keysym on KWin; splitting a single
-/// logical replacement between keysym and commit_string creates non-atomic
-/// edits that terminals like Ghostty and xfce4-terminal render incorrectly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum V1ReplacementRoute {
-    WholeKeysym,
+/// Key routing is independent of the text protocol. A VK may accompany IMv1.
+#[derive(Clone, Copy)]
+pub(crate) enum KeyOutput<'a> {
+    VirtualKeyboard { vk: &'a ZwpVirtualKeyboardV1, synthetic_keymap: bool },
+    V1Context { ctx: &'a ZwpInputMethodContextV1, serial: u32 },
 }
 
-fn v1_replacement_route(_text: &str, _commit_string_functional: bool) -> V1ReplacementRoute {
-    V1ReplacementRoute::WholeKeysym
+impl KeyOutput<'_> {
+    fn has_synthetic_keymap(&self) -> bool {
+        matches!(self, Self::VirtualKeyboard { synthetic_keymap: true, .. })
+    }
+}
+
+impl KeyEmitter for KeyOutput<'_> {
+    fn emit_key(&mut self, time: u32, key: u32, value: u32) {
+        match self {
+            Self::VirtualKeyboard { vk, .. } => vk.key(time, key, value),
+            Self::V1Context { ctx, serial } => ctx.key(*serial, time, key, value),
+        }
+    }
+
+    fn emit_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
+        match self {
+            Self::VirtualKeyboard { vk, .. } => vk.modifiers(depressed, latched, locked, group),
+            Self::V1Context { ctx, serial } => ctx.modifiers(*serial, depressed, latched, locked, group),
+        }
+    }
+
+    fn modifier_echo_through_grab(&self) -> bool {
+        matches!(self, Self::V1Context { .. })
+    }
 }
 
 // V2 serial checks can discard an edit when a client update overtakes it.
@@ -54,10 +77,7 @@ fn forward_backspace_needs_modifier_guard(key_code: u32, raw_mods: (u32, u32, u3
     key_code == 14 && (depressed | latched | locked) != 0
 }
 
-fn flush_connection(conn: Option<&wayland_client::Connection>, operation: &'static str) -> bool {
-    let Some(conn) = conn else {
-        return true;
-    };
+fn flush_connection(conn: &wayland_client::Connection, operation: &'static str) -> bool {
     match conn.flush() {
         Ok(()) => true,
         Err(error) => {
@@ -72,34 +92,12 @@ fn flush_connection(conn: Option<&wayland_client::Connection>, operation: &'stat
 /// Constructed via `AdapterCtx::with_sink` — borrows proxy references from
 /// `AdapterState`.
 ///
-/// - `text_ops` selects v2 (wlroots) vs v1 (KWin) for text-input-v3-shaped
-///   events (`commit_string`, `delete_surrounding_text`, `commit(serial)`).
-/// - `forward_emitter` emits **standard keycodes** against the
-///   compositor's existing keymap. Drives `vk_key` (Tier 2 BS, nav) and
-///   `forward_press` (user-typed letters daklak passes through).
-///   `vk_v1` on KWin / `vk_v2` everywhere else.
-/// - `synth_keymap_emitter` emits **daklak's synthesised keymap slots**
-///   (Vietnamese precomposed chars at evdev kc ≤ 191). Drives
-///   `vk_commit_char` (the key-channel Vietnamese commit). Only `vk_v2`
-///   qualifies — v1 has no `vk_commit_char` parity.
-///   `None` on backends where the vk synthetic-keymap commit is
-///   unsupported (KWin v1).
+/// Text operations and key operations borrow independently selected channels.
+/// All key output, including passthrough and replacement text, uses `keys`.
 pub struct AdapterSink<'a> {
     pub(crate) text_ops: TextOpsTarget<'a>,
-    pub(crate) forward_emitter: &'a mut dyn KeyEmitter,
-    pub(crate) synth_keymap_emitter: Option<&'a mut dyn KeyEmitter>,
-    /// Counter of `vk.modifiers` calls daklak has emitted but not yet seen
-    /// echoed back through the IM grab's `Modifiers` event. Incremented per
-    /// emit in `vk_commit_char`; AdapterState's `on_modifiers` handler decrements
-    /// and skips its own `self.modifiers` update so daklak's modifier state
-    /// tracking isn't transiently corrupted by its own dance.
-    pub(crate) synthetic_mods_pending: &'a mut u32,
-    /// Exact synthetic modifier masks expected to echo back through the IM grab.
-    pub(crate) synthetic_mods_expected: &'a mut std::collections::VecDeque<(u32, u32, u32, u32)>,
-    /// Stamp of the most recent `synthetic_mods_pending` increment — read by
-    /// `on_modifiers` as a TTL safety net (force-reset the counter if no
-    /// echo arrives within 50ms, in case the compositor coalesced events).
-    pub(crate) synthetic_mods_emitted_at: &'a mut Option<Instant>,
+    pub(crate) keys: KeyOutput<'a>,
+    pub(crate) echo: &'a mut ModifierEcho,
     /// Snapshot of the user's physical modifier state at the time of the
     /// daemon action. `vk_commit_char` may temporarily override these to
     /// address xkb level 2/3/4 of the daklak custom keymap, then restores.
@@ -113,35 +111,23 @@ pub struct AdapterSink<'a> {
     pub(crate) held: &'a mut HeldKeys,
     /// Wayland connection — used by `commit_via_keysym` to flush after
     /// the batch of emissions so they reach the compositor in one round.
-    pub(crate) conn: Option<&'a wayland_client::Connection>,
-    /// xkb state for char→keycode reverse lookup. Used by
-    /// `commit_via_keysym` to emit standard ASCII chars via `ctx.key()`
-    /// (layout-aware) instead of `ctx.keysym()` which would go through
-    /// KWin's forwardKeySym + kc 247 temp keymap and trigger foot's xkb
-    /// recompile race.
+    pub(crate) conn: &'a wayland_client::Connection,
+    /// Reverse lookup for held-key releases and the IMv1 modifier guard.
     pub(crate) xkb: Option<&'a XkbState>,
     /// Whether the focused client applies text-input-v3 `commit_string`.
     /// `true` by default; flipped `false` at the ST→FK downgrade when the
     /// client's surrounding-text proved dead (Google Docs / Firefox
     /// contenteditable) — the same dead text-input-v3 contract drops
-    /// `commit_string` too. When `false`, `commit_via_keysym` routes the whole
-    /// commit through `vk_commit_char` (v2/sway) or `ctx.keysym` (v1/KWin)
-    /// instead of `commit_string`. KWin v1 always keeps replacements on the
-    /// single keysym channel; v2 with working commit_string still falls back to
-    /// one whole commit_string on the normal path.
+    /// `commit_string` too. Also controls the IMv1 mapped-keysym modifier guard.
+    /// A key-channel replacement is always preflighted as a whole.
     pub(crate) commit_string_functional: bool,
-    /// V2 only: flipped to true by `commit()` so `apply_done_frame` can
-    /// detect whether daklak already acked the compositor's done event,
-    /// and emit a bare heartbeat commit otherwise. See AdapterState field
-    /// of the same name for rationale.
-    pub(crate) pending_im_commit_ack: &'a mut bool,
 }
 
 impl OutputSink for AdapterSink<'_> {
     fn prefer_key_channel_replacement(&self, text: &str) -> bool {
         prefer_v2_key_replacement(
             matches!(&self.text_ops, TextOpsTarget::V2 { .. }),
-            self.synth_keymap_emitter.is_some(),
+            self.keys.has_synthetic_keymap(),
             text,
         )
     }
@@ -156,7 +142,7 @@ impl OutputSink for AdapterSink<'_> {
         match &self.text_ops {
             // v2/wlroots and v1/KWin both use UTF-8 byte counts per the
             // text-input-v3 spec.
-            TextOpsTarget::V2 { im } => {
+            TextOpsTarget::V2 { im, .. } => {
                 im.delete_surrounding_text(before_bytes, after_bytes);
             }
             TextOpsTarget::V1 { ctx, .. } => {
@@ -175,16 +161,16 @@ impl OutputSink for AdapterSink<'_> {
     fn commit_string(&mut self, text: &str) {
         tracing::trace!(text = %text, "commit_string emit (text-input channel)");
         match &self.text_ops {
-            TextOpsTarget::V2 { im } => im.commit_string(text.to_owned()),
+            TextOpsTarget::V2 { im, .. } => im.commit_string(text.to_owned()),
             TextOpsTarget::V1 { ctx, serial } => ctx.commit_string(*serial, text.to_owned()),
         }
     }
 
     fn commit(&mut self, serial: u32) {
-        match &self.text_ops {
-            TextOpsTarget::V2 { im } => {
+        match &mut self.text_ops {
+            TextOpsTarget::V2 { im, acked } => {
                 im.commit(serial);
-                *self.pending_im_commit_ack = true;
+                **acked = true;
             }
             // v1 has no batching — commit is a no-op.
             TextOpsTarget::V1 { .. } => {}
@@ -196,34 +182,29 @@ impl OutputSink for AdapterSink<'_> {
             KeyState::Pressed => 1,
             KeyState::Released => 0,
         };
-        // Standard keycode (BS / nav / forward) → forward_emitter.
-        // TRACE the wire order: on v1 this is ctx.key (wl_keyboard channel),
-        // emitted interleaved with commit_via_keysym's keysym (wl_keyboard) and
-        // commit_string (text-input-v3) channels. Lets a live log confirm
-        // whether ForwardKey backspaces actually fire and in what order vs the
-        // commit on a contenteditable that reorders the two channels.
+        // Backspace and replacement text must use the same keyboard channel.
         let guard_modifiers = forward_backspace_needs_modifier_guard(key_code, self.raw_mods);
         if guard_modifiers && state == KeyState::Pressed {
             tracing::trace!(
                 raw_mods = ?self.raw_mods,
                 "vk_key Backspace modifier guard: clear modifiers"
             );
-            self.forward_emitter.emit_modifiers(0, 0, 0, self.raw_mods.3);
+            self.keys.emit_modifiers(0, 0, 0, self.raw_mods.3);
         }
         if state == KeyState::Pressed {
             // A synthetic Backspace while the user's own Backspace is still
             // down (fast delete-then-retype) would otherwise be dropped.
             self.held
-                .release_before_press(self.forward_emitter, time, key_code);
+                .release_before_press(&mut self.keys, time, key_code);
         }
         tracing::trace!(key_code, value, "vk_key emit (forward channel)");
-        self.forward_emitter.emit_key(time, key_code, value);
+        self.keys.emit_key(time, key_code, value);
         if guard_modifiers && state == KeyState::Released {
             tracing::trace!(
                 raw_mods = ?self.raw_mods,
                 "vk_key Backspace modifier guard: restore modifiers"
             );
-            self.forward_emitter.emit_modifiers(
+            self.keys.emit_modifiers(
                 self.raw_mods.0,
                 self.raw_mods.1,
                 self.raw_mods.2,
@@ -233,32 +214,17 @@ impl OutputSink for AdapterSink<'_> {
     }
 
     fn vk_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        // Modifier echo around forwards → forward_emitter. The key-channel
-        // commit's modifier dance runs inside emit_char on
-        // synth_keymap_emitter and is wired directly there.
-        self.forward_emitter
+        self.keys
             .emit_modifiers(depressed, latched, locked, group);
     }
 
     fn vk_commit_char(&mut self, time: u32, c: char) -> bool {
-        // The key-channel Vietnamese commit needs daklak's synthesised
-        // keymap. Only the
-        // synth_keymap_emitter knows how to drive it — KWin v1 leaves
-        // this slot `None` and the caller falls back to `commit_string`.
-        let Some(emitter) = self.synth_keymap_emitter.as_deref_mut() else {
-            tracing::trace!(
-                "vk_commit_char: no synth_keymap_emitter available (vk synthetic-keymap commit unsupported on this backend)"
-            );
+        if !self.keys.has_synthetic_keymap() {
             return false;
-        };
-        let mut synthetic_mods = viet_ime_key_emitter::SyntheticMods {
-            pending: self.synthetic_mods_pending,
-            expected: self.synthetic_mods_expected,
-            emitted_at: self.synthetic_mods_emitted_at,
-        };
+        }
         viet_ime_key_emitter::emit_char(
-            emitter,
-            &mut synthetic_mods,
+            &mut self.keys,
+            &mut self.echo.emission(),
             viet_ime_key_emitter::EmitCharParams {
                 raw_mods: self.raw_mods,
                 held: self.held,
@@ -269,60 +235,16 @@ impl OutputSink for AdapterSink<'_> {
     }
 
     fn commit_via_keysym(&mut self, serial: u32, time: u32, text: &str) -> bool {
-        match &self.text_ops {
-            // ── ImV2 path: emit via virtual keyboard ──────────────────────
-            //
-            // ImV2 has no ctx.keysym(). Every replacement goes through the
-            // virtual keyboard's synthetic keymap (`vk_commit_char`, which
-            // includes the held-key prelude-release fix), even when the
-            // client has a live text-input-v3 session:
-            //
-            // - Non-terminal clients (Firefox / Google Docs) ignore
-            //   text-input-v3 commit_string in this path.
-            // - The ForwardKey Backspaces and every unconsumed user key are
-            //   vk key events. GTK queues key events but applies text-input
-            //   events on arrival, so a commit_string would land *before* the
-            //   queued Backspace (Ghostty: `la` + `à`, then BS → `la`).
-            //   Keeping the replacement on the key channel keeps the edit in
-            //   order.
-            //
-            // commit_string remains only for chars outside the synth keymap.
-            TextOpsTarget::V2 { .. } => {
-                tracing::trace!(text = %text, "commit_via_keysym: enter (v2 vk path)");
-                let mut fallback_buf = String::new();
-                for c in text.chars() {
-                    if self.vk_commit_char(time, c) {
-                        if !flush_connection(self.conn, "flush synthetic character") {
-                            // Emission was attempted. Returning false would replay
-                            // the replacement through commit_string and risk duplicates.
-                            return true;
-                        }
-                        continue;
-                    }
-                    // Char not in synth keymap — buffer for commit_string.
-                    fallback_buf.push(c);
-                }
-                if !fallback_buf.is_empty() {
-                    tracing::trace!(
-                        text = %fallback_buf,
-                        "commit_via_keysym: fallback commit_string for chars outside synth keymap"
-                    );
-                    self.commit_string(&fallback_buf);
-                    self.commit(serial);
-                }
-                true
-            }
-
-            // ── ImV1 path: emit via ctx.keysym() ─────────────────────────
-            TextOpsTarget::V1 { ctx, .. } => self.commit_via_keysym_v1(ctx, serial, time, text),
-        }
+        // Never emit a supported prefix and fall back with the remainder: that
+        // reorders characters across keyboard and text-input delivery queues.
+        self.commit_key_channel_text(serial, time, text)
     }
 
     fn commit_key_channel_text(&mut self, _serial: u32, time: u32, text: &str) -> bool {
-        match &self.text_ops {
-            // ImV2: preflight all chars are in the synth keymap, then emit.
-            TextOpsTarget::V2 { .. } => {
-                if !text.chars().all(|c| {
+        match self.keys {
+            // Preflight the entire text before emitting any key.
+            KeyOutput::VirtualKeyboard { .. } => {
+                if !self.keys.has_synthetic_keymap() || !text.chars().all(|c| {
                     viet_ime_keymap::char_to_emit(c).is_some()
                 }) {
                     return false;
@@ -332,14 +254,15 @@ impl OutputSink for AdapterSink<'_> {
                         return false;
                     }
                     if !flush_connection(self.conn, "flush key-channel character") {
+                        // Output was attempted; false would replay the edit.
                         return true;
                     }
                 }
                 true
             }
             // ImV1: delegate to whole-keysym path.
-            TextOpsTarget::V1 { ctx, .. } => {
-                self.commit_via_keysym_v1(ctx, _serial, time, text)
+            KeyOutput::V1Context { ctx, serial } => {
+                self.commit_via_keysym_v1(ctx, serial, time, text)
             }
         }
     }
@@ -360,7 +283,9 @@ impl AdapterSink<'_> {
         const PRESSED: u32 = 1;
         const RELEASED: u32 = 0;
 
-        let _route = v1_replacement_route(text, self.commit_string_functional);
+        if !text.chars().all(|c| viet_ime_keymap::xkb::commit_keysym(c).is_some()) {
+            return false;
+        }
 
         tracing::trace!(text = %text, "commit_via_keysym: enter (v1 keysym path)");
 
@@ -389,25 +314,23 @@ impl AdapterSink<'_> {
             // dropped.
             if let Some(kc) = self.xkb.and_then(|xkb| xkb.keysym_keycode(sym)) {
                 self.held
-                    .release_before_press(self.forward_emitter, time, kc);
+                    .release_before_press(&mut self.keys, time, kc);
             }
 
-            // Per-char keysym barrier: KWin's forwardKeySym installs a
-            // per-sym temp keymap (scratch keycode) for unmapped keysyms → foot
-            // recompiles xkb. Flush + sleep so foot finishes before the
-            // next char or forwarded physical key arrives.
+            // Keep the mapped-key modifier guard and per-character flush on
+            // the context channel; do not apply this workaround to VK.
             let guard_modifiers = v1_keysym_needs_modifier_guard(
                 is_unmapped,
                 self.commit_string_functional,
                 self.raw_mods,
             );
             if guard_modifiers {
-                self.forward_emitter.emit_modifiers(0, 0, 0, self.raw_mods.3);
+                self.keys.emit_modifiers(0, 0, 0, self.raw_mods.3);
             }
             ctx.keysym(serial, time, sym.raw(), PRESSED, 0);
             ctx.keysym(serial, time, sym.raw(), RELEASED, 0);
             if guard_modifiers {
-                self.forward_emitter.emit_modifiers(
+                self.keys.emit_modifiers(
                     self.raw_mods.0,
                     self.raw_mods.1,
                     self.raw_mods.2,
@@ -462,36 +385,6 @@ mod tests {
         assert!(!forward_backspace_needs_modifier_guard(14, (0, 0, 0, 0)));
         assert!(!forward_backspace_needs_modifier_guard(14, (0, 0, 0, 1)));
         assert!(!forward_backspace_needs_modifier_guard(30, (1, 0, 0, 0)));
-    }
-
-    // ── V1ReplacementRoute tests ───────────────────────────────────────
-
-    #[test]
-    fn v1_replacement_uses_whole_keysym_even_when_commit_string_functional() {
-        assert_eq!(
-            v1_replacement_route("ập", true),
-            V1ReplacementRoute::WholeKeysym
-        );
-    }
-
-    #[test]
-    fn v1_replacement_uses_whole_keysym_when_commit_string_is_not_functional() {
-        assert_eq!(
-            v1_replacement_route("ập", false),
-            V1ReplacementRoute::WholeKeysym
-        );
-    }
-
-    #[test]
-    fn v1_mapped_ascii_tail_is_allowed_on_keysym_channel() {
-        assert_eq!(
-            v1_replacement_route("ếng", true),
-            V1ReplacementRoute::WholeKeysym
-        );
-        assert_eq!(
-            v1_replacement_route("ập", false),
-            V1ReplacementRoute::WholeKeysym
-        );
     }
 
     /// Verifies that Latin-2+ legacy keysyms get Unicode encoding to

@@ -482,7 +482,9 @@ mod tests {
         use std::sync::Arc;
         use viet_ime_edit_strategy::{BackspaceMethod, KeyDecision, KeyState, OutputSink};
         use viet_ime_engine::InputMethod;
-        use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, AdapterState, FrameSnapshot};
+        use viet_ime_wayland_adapter::{
+            AdapterCtx, AdapterHandler, AdapterState, FrameSnapshot, ImProtocol,
+        };
 
         #[derive(Default)]
         struct DeleteCaptureSink {
@@ -539,7 +541,7 @@ mod tests {
                 super::super::noop_config_rx(),
             );
 
-            let mut state = AdapterState::new();
+            let (mut state, _peer) = AdapterState::for_test(ImProtocol::ImV2);
             let mut ctx = AdapterCtx { state: &mut state };
             let mut activate = frame("", 0, 0);
             activate.activate = true;
@@ -603,7 +605,7 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 super::super::noop_config_rx(),
             );
-            let mut state = AdapterState::new();
+            let (mut state, _peer) = AdapterState::for_test(ImProtocol::ImV2);
             let mut ctx = AdapterCtx { state: &mut state };
 
             daemon.on_focus_changed(&mut ctx, Some("com.mitchellh.ghostty".to_owned()), false);
@@ -623,14 +625,15 @@ mod tests {
         }
 
         #[test]
-        fn focus_without_vk_does_not_synthesize_session() {
+        fn focus_on_imv1_does_not_synthesize_session() {
             let mut daemon = Daemon::new(
                 Config::default(),
                 Arc::new(AtomicBool::new(true)),
                 super::super::noop_config_rx(),
             );
-            let mut state = AdapterState::new();
-            state.profile.has_vk_keyboard = false;
+            // IMv1 has no keyboard grab outside a text-input context, so a
+            // focused client without text-input cannot be composed for.
+            let (mut state, _peer) = AdapterState::for_test(ImProtocol::ImV1);
             let mut ctx = AdapterCtx { state: &mut state };
 
             daemon.on_focus_changed(&mut ctx, Some("com.mitchellh.ghostty".to_owned()), false);
@@ -664,7 +667,7 @@ mod tests {
                 false,
             ));
 
-            let mut state = AdapterState::new();
+            let (mut state, _peer) = AdapterState::for_test(ImProtocol::ImV2);
             let mut ctx = AdapterCtx { state: &mut state };
 
             daemon.on_done_frame(&mut ctx, &frame("translate", 3, 3));
@@ -823,7 +826,7 @@ mod tests {
         use std::sync::Arc;
         use viet_ime_edit_strategy::{BackspaceMethod, KeyDecision, ModifierState};
         use viet_ime_engine::InputMethod;
-        use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, AdapterState};
+        use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, AdapterState, ImProtocol};
 
         const KEY_A: u32 = 30;
         const KEY_LEFT: u32 = 105;
@@ -845,7 +848,7 @@ mod tests {
 
         /// Drive the trait `on_key_pressed` with `forwarding_repeat = repeat`.
         fn key(d: &mut Daemon, key: u32, ch: Option<char>, repeat: bool) -> KeyDecision {
-            let mut state = AdapterState::new();
+            let (mut state, _peer) = AdapterState::for_test(ImProtocol::ImV2);
             state.forwarding_repeat = repeat;
             let mut ctx = AdapterCtx { state: &mut state };
             d.on_key_pressed(&mut ctx, 0, key, ch)
@@ -936,9 +939,7 @@ mod tests {
         use viet_ime_edit_strategy::{BackspaceMethod, KeyDecision};
         use viet_ime_engine::InputMethod;
         use viet_ime_keymap::xkb::XkbState;
-        use viet_ime_wayland_adapter::{
-            AdapterCtx, AdapterHandler, AdapterState, ImProtocol, TransportProfile,
-        };
+        use viet_ime_wayland_adapter::{AdapterCtx, AdapterHandler, AdapterState, ImProtocol};
 
         const KEY_L: u32 = 38;
 
@@ -961,8 +962,7 @@ mod tests {
         /// `is_level_shifted` can compare the decoded char to its base level.
         /// `ch` is the already-decoded char the adapter would pass.
         fn key(d: &mut Daemon, protocol: ImProtocol, ch: char) -> KeyDecision {
-            let mut state = AdapterState::new();
-            state.profile = TransportProfile::for_protocol(protocol);
+            let (mut state, _peer) = AdapterState::for_test(protocol);
             state.xkb = Some(XkbState::us_for_test());
             let mut ctx = AdapterCtx { state: &mut state };
             d.on_key_pressed(&mut ctx, 0, KEY_L, Some(ch))

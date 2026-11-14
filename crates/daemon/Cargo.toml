@@ -40,3 +40,4 @@ futures-util = { workspace = true }
 [dev-dependencies]
 # Enable the keymap test builders (real "us" layout) for daemon tests.
 viet-ime-keymap = { workspace = true, features = ["test-util"] }
+viet-ime-wayland-adapter = { path = "../wayland-adapter", features = ["test-util"] }
