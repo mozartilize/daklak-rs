@@ -90,6 +90,9 @@ execution are independent of which transport is live.
 To compute a minimal edit, the brain keeps a **shadow** of what it believes the
 application currently shows for the in-progress word. Each keystroke diffs the
 new composed form against the shadow to produce "delete N, commit S".
+Backspace can itself produce such a replacement: with legacy tone placement,
+`hoàn` becomes `hòa` by deleting `oàn` and inserting `òa`. The evdev path uses
+the same output handling for Backspace and printable-key edits.
 
 The shadow can drift out of sync with reality (the user clicks elsewhere, an app
 rewrites its own field, focus changes). daklak resets or resynchronizes the

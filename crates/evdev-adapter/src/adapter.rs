@@ -443,16 +443,13 @@ impl EvdevAdapter {
 
         handler.check_idle_reset_window();
 
-        if code == KEY_BACKSPACE {
-            match handler.handle_backspace() {
-                KeyDecision::Consumed => {}
-                KeyDecision::ForwardRaw => self.forward_press_raw(code, value),
-                KeyDecision::Apply { backspaces, .. } => self.emit_backspaces(backspaces),
-            }
-            return;
-        }
+        let decision = if code == KEY_BACKSPACE {
+            handler.handle_backspace()
+        } else {
+            handler.handle_char(code, ch)
+        };
 
-        match handler.handle_char(code, ch) {
+        match decision {
             KeyDecision::Consumed => {}
             KeyDecision::ForwardRaw => self.forward_press_raw(code, value),
             KeyDecision::Apply {
@@ -547,6 +544,7 @@ mod tests {
     #[derive(Default)]
     struct MockHandler {
         char_decisions: Vec<KeyDecision>,
+        backspace_decision: Option<KeyDecision>,
     }
 
     impl EvdevHandler for MockHandler {
@@ -558,7 +556,7 @@ mod tests {
             }
         }
         fn handle_backspace(&mut self) -> KeyDecision {
-            KeyDecision::ForwardRaw
+            self.backspace_decision.take().unwrap_or(KeyDecision::ForwardRaw)
         }
         fn clear_session(&mut self) {}
         fn clear_last_input_char(&mut self) {}
@@ -586,6 +584,31 @@ mod tests {
 
     const KEY_S: u16 = 31;
 
+    #[test]
+    fn backspace_replacement_is_emitted_after_deletes() {
+        // Legacy tone placement: deleting n from hoàn replaces oàn with òa.
+        let emitter = CapturingEmitter::default();
+        let events = emitter.events.clone();
+        let mut adapter = test_adapter(emitter);
+        let mut handler = MockHandler {
+            backspace_decision: Some(KeyDecision::Apply {
+                method: viet_ime_edit_strategy::BackspaceMethod::ForwardKey,
+                backspaces: 3,
+                commit: "òa".into(),
+            }),
+            ..Default::default()
+        };
+        adapter.process_event(&mut handler, &key(KEY_BACKSPACE as u16, 1));
+        adapter.process_event(&mut handler, &key(KEY_BACKSPACE as u16, 0));
+
+        assert_eq!(&*events.lock().unwrap(), &[
+            (14, 1), (14, 0), (14, 1), (14, 0), (14, 1), (14, 0),
+            // ò: Level3 + Level5 + X; a: unmodified A.
+            (100, 1), (92, 1), (45, 1), (45, 0),
+            (100, 0), (92, 0), (30, 1), (30, 0),
+        ]);
+    }
+
     /// A press the engine consumed must not forward its release. Otherwise the
     /// client receives a press-less release (dangling through the live IBus
     /// passthrough path), which strands it in an auto-repeat until the next key.
@@ -596,6 +619,7 @@ mod tests {
         let mut adapter = test_adapter(emitter);
         let mut handler = MockHandler {
             char_decisions: vec![KeyDecision::Consumed],
+            ..Default::default()
         };
 
         adapter.process_event(&mut handler, &key(KEY_S, 1)); // press → consumed
@@ -617,6 +641,7 @@ mod tests {
         let mut adapter = test_adapter(emitter);
         let mut handler = MockHandler {
             char_decisions: vec![KeyDecision::ForwardRaw],
+            ..Default::default()
         };
 
         adapter.process_event(&mut handler, &key(KEY_S, 1)); // press → forward raw
@@ -641,6 +666,7 @@ mod tests {
         let mut adapter = test_adapter(emitter);
         let mut handler = MockHandler {
             char_decisions: vec![KeyDecision::ForwardRaw, KeyDecision::ForwardRaw],
+            ..Default::default()
         };
         adapter.process_event(&mut handler, &key(KEY_S, 1)); // press → forward raw
         adapter.process_event(&mut handler, &key(KEY_S, 2)); // autorepeat → re-forward
@@ -665,6 +691,7 @@ mod tests {
                     commit: "a".into(),
                 },
             ],
+            ..Default::default()
         };
         adapter.process_event(&mut handler, &key(KEY_S, 1)); // press → consumed
         adapter.process_event(&mut handler, &key(KEY_S, 2)); // autorepeat → Apply recompose
@@ -695,6 +722,7 @@ mod tests {
                 KeyDecision::ForwardRaw, // autorepeat: engine now forwards raw
                 KeyDecision::ForwardRaw, // autorepeat: keeps forwarding
             ],
+            ..Default::default()
         };
         adapter.process_event(&mut handler, &key(KEY_S, 1)); // press → consumed
         adapter.process_event(&mut handler, &key(KEY_S, 2)); // autorepeat → first raw forward
