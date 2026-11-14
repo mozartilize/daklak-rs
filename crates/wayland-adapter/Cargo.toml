@@ -19,7 +19,6 @@ viet-ime-keymap = { workspace = true }
 viet-ime-key-emitter = { workspace = true }
 
 wayland-client = { workspace = true }
-wayland-backend = { workspace = true }
 wayland-protocols = { workspace = true }
 wayland-protocols-misc = { workspace = true }
 wayland-protocols-wlr = { workspace = true }
@@ -28,11 +27,8 @@ wayland-protocols-plasma = { version = "0.3", features = ["client"], optional = 
 tokio = { workspace = true }
 tracing = { workspace = true }
 async-trait = "0.1"
-x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code"] }
 
 xkbcommon = { workspace = true }
-libc = "0.2"
-serde_json = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]

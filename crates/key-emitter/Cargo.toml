@@ -8,7 +8,6 @@ license.workspace = true
 viet-ime-keymap = { workspace = true }
 viet-ime-edit-strategy = { path = "../edit-strategy" }
 
-wayland-client = { workspace = true }
 wayland-protocols = { workspace = true }
 wayland-protocols-misc = { workspace = true }
 
