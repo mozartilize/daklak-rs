@@ -49,7 +49,6 @@ pub fn apply(
         sink.commit_string(commit);
         sink.commit(serial);
         shadow.append(commit);
-        shadow.pending_commit = true;
         return;
     }
 
@@ -80,5 +79,4 @@ pub fn apply(
     sink.commit_string(commit);
     sink.commit(serial);
     shadow.append(commit);
-    shadow.pending_commit = true;
 }

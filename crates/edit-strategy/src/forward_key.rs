@@ -46,5 +46,4 @@ pub fn apply(
     }
 
     shadow.append(commit);
-    shadow.pending_commit = true;
 }

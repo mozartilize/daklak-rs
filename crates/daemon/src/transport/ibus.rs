@@ -23,9 +23,6 @@ impl viet_ime_ibus_adapter::IbusHandler for Daemon {
     }
     fn set_modifiers(&mut self, m: viet_ime_edit_strategy::ModifierState) {
         self.router.modifiers = m;
-        if let Some(w) = self.router.composer.as_mut() {
-            w.set_modifiers(m);
-        }
     }
     fn activate_ibus(&mut self, method: viet_ime_edit_strategy::BackspaceMethod) {
         Daemon::activate_ibus(self, method);

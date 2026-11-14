@@ -403,7 +403,6 @@ impl Daemon {
         c.set_modern_style(self.config.modern_style);
         c.set_auto_capitalize(self.config.auto_capitalize);
         c.set_double_space_period(self.config.double_space_period);
-        c.set_modifiers(self.router.modifiers);
         self.router.current_active = true;
         self.router.synthetic_active = true;
         self.router.composer = Some(c);
@@ -423,7 +422,6 @@ impl Daemon {
         c.set_modern_style(self.config.modern_style);
         c.set_auto_capitalize(self.config.auto_capitalize);
         c.set_double_space_period(self.config.double_space_period);
-        c.set_modifiers(self.router.modifiers);
         self.router.composer = Some(c);
         self.router.current_active = true;
     }

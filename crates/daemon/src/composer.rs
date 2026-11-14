@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, KeyDecision, ModifierState, Strategy};
+use viet_ime_edit_strategy::{BackspaceMethod, DeleteUnit, KeyDecision, Strategy};
 use viet_ime_engine::{EngineState, InputMethod, ProcessResult};
 
 #[cfg(feature = "ibus")]
@@ -43,10 +43,6 @@ impl EditModel {
 
     fn set_method(&mut self, m: BackspaceMethod) {
         self.strategy.set_method(m);
-    }
-
-    fn set_modifiers(&mut self, m: ModifierState) {
-        self.strategy.set_modifiers(m);
     }
 
     /// Reset IM-owned text while preserving the last application snapshot.
@@ -96,14 +92,6 @@ impl EditModel {
 
     fn deletion_since_prev(&self, text: &str, cursor: u32) -> bool {
         detect_deletion(&self.prev_text, self.prev_cursor, text, cursor)
-    }
-
-    /// Prove that `text` is the last confirmed application text plus exactly
-    /// `ch` immediately before `cursor`. Cursor movement is irrelevant; the
-    /// unchanged prefix+suffix proves this key, rather than an existing equal
-    /// character, produced the frame.
-    fn confirms_inserted_char(&self, text: &str, cursor: u32, ch: char) -> bool {
-        char_inserted_before_cursor(&self.prev_text, text, cursor, ch)
     }
 
     fn is_duplicate_frame(&self, text: &str, cursor: u32, anchor: u32) -> bool {
@@ -255,10 +243,6 @@ pub struct Composer {
     client_report: Option<(String, u32)>,
     previous_client_report: Option<(String, u32)>,
 
-    /// Whether `[`/`]`/`{`/`}` Telex shortcuts for ơ/ư/Ơ/Ư are enabled.
-    /// Stored so `set_input_method` can recreate the engine with it.
-    bracket_shortcuts: bool,
-
     /// Whether retroactive SurroundingText edits must first be confirmed by a
     /// client frame containing the raw key at its real insertion point. Only
     /// Wayland drains frame-triggered repairs; IBus keeps immediate edits.
@@ -304,9 +288,10 @@ pub struct Composer {
     /// combinations of independent flags.
     confirmation: ConfirmationState,
 
-    /// The letters typed since the current word started, when known (unknown
-    /// after a backspace). When a frame shows exactly these letters still raw
-    /// as the word before the caret, they can be retyped as fresh keys.
+    /// Literal letters typed since the current word started, when known
+    /// (unknown after a backspace), not the engine's reconstructed seed keys.
+    /// When a frame shows exactly these letters still raw as the word before
+    /// the caret, they can be retyped as fresh keys.
     typed_word: Option<String>,
 
     /// Whether a key was typed since composition was last reset (activation,
@@ -321,10 +306,23 @@ pub struct Composer {
     edit: EditModel,
 }
 
+/// What a surrounding-text frame means for the composition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SurroundingDecision {
-    trust: bool,
-    reseed: bool,
+enum SurroundingDecision {
+    /// A late echo of daklak's own recent edit: it describes a state already
+    /// left, so nothing is taken from it.
+    Ignore,
+    /// The text before the caret is the shadow. Sync to it; the engine
+    /// already agrees.
+    Confirmed,
+    /// The app removed text daklak did not delete. The engine starts over.
+    ExternalDeletion,
+    /// The caret is somewhere daklak did not put it (a click, an activation,
+    /// an external edit). Reseed the engine from the word it now touches.
+    Reseed,
+    /// The echo of the user's own key. Sync to it and keep the engine's
+    /// running composition.
+    TypedChar,
 }
 
 /// A retroactive repair emitted from a surrounding_text frame (not a
@@ -504,7 +502,7 @@ impl SurroundingObserver {
     fn observe(
         recent_action: bool,
         one_char_typed: bool,
-        deletion: bool,
+        external_deletion: bool,
         force_reseed: bool,
         shadow_confirmed: bool,
     ) -> SurroundingDecision {
@@ -523,13 +521,26 @@ impl SurroundingObserver {
         //    selection describing a prefix we already typed past (`haf`→`à`).
         //    Drop it.
         //
-        // `deletion` (incl. shadow-confirmed) drives only `reseed` + the reset
-        // branch below; it must NOT relax `trust`, and `has_selection` must NOT
+        // A deletion must NOT make a recent frame trusted: within the window
+        // it is our own delete_surrounding_text echo. `has_selection` must NOT
         // either (that blanket-trusted stale omnibox selections). Genuine
         // external edits arrive `!recent_action` and are always trusted.
-        let trust = !(recent_action && !one_char_typed && !shadow_confirmed && !force_reseed);
-        let reseed = force_reseed || (!one_char_typed && !recent_action && !deletion);
-        SurroundingDecision { trust, reseed }
+        if recent_action && !(one_char_typed || shadow_confirmed || force_reseed) {
+            return SurroundingDecision::Ignore;
+        }
+        // A trusted frame, most specific evidence first. One that matches the
+        // shadow tells the engine nothing new, even on activation. A 1-char
+        // insertion at the prior cursor is an ordinary keystroke the engine
+        // already tracks; anything else left is a caret daklak did not place.
+        if shadow_confirmed {
+            SurroundingDecision::Confirmed
+        } else if external_deletion {
+            SurroundingDecision::ExternalDeletion
+        } else if force_reseed || !one_char_typed {
+            SurroundingDecision::Reseed
+        } else {
+            SurroundingDecision::TypedChar
+        }
     }
 }
 
@@ -552,7 +563,6 @@ impl Composer {
             retroactive_context: false,
             client_report: None,
             previous_client_report: None,
-            bracket_shortcuts,
             confirm_retroactive_edits: false,
             v2_key_replacement: false,
             auto_capitalize: false,
@@ -674,16 +684,10 @@ impl Composer {
         self.ibus.note_correction_and_should_downgrade()
     }
 
-    pub fn set_modifiers(&mut self, m: ModifierState) {
-        self.edit.set_modifiers(m);
-    }
-
     /// Change input method at runtime. Resets all composition state.
     pub fn set_input_method(&mut self, method: InputMethod) {
-        let modern_style = self.engine.modern_style();
         self.full_reset();
-        self.engine = EngineState::new_with_options(method, self.bracket_shortcuts);
-        self.engine.set_modern_style(modern_style);
+        self.engine.set_input_method(method);
     }
 
     /// Toggle modern-style tone placement. `false` = legacy `òa` instead of `oà`.
@@ -705,9 +709,7 @@ impl Composer {
     pub fn set_double_space_period(&mut self, enabled: bool) {
         self.double_space_period = enabled;
         if !enabled {
-            self.first_space_after_word_at = None;
-            self.last_space_at = None;
-            self.pending_double_space_at = None;
+            self.clear_space_timers();
         }
     }
 
@@ -732,19 +734,29 @@ impl Composer {
     /// context. Mouse navigation needs no special handling; its changed frame
     /// is consumed normally by `apply_surrounding`.
     pub fn reset_composition_preserving_surrounding(&mut self) {
-        self.engine.reset();
-        self.edit.reset_composition();
-        self.last_input_char = None;
-        self.first_space_after_word_at = None;
-        self.last_space_at = None;
-        self.pending_double_space_at = None;
-        self.shadow_anchored = false;
-        self.empty_shadow_is_field_start = false;
-        self.retroactive_context = false;
+        self.forget_word_and_caret();
         self.confirmation = ConfirmationState::AwaitingFrame;
         self.typed_word = Some(String::new());
         self.keys_since_reset = false;
         self.passed_shadows.clear();
+    }
+
+    /// Drop the in-progress word and everything assumed about where the caret
+    /// is: engine, shadow, and the last-key and field-start bookkeeping.
+    fn forget_word_and_caret(&mut self) {
+        self.engine.reset();
+        self.edit.reset_composition();
+        self.last_input_char = None;
+        self.clear_space_timers();
+        self.shadow_anchored = false;
+        self.empty_shadow_is_field_start = false;
+        self.retroactive_context = false;
+    }
+
+    fn clear_space_timers(&mut self) {
+        self.first_space_after_word_at = None;
+        self.last_space_at = None;
+        self.pending_double_space_at = None;
     }
 
     /// Note the shadow before daklak changes it (see `passed_shadows`).
@@ -791,25 +803,14 @@ impl Composer {
             return false;
         }
         if self.method() == BackspaceMethod::SurroundingText {
-            if !matches!(
-                self.confirmation,
-                ConfirmationState::Live | ConfirmationState::LiveConfirmed
-            ) {
+            if self.confirmation.is_uncertain() {
                 self.confirmation = ConfirmationState::AwaitingFrame;
             }
         } else {
             // ForwardKey receives no cursor frames. After an idle pause its
             // shadow cannot be trusted: a silent click may have moved the
             // application cursor while the shadow still names the old word.
-            self.engine.reset();
-            self.edit.reset_composition();
-            self.last_input_char = None;
-            self.first_space_after_word_at = None;
-            self.last_space_at = None;
-            self.pending_double_space_at = None;
-            self.shadow_anchored = false;
-            self.empty_shadow_is_field_start = false;
-            self.retroactive_context = false;
+            self.forget_word_and_caret();
         }
         true
     }
@@ -846,30 +847,17 @@ impl Composer {
 
         if start.reset_speculation {
             self.engine.reset();
-            self.retroactive_context = false;
         }
-        if start.clear_non_alpha_context {
+        if start.reset_speculation || start.clear_non_alpha_context {
             self.retroactive_context = false;
         }
 
         if ch == ' '
             && self.double_space_period
             && !start.context_uncertain
-            && first_space_at
-                .is_some_and(|t| now.saturating_duration_since(t) <= DOUBLE_SPACE_WINDOW)
+            && within_double_space_window(first_space_at, now)
         {
-            self.engine.reset();
-            self.retroactive_context = false;
-            self.last_input_char = Some(' ');
-            self.keys_since_reset = true;
-            self.typed_word = Some(String::new());
-            self.last_keystroke_at = now;
-            self.confirmation = ConfirmationState::Live;
-            return KeyDecision::Apply {
-                method: self.method(),
-                backspaces: 1,
-                commit: ". ".to_owned(),
-            };
+            return self.double_space_period_edit(now);
         }
 
         if let Some(word) = start.seed_word.as_deref() {
@@ -877,65 +865,110 @@ impl Composer {
             self.retroactive_context = self.engine.feed_context_gated(word);
         }
 
-        let auto_capitalize_now = self.auto_capitalize
-            && !start.context_uncertain
-            && ch.is_ascii_lowercase()
-            && self.engine.at_word_beginning()
-            && self.is_at_sentence_start();
-        let effective_ch = if auto_capitalize_now {
+        let capitalize = !start.context_uncertain && self.starts_sentence_with(ch);
+        let typed = if capitalize {
             ch.to_ascii_uppercase()
         } else {
             ch
         };
 
-        if matches!(ch, '\n' | '\r') {
-            self.empty_shadow_is_field_start = true;
-        } else if !ch.is_whitespace() {
-            self.empty_shadow_is_field_start = false;
-        }
-
-        self.last_input_char = Some(effective_ch);
-        self.keys_since_reset = true;
-        if effective_ch.is_alphabetic() {
-            if let Some(word) = self.typed_word.as_mut() {
-                word.push(effective_ch);
-            }
-        } else {
-            self.typed_word = Some(String::new());
-        }
-        let result = self.engine.process_key(effective_ch);
+        self.note_typed_char(typed);
+        let result = self.engine.process_key(typed);
         self.last_keystroke_at = now;
-        self.trace_process_key(effective_ch, &result);
+        self.trace_process_key(typed, &result);
 
-        if ch == ' ' && !start.context_uncertain && prev_ended_with_word_char {
-            self.first_space_after_word_at = Some(now);
-        }
         if ch == ' ' {
-            self.last_space_at = Some(now);
-            // Not provable from the shadow (e.g. right after focus): let the
-            // next client frame decide (`confirm_double_space`).
-            if self.double_space_period
-                && prev_space_at
-                    .is_some_and(|t| now.saturating_duration_since(t) <= DOUBLE_SPACE_WINDOW)
-            {
-                self.pending_double_space_at = Some(now);
-            }
+            let after_word = !start.context_uncertain && prev_ended_with_word_char;
+            self.note_space(now, after_word, prev_space_at);
         }
 
-        if auto_capitalize_now && !result.consumed {
+        if capitalize && !result.consumed {
             self.confirmation = ConfirmationState::Live;
             return KeyDecision::Apply {
                 method: self.method(),
                 backspaces: 0,
-                commit: effective_ch.to_string(),
+                commit: typed.to_string(),
             };
         }
 
+        self.finish_key(typed, &facts, start.context_uncertain, result)
+    }
+
+    /// Whether `ch` is a lowercase letter that begins a sentence, going by
+    /// the shadow, and so should be typed as a capital.
+    fn starts_sentence_with(&self, ch: char) -> bool {
+        self.auto_capitalize
+            && ch.is_ascii_lowercase()
+            && self.engine.at_word_beginning()
+            && self.is_at_sentence_start()
+    }
+
+    /// Start the double-space timers for a space that did not itself become
+    /// `". "`. `after_word` is whether the shadow proves it follows a word or
+    /// number; `prev_space_at` is when the key before it was a space too.
+    fn note_space(&mut self, now: Instant, after_word: bool, prev_space_at: Option<Instant>) {
+        if after_word {
+            self.first_space_after_word_at = Some(now);
+        }
+        self.last_space_at = Some(now);
+        // Not provable from the shadow (e.g. right after focus): let the
+        // next client frame decide (`confirm_double_space`).
+        if self.double_space_period && within_double_space_window(prev_space_at, now) {
+            self.pending_double_space_at = Some(now);
+        }
+    }
+
+    /// The second space of a quick pair right after a word or number: replace
+    /// the first space with `". "`.
+    fn double_space_period_edit(&mut self, now: Instant) -> KeyDecision {
+        self.engine.reset();
+        self.retroactive_context = false;
+        self.last_input_char = Some(' ');
+        self.keys_since_reset = true;
+        self.typed_word = Some(String::new());
+        self.last_keystroke_at = now;
+        self.confirmation = ConfirmationState::Live;
+        KeyDecision::Apply {
+            method: self.method(),
+            backspaces: 1,
+            commit: ". ".to_owned(),
+        }
+    }
+
+    /// Bookkeeping for a printable key (after auto-capitalization), before
+    /// the engine processes it.
+    fn note_typed_char(&mut self, typed: char) {
+        if matches!(typed, '\n' | '\r') {
+            self.empty_shadow_is_field_start = true;
+        } else if !typed.is_whitespace() {
+            self.empty_shadow_is_field_start = false;
+        }
+
+        self.last_input_char = Some(typed);
+        self.keys_since_reset = true;
+        if typed.is_alphabetic() {
+            if let Some(word) = self.typed_word.as_mut() {
+                word.push(typed);
+            }
+        } else {
+            self.typed_word = Some(String::new());
+        }
+    }
+
+    /// Turn the engine's result for `typed` into the key's decision and the
+    /// confirmation state that follows it.
+    fn finish_key(
+        &mut self,
+        typed: char,
+        facts: &FeedKeyFacts,
+        context_uncertain: bool,
+        result: ProcessResult,
+    ) -> KeyDecision {
         let base_word = self.current_shadow_word().to_owned();
         let prior_pending = matches!(&facts.confirmation, ConfirmationState::PendingRaw(_));
         match plan_key_finish(
-            effective_ch,
-            start.context_uncertain,
+            typed,
+            context_uncertain,
             prior_pending,
             facts.confirmation.is_frame_derived(),
             result,
@@ -951,7 +984,7 @@ impl Composer {
             }
             KeyFinishPlan::Forward { pending } => {
                 self.remember_shadow();
-                self.edit.push_forwarded_char(effective_ch);
+                self.edit.push_forwarded_char(typed);
                 self.confirmation = pending
                     .map(ConfirmationState::PendingRaw)
                     .unwrap_or(ConfirmationState::Live);
@@ -1008,9 +1041,7 @@ impl Composer {
     pub fn feed_backspace(&mut self) -> KeyDecision {
         self.typed_word = None;
         self.last_input_char = None;
-        self.first_space_after_word_at = None;
-        self.last_space_at = None;
-        self.pending_double_space_at = None;
+        self.clear_space_timers();
         self.keys_since_reset = true;
         let r = self.engine.process_backspace();
         tracing::debug!(
@@ -1271,70 +1302,36 @@ impl Composer {
         }
         let recent_action = self.last_action_at.elapsed() < Duration::from_millis(150);
         let before_cursor = text_before_cursor(text, cursor);
-        // A frame one letter longer than the recorded baseline usually echoes
-        // the user's own raw key. But the baseline lags while echoes are
-        // skipped, so a half-applied echo of daklak's own edit can look the
-        // same (`go` -> `goo` while `gôn` becomes `goonh`), and so can a late
-        // echo of a raw key daklak has since edited (`ngu` after `nguw` showed
-        // `ngư`). Such a frame is a strict prefix of the shadow or a shadow
-        // daklak has replaced: a state already passed.
-        let shadow = self.edit.shadow_text();
-        let behind_shadow = recent_action
-            && before_cursor != shadow
-            && (shadow.starts_with(before_cursor)
-                || self.passed_shadows.iter().any(|s| s == before_cursor));
-        // With no key typed since a shortcut or navigation, it cannot echo
-        // one either: Firefox, lagging, reports the letters of a word that
-        // Ctrl+Backspace has already deleted. Such a frame reseeds as
-        // frame-derived context, so the next key waits for confirmation.
-        let one_char_typed = self.keys_since_reset
-            && !behind_shadow
-            && self.edit.one_char_insertion_since_prev(text, cursor);
+        let one_char_typed =
+            self.frame_shows_typed_char(text, cursor, before_cursor, recent_action);
         self.revalidate_live_confirmation(text, cursor, anchor);
 
-        // A double space typed before the context was proven: the frame that
-        // shows it right after a word or number turns it into ". ".
-        if self.pending_double_space_at.is_some() && cursor == anchor {
+        // Repairs a frame can trigger by itself. All need a collapsed caret.
+        if cursor == anchor {
+            // A double space typed before the context was proven: the frame that
+            // shows it right after a word or number turns it into ". ".
             if let Some(repair) = self.confirm_double_space(text, cursor, anchor, before_cursor) {
                 return Some(repair);
             }
-        }
-
-        // A raw key awaiting confirmation is stronger evidence than the 150ms
-        // echo heuristic: daklak issued no positional edit for this key, and a
-        // frame containing it immediately before the reported cursor tells us
-        // where the client actually inserted it. Handle this before generic
-        // stale-frame filtering.
-        if self.confirmation.pending_raw().is_some() && cursor == anchor {
-            if let Some(repair) = self.confirm_pending_raw_key(text, cursor, anchor, before_cursor) {
-                return Some(repair);
+            // A raw key awaiting confirmation is stronger evidence than the 150ms
+            // echo heuristic: daklak issued no positional edit for this key, and a
+            // frame containing it immediately before the reported cursor tells us
+            // where the client actually inserted it. Handle this before generic
+            // stale-frame filtering.
+            if let Some(pending) = self.pending_raw_shown_before(before_cursor) {
+                return self.confirm_pending_raw_key(pending, text, cursor, anchor, before_cursor);
             }
-            self.confirmation.pending_raw()?;
         }
 
         let shadow_confirmed = before_cursor == self.edit.shadow_text();
-        // Chromium-family editors can activate without surrounding text and
-        // initially use ForwardKey. Keep composing normally until a frame
-        // confirms our visible text; then capitalize the current word if the
-        // frame proves it started a sentence. This also covers a word already
-        // composed before the first frame (`banj` -> `bạn` -> `Bạn`).
-        if self.auto_capitalize
-            && !self.shadow_anchored
-            && self.keys_since_reset
-            && cursor == anchor
-            && shadow_confirmed
-        {
-            let word = current_word_before_cursor(text, cursor);
-            let prefix = &before_cursor[..before_cursor.len() - word.len()];
-            if !word.is_empty() && Self::sentence_start(prefix, true) {
-                if let Some(keys) = self.typed_word.clone()
-                    .filter(|keys| keys.starts_with(|c: char| c.is_ascii_lowercase()))
-                {
-                    return Some(self.capitalize_confirmed_word(text, cursor, anchor, word, keys));
-                }
+        if cursor == anchor && shadow_confirmed {
+            if let Some(repair) =
+                self.capitalize_on_first_frame(text, cursor, anchor, before_cursor)
+            {
+                return Some(repair);
             }
         }
-        let deletion = self.edit.deletion_since_prev(text, cursor) || shadow_confirmed;
+
         // `shadow_confirmed` (not `has_selection`) gates trust within the
         // recent-action window. A genuine Chromium autocomplete-selection frame
         // has a before-cursor prefix equal to what the user typed (== shadow),
@@ -1346,51 +1343,20 @@ impl Composer {
         let decision = SurroundingObserver::observe(
             recent_action,
             one_char_typed,
-            deletion,
+            self.edit.deletion_since_prev(text, cursor),
             force_reseed,
             shadow_confirmed,
         );
 
-        if !decision.trust {
+        if decision == SurroundingDecision::Ignore {
             tracing::trace!(text, cursor, anchor, "skip recent surrounding_text echo");
             return None;
         }
 
-        let deletion_already_applied = shadow_confirmed;
-        self.passed_shadows.clear();
-        self.edit.on_surrounding_text(text, cursor, anchor);
-        self.shadow_anchored = true;
-        self.empty_shadow_is_field_start = self
-            .edit
-            .shadow_text()
-            .trim_matches([' ', '\t'])
-            .is_empty();
-        // A trusted frame supplies destination context; a frame-derived seed
-        // below carries any remaining uncertainty in `confirmation`.
-        let preserve_frame_derived = self.confirmation.is_frame_derived();
-        let confirm_live =
-            shadow_confirmed && !matches!(self.confirmation, ConfirmationState::PendingRaw(_));
-        let had_pending_edit = self
-            .confirmation
-            .pending_raw()
-            .and_then(|pending| pending.edit.as_ref())
-            .is_some();
-        self.confirmation = if preserve_frame_derived {
-            ConfirmationState::FrameDerived
-        } else if confirm_live {
-            ConfirmationState::LiveConfirmed
-        } else {
-            ConfirmationState::Live
-        };
-        if had_pending_edit {
-            // A trusted frame superseded the confirmation transaction; the
-            // engine's speculative post-key state was never applied on screen.
-            self.engine.reset();
-            self.retroactive_context = false;
-        }
+        self.adopt_trusted_frame(text, cursor, anchor, shadow_confirmed);
 
-        if deletion {
-            if !deletion_already_applied {
+        match decision {
+            SurroundingDecision::ExternalDeletion => {
                 self.engine.reset();
                 self.retroactive_context = false;
                 self.confirmation = ConfirmationState::Live;
@@ -1403,29 +1369,150 @@ impl Composer {
                 self.last_input_char = None;
                 self.first_space_after_word_at = None;
             }
-        } else if decision.reseed {
-            let word = current_word_before_insertion_point(text, cursor, anchor);
-            self.engine.reset();
-            self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(word);
-            // Engine context now describes a frame-reported cursor which may
-            // go stale before the next key; positional edits from it must be
-            // confirm-deferred.
-            self.confirmation = if self.retroactive_context {
-                ConfirmationState::FrameDerived
-            } else {
-                ConfirmationState::Live
-            };
-            // Same invalidation as the deletion arm: after a genuine cursor
-            // jump the last typed key describes the previous locale.
-            self.last_input_char = None;
-            self.first_space_after_word_at = None;
-            if self.retroactive_context {
-                tracing::debug!(word, "re-seed engine (activate or cursor jump)");
+            SurroundingDecision::Reseed => {
+                let word = current_word_before_insertion_point(text, cursor, anchor);
+                // Engine context now describes a frame-reported cursor which may
+                // go stale before the next key; positional edits from it must be
+                // confirm-deferred.
+                self.confirmation = self.reseed_from_frame_word(word);
+                // Same invalidation as the deletion arm: after a genuine cursor
+                // jump the last typed key describes the previous locale.
+                self.last_input_char = None;
+                self.first_space_after_word_at = None;
+                if self.retroactive_context {
+                    tracing::debug!(word, "re-seed engine (activate or cursor jump)");
+                }
             }
+            SurroundingDecision::Ignore
+            | SurroundingDecision::Confirmed
+            | SurroundingDecision::TypedChar => {}
         }
 
         self.edit.record_surrounding(text, cursor, anchor);
         None
+    }
+
+    /// Whether the frame is the recorded baseline plus one letter the user
+    /// just typed.
+    ///
+    /// A frame one letter longer than the baseline usually echoes the user's
+    /// own raw key. But the baseline lags while echoes are skipped, so a
+    /// half-applied echo of daklak's own edit can look the same (`go` -> `goo`
+    /// while `gôn` becomes `goonh`), and so can a late echo of a raw key
+    /// daklak has since edited (`ngu` after `nguw` showed `ngư`). Such a frame
+    /// is a strict prefix of the shadow or a shadow daklak has replaced: a
+    /// state already passed.
+    ///
+    /// With no key typed since a shortcut or navigation, it cannot echo one
+    /// either: Firefox, lagging, reports the letters of a word that
+    /// Ctrl+Backspace has already deleted. Such a frame reseeds as
+    /// frame-derived context, so the next key waits for confirmation.
+    fn frame_shows_typed_char(
+        &self,
+        text: &str,
+        cursor: u32,
+        before_cursor: &str,
+        recent_action: bool,
+    ) -> bool {
+        let shadow = self.edit.shadow_text();
+        let behind_shadow = recent_action
+            && before_cursor != shadow
+            && (shadow.starts_with(before_cursor)
+                || self.passed_shadows.iter().any(|s| s == before_cursor));
+        self.keys_since_reset
+            && !behind_shadow
+            && self.edit.one_char_insertion_since_prev(text, cursor)
+    }
+
+    /// The raw key awaiting confirmation, when the frame shows it immediately
+    /// before the cursor.
+    fn pending_raw_shown_before(&self, before_cursor: &str) -> Option<PendingRaw> {
+        self.confirmation
+            .pending_raw()
+            .filter(|pending| before_cursor.ends_with(pending.ch))
+            .cloned()
+    }
+
+    /// Chromium-family editors can activate without surrounding text and
+    /// initially use ForwardKey. Composition continues normally until a frame
+    /// confirms the visible text; this then capitalizes the current word if
+    /// the frame proves it started a sentence. It also covers a word already
+    /// composed before the first frame (`banj` -> `bạn` -> `Bạn`). Call only
+    /// for a collapsed caret whose text before it equals the shadow.
+    fn capitalize_on_first_frame(
+        &mut self,
+        text: &str,
+        cursor: u32,
+        anchor: u32,
+        before_cursor: &str,
+    ) -> Option<RetroEdit> {
+        if !self.auto_capitalize || self.shadow_anchored || !self.keys_since_reset {
+            return None;
+        }
+        let word = current_word_before_cursor(text, cursor);
+        let prefix = &before_cursor[..before_cursor.len() - word.len()];
+        if word.is_empty() || !Self::sentence_start(prefix, true) {
+            return None;
+        }
+        let keys = self
+            .typed_word
+            .clone()
+            .filter(|keys| keys.starts_with(|c: char| c.is_ascii_lowercase()))?;
+        Some(self.capitalize_confirmed_word(text, cursor, anchor, word, keys))
+    }
+
+    /// Take a trusted frame as the visible text and settle what it proves
+    /// about the confirmation in progress.
+    fn adopt_trusted_frame(
+        &mut self,
+        text: &str,
+        cursor: u32,
+        anchor: u32,
+        shadow_confirmed: bool,
+    ) {
+        self.passed_shadows.clear();
+        self.edit.on_surrounding_text(text, cursor, anchor);
+        self.shadow_anchored = true;
+        self.empty_shadow_is_field_start =
+            self.edit.shadow_text().trim_matches([' ', '\t']).is_empty();
+        // A trusted frame supplies destination context; a frame-derived seed
+        // carries any remaining uncertainty in `confirmation`.
+        let pending = self.confirmation.pending_raw();
+        let supersedes_pending_edit = pending.is_some_and(|pending| pending.edit.is_some());
+        self.confirmation = if self.confirmation.is_frame_derived() {
+            ConfirmationState::FrameDerived
+        } else if shadow_confirmed && pending.is_none() {
+            ConfirmationState::LiveConfirmed
+        } else {
+            ConfirmationState::Live
+        };
+        if supersedes_pending_edit {
+            // A trusted frame superseded the confirmation transaction; the
+            // engine's speculative post-key state was never applied on screen.
+            self.engine.reset();
+            self.retroactive_context = false;
+        }
+    }
+
+    /// Take `text` as what the client shows now: sync the shadow to it and
+    /// make it the baseline later frames are diffed against.
+    fn adopt_frame(&mut self, text: &str, cursor: u32, anchor: u32) {
+        self.edit.on_surrounding_text(text, cursor, anchor);
+        self.edit.record_surrounding(text, cursor, anchor);
+    }
+
+    /// Rebuild the engine from a word a frame shows before the caret. Returns
+    /// the confirmation such context deserves: frame-derived when the word
+    /// seeded the engine (its caret may go stale before the next key), live
+    /// when there is nothing to compose against.
+    fn reseed_from_frame_word(&mut self, word: &str) -> ConfirmationState {
+        self.engine.reset();
+        self.retroactive_context = !word.is_empty() && self.engine.feed_context_gated(word);
+        if self.retroactive_context {
+            ConfirmationState::FrameDerived
+        } else {
+            ConfirmationState::Live
+        }
     }
 
     fn confirm_double_space(
@@ -1447,8 +1534,7 @@ impl Composer {
         self.pending_double_space_at = None;
         self.last_space_at = None;
         self.engine.reset();
-        self.edit.on_surrounding_text(text, cursor, anchor);
-        self.edit.record_surrounding(text, cursor, anchor);
+        self.adopt_frame(text, cursor, anchor);
         self.shadow_anchored = true;
         self.empty_shadow_is_field_start = false;
         self.last_input_char = Some(' ');
@@ -1472,8 +1558,7 @@ impl Composer {
     ) -> RetroEdit {
         keys[..1].make_ascii_uppercase();
         let commit = self.engine.retype(&keys);
-        self.edit.on_surrounding_text(text, cursor, anchor);
-        self.edit.record_surrounding(text, cursor, anchor);
+        self.adopt_frame(text, cursor, anchor);
         self.shadow_anchored = true;
         self.empty_shadow_is_field_start = false;
         self.last_input_char = keys.chars().last();
@@ -1486,123 +1571,55 @@ impl Composer {
         }
     }
 
-    /// Finish a raw-key transaction from client ground truth. The only required
-    /// proof is the tracked key immediately before the reported cursor; how the
-    /// cursor moved there is irrelevant. The frame is always recorded, ending
-    /// the `prev_text` starvation loop even when replay produces no edit.
+    /// Finish a raw-key transaction from client ground truth. `pending` is the
+    /// tracked key, which the frame shows immediately before the reported
+    /// cursor (`pending_raw_shown_before`); how the cursor moved there is
+    /// irrelevant. The frame is always recorded, ending the `prev_text`
+    /// starvation loop even when replay produces no edit.
     fn confirm_pending_raw_key(
         &mut self,
+        pending: PendingRaw,
         text: &str,
         cursor: u32,
         anchor: u32,
         before_cursor: &str,
     ) -> Option<RetroEdit> {
-        let pending = self.confirmation.pending_raw()?.clone();
         let ch = pending.ch;
-        let (raw_index, actual_ch) = before_cursor.char_indices().next_back()?;
-        if actual_ch != ch {
-            return None;
-        }
-
-        // A delayed client may combine the prior committed transform and this
-        // raw key into one frame, so `prev_text` can lag by more than one edit.
-        // Shadow equality alone also matches a cursor move over an adjacent
-        // identical character; a real insertion changes the document.
-        let document_changed = text != self.edit.prev_surrounding_for_trace().0;
-        // The recorded baseline can be stale (echoes skipped since), so the
-        // client's own previous report is checked too: going from it to this
-        // frame by exactly the raw key at the caret proves where it landed.
-        let client_step_inserted = self
-            .previous_client_report
-            .as_ref()
-            .is_some_and(|(prev, _)| char_inserted_before_cursor(prev, text, cursor, ch));
-        // Several raw keys can arrive before any client frame. Prove the
-        // complete typed insertion rather than requiring an intermediate echo.
-        let typed_word_inserted = self.typed_word.as_deref().is_some_and(|word| {
-            !word.is_empty()
-                && (text_inserted_before_cursor(
-                    self.edit.prev_surrounding_for_trace().0, text, cursor, word,
-                ) || self.previous_client_report.as_ref().is_some_and(|(prev, _)| {
-                    text_inserted_before_cursor(prev, text, cursor, word)
-                }))
-        });
-        let insertion_proven = self.edit.confirms_inserted_char(text, cursor, ch)
-            || client_step_inserted
-            || typed_word_inserted
-            || (before_cursor == self.edit.shadow_text() && document_changed);
-        let repairable = pending.repairable;
-        let stripped = &before_cursor[..raw_index];
+        let insertion_proven = self.raw_key_insertion_proven(text, cursor, before_cursor, ch);
+        let stripped = &before_cursor[..before_cursor.len() - ch.len_utf8()];
         let base_word = current_word_before_cursor(stripped, stripped.len() as u32).to_owned();
-        let actual_word = current_word_before_cursor(before_cursor, before_cursor.len() as u32)
-            .to_owned();
+        let actual_word =
+            current_word_before_cursor(before_cursor, before_cursor.len() as u32).to_owned();
+        // The word on screen is exactly the letters the user typed, still raw.
+        let typed_as_shown =
+            insertion_proven && self.typed_word.as_deref() == Some(actual_word.as_str());
 
         // A reset can leave the same empty/sentence-ending frame on screen.
         // Do not trust that duplicate as cursor evidence; capitalize only once
         // this frame proves where our raw key (or overlapping word) landed.
         if self.auto_capitalize
-            && insertion_proven
-            && self.typed_word.as_deref() == Some(actual_word.as_str())
+            && typed_as_shown
             && actual_word.starts_with(|c: char| c.is_ascii_lowercase())
             && Self::sentence_start(
                 &before_cursor[..before_cursor.len() - actual_word.len()],
                 true,
             )
         {
-            return Some(self.capitalize_confirmed_word(
-                text, cursor, anchor, &actual_word, actual_word.clone(),
-            ));
+            let keys = actual_word.clone();
+            return Some(self.capitalize_confirmed_word(text, cursor, anchor, &actual_word, keys));
         }
 
-        if !insertion_proven || !repairable {
-            // The frame changed by more than this key (paste/delete/external
-            // edit), or an overlapping key already invalidated the stashed
-            // repair. Either way it is the newest ground truth but cannot
-            // justify emitting a repair. Synchronize and continue from its
-            // visible word.
-            self.edit.on_surrounding_text(text, cursor, anchor);
-            self.edit.record_surrounding(text, cursor, anchor);
-            self.last_input_char = Some(ch);
-            self.engine.reset();
-            if insertion_proven && self.typed_word.as_deref() == Some(actual_word.as_str()) {
-                // The word on screen is exactly the letters the user typed,
-                // left raw because they overlapped before any frame confirmed
-                // them (`D`, `d` typed fast after Ctrl+Backspace show `Dd`).
-                // Retype them as fresh keys and repair the word to match.
-                let word = self.engine.retype(&actual_word);
-                self.retroactive_context = true;
-                self.confirmation = ConfirmationState::LiveConfirmed;
-                let common = actual_word
-                    .chars()
-                    .zip(word.chars())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                return (word != actual_word).then(|| RetroEdit {
-                    backspaces: actual_word.chars().count() - common,
-                    commit: word.chars().skip(common).collect(),
-                });
-            }
-            self.retroactive_context =
-                !actual_word.is_empty() && self.engine.feed_context_gated(&actual_word);
-            // When the frame PROVED this pending key landed at the reported
-            // cursor (`insertion_proven`) but a later overlapping key made it
-            // unrepairable, the cursor and latest character are known — end the
-            // deferral instead of re-arming FrameDerived. Leaving it frame-
-            // derived was sticky: every following key kept forwarding raw and
-            // dropping its commit. Observed in LibreOffice Writer typing "hơn":
-            // a stale post-backspace frame (arriving after the recent-action
-            // window because forwarded backspaces do not mark an action)
-            // reseeded to FrameDerived, then two overlapping keys pinned
-            // `repairable=false`, so "ho"+w never composed ơ and raw "how"/
-            // "howj" was left on screen. Only the unproven case stays
-            // conservative — it may be a genuine cursor jump.
-            self.confirmation = if insertion_proven {
-                ConfirmationState::LiveConfirmed
-            } else if self.retroactive_context {
-                ConfirmationState::FrameDerived
-            } else {
-                ConfirmationState::Live
-            };
-            return None;
+        // Whatever the frame proves about the key, it is the newest ground
+        // truth: every outcome below continues from it.
+        self.adopt_frame(text, cursor, anchor);
+        self.last_input_char = Some(ch);
+
+        if !insertion_proven || !pending.repairable {
+            return self.settle_unrepairable_raw_key(
+                insertion_proven,
+                typed_as_shown,
+                &actual_word,
+            );
         }
 
         // Preferred path: the live engine already processed this key against
@@ -1610,68 +1627,137 @@ impl Composer {
         // KEEP the engine state — it holds revert history a reseed loses
         // ("kư" fails the round-trip gate, so reseeding forgets ư came from
         // 'w' and a second 'w' would compose "kưư" instead of reverting).
-        if let Some(stash) = pending.edit {
-            if stash.base_word == base_word {
-                self.edit.on_surrounding_text(text, cursor, anchor);
-                self.edit.record_surrounding(text, cursor, anchor);
-                self.last_input_char = Some(ch);
-                self.retroactive_context = true;
-                // The frame just PROVED our own keystroke landed where the
-                // engine composed it, so the cursor is known again — return to
-                // live composition instead of re-arming FrameDerived. Leaving
-                // it frame-derived made the deferral sticky: it survived word
-                // boundaries (a backspace-reseed then leaked into every later
-                // tone key, flashing raw + repairing via the frame until an
-                // external Ctrl+A→Backspace reset). A genuine later cursor move
-                // is still caught — `revalidate_live_confirmation` downgrades
-                // LiveConfirmed→AwaitingFrame on a shadow mismatch, and idle
-                // re-defers after 2s.
-                self.confirmation = ConfirmationState::LiveConfirmed;
-                // The screen shows base_word + raw ch; the engine wants
-                // base_word minus `backspaces` plus `commit`. Deleting the raw
-                // char costs one extra backspace.
-                return Some(RetroEdit {
-                    backspaces: stash.backspaces + 1,
-                    commit: stash.commit,
-                });
-            }
-            // Cursor moved: the key landed on a different word than the one
-            // the engine composed against. Drop the stash and re-derive from
-            // frame ground truth below.
+        // A stash for a different base word means the cursor moved: the key
+        // landed on another word than the one the engine composed against,
+        // so the edit is re-derived from the frame instead.
+        if let Some(stash) = pending.edit.filter(|stash| stash.base_word == base_word) {
+            self.retroactive_context = true;
+            // The frame just PROVED our own keystroke landed where the
+            // engine composed it, so the cursor is known again — return to
+            // live composition instead of re-arming FrameDerived. Leaving
+            // it frame-derived made the deferral sticky: it survived word
+            // boundaries (a backspace-reseed then leaked into every later
+            // tone key, flashing raw + repairing via the frame until an
+            // external Ctrl+A→Backspace reset). A genuine later cursor move
+            // is still caught — `revalidate_live_confirmation` downgrades
+            // LiveConfirmed→AwaitingFrame on a shadow mismatch, and idle
+            // re-defers after 2s.
+            self.confirmation = ConfirmationState::LiveConfirmed;
+            // The screen shows base_word + raw ch; the engine wants
+            // base_word minus `backspaces` plus `commit`. Deleting the raw
+            // char costs one extra backspace.
+            return Some(RetroEdit {
+                backspaces: stash.backspaces + 1,
+                commit: stash.commit,
+            });
         }
 
+        self.replay_raw_key(base_word, ch)
+    }
+
+    /// Whether the frame proves the pending raw key `ch` was inserted right
+    /// before the reported cursor, rather than the cursor having moved next
+    /// to an equal character.
+    fn raw_key_insertion_proven(
+        &self,
+        text: &str,
+        cursor: u32,
+        before_cursor: &str,
+        ch: char,
+    ) -> bool {
+        let recorded = self.edit.prev_surrounding_for_trace().0;
+        // The recorded baseline can be stale (echoes skipped since), so the
+        // client's own previous report is a baseline too: going from it to
+        // this frame by exactly the insertion at the caret proves where it
+        // landed.
+        let baselines = [
+            Some(recorded),
+            self.previous_client_report
+                .as_ref()
+                .map(|(prev, _)| prev.as_str()),
+        ];
+        // Several raw keys can arrive before any client frame, so the
+        // complete typed word counts as the insertion as well as the key
+        // alone; no intermediate echo is required.
+        let mut key = [0; 4];
+        let insertions = [
+            Some(&*ch.encode_utf8(&mut key)),
+            self.typed_word.as_deref().filter(|word| !word.is_empty()),
+        ];
+        let stepped = baselines.iter().flatten().any(|prev| {
+            insertions
+                .iter()
+                .flatten()
+                .any(|inserted| text_inserted_before_cursor(prev, text, cursor, inserted))
+        });
+        // A delayed client may combine the prior committed transform and this
+        // raw key into one frame, so the baselines can lag by more than one
+        // edit. Shadow equality alone also matches a cursor move over an
+        // adjacent identical character; a real insertion changes the document.
+        stepped || (before_cursor == self.edit.shadow_text() && text != recorded)
+    }
+
+    /// The frame changed by more than the pending key (paste/delete/external
+    /// edit), or an overlapping key already invalidated the stashed repair.
+    /// Either way it is the newest ground truth but cannot justify replaying
+    /// the key. Continue from its visible word.
+    fn settle_unrepairable_raw_key(
+        &mut self,
+        insertion_proven: bool,
+        typed_as_shown: bool,
+        actual_word: &str,
+    ) -> Option<RetroEdit> {
+        if typed_as_shown {
+            // The letters were left raw because they overlapped before any
+            // frame confirmed them (`D`, `d` typed fast after Ctrl+Backspace
+            // show `Dd`). Retype them as fresh keys and repair the word to
+            // match.
+            let word = self.engine.retype(actual_word);
+            self.retroactive_context = true;
+            self.confirmation = ConfirmationState::LiveConfirmed;
+            return suffix_edit(actual_word, &word);
+        }
+        let frame_derived = self.reseed_from_frame_word(actual_word);
+        // When the frame PROVED this pending key landed at the reported
+        // cursor (`insertion_proven`) but a later overlapping key made it
+        // unrepairable, the cursor and latest character are known — end the
+        // deferral instead of re-arming FrameDerived. Leaving it frame-
+        // derived was sticky: every following key kept forwarding raw and
+        // dropping its commit. Observed in LibreOffice Writer typing "hơn":
+        // a stale post-backspace frame (arriving after the recent-action
+        // window because forwarded backspaces do not mark an action)
+        // reseeded to FrameDerived, then two overlapping keys pinned
+        // `repairable=false`, so "ho"+w never composed ơ and raw "how"/
+        // "howj" was left on screen. Only the unproven case stays
+        // conservative — it may be a genuine cursor jump.
+        self.confirmation = if insertion_proven {
+            ConfirmationState::LiveConfirmed
+        } else {
+            frame_derived
+        };
+        None
+    }
+
+    /// Re-derive a proven raw key's edit from the frame alone: seed the engine
+    /// with the word the frame shows before the key, then feed the key again.
+    fn replay_raw_key(&mut self, base_word: String, ch: char) -> Option<RetroEdit> {
         self.engine.reset();
         let seeded = !base_word.is_empty() && self.engine.feed_context_gated(&base_word);
-        let replay = seeded.then(|| self.engine.process_key(ch));
-
-        // This frame is authoritative regardless of whether replay composes.
-        self.edit.on_surrounding_text(text, cursor, anchor);
-        self.edit.record_surrounding(text, cursor, anchor);
-        self.last_input_char = Some(ch);
-
         // For boundary-valued IM keys (`[`/`]` Telex shortcuts), extracting the
         // current word after the raw key yields empty. The proven on-screen word
         // is instead exactly the base word plus that inserted key.
         let screen_word = format!("{base_word}{ch}");
-
-        let Some(replay) = replay else {
+        if !seeded {
             // Fresh word or foreign base: keep the raw key, but seed the full
             // confirmed word so subsequent keys start from real client state.
-            self.engine.reset();
-            self.retroactive_context =
-                !screen_word.is_empty() && self.engine.feed_context_gated(&screen_word);
-            self.confirmation = if self.retroactive_context {
-                ConfirmationState::FrameDerived
-            } else {
-                ConfirmationState::Live
-            };
+            self.confirmation = self.reseed_from_frame_word(&screen_word);
             return None;
-        };
-
+        }
+        let replay = self.engine.process_key(ch);
         self.retroactive_context = true;
-        // As in the stash path above: the frame proved where this key landed,
-        // so the caret is known and the next key may edit directly. Leaving
-        // it frame-derived defers the next key until a report proves it too,
+        // As in the stash path: the frame proved where this key landed, so
+        // the caret is known and the next key may edit directly. Leaving it
+        // frame-derived defers the next key until a report proves it too,
         // which Firefox's caret-first reports may never do before Enter.
         self.confirmation = ConfirmationState::LiveConfirmed;
         if !replay.consumed {
@@ -1685,20 +1771,7 @@ impl Composer {
             desired.pop();
         }
         desired.push_str(&replay.commit);
-
-        let prefix_chars = screen_word
-            .chars()
-            .zip(desired.chars())
-            .take_while(|(a, b)| a == b)
-            .count();
-        let backspaces = screen_word.chars().count() - prefix_chars;
-        let commit: String = desired.chars().skip(prefix_chars).collect();
-
-        if backspaces == 0 && commit.is_empty() {
-            None
-        } else {
-            Some(RetroEdit { backspaces, commit })
-        }
+        suffix_edit(&screen_word, &desired)
     }
 
     /// True if (text, cursor, anchor) exactly matches the last frame — clients
@@ -1844,11 +1917,9 @@ fn client_byte_delete_agrees(client_before: &str, shadow: &str, backspaces: usiz
     client_before.ends_with(&shadow[start..])
 }
 
-/// Whether `text` is `prev` with `ch` inserted immediately before `cursor`.
-fn char_inserted_before_cursor(prev: &str, text: &str, cursor: u32, ch: char) -> bool {
-    text_inserted_before_cursor(prev, text, cursor, ch.encode_utf8(&mut [0; 4]))
-}
-
+/// Whether `text` is `prev` with `inserted` added immediately before `cursor`.
+/// Where the cursor was before is irrelevant; the unchanged prefix and suffix
+/// prove the insertion, rather than an existing equal run, produced `text`.
 fn text_inserted_before_cursor(prev: &str, text: &str, cursor: u32, inserted: &str) -> bool {
     let cursor = (cursor as usize).min(text.len());
     let Some(start) = cursor.checked_sub(inserted.len()) else {
@@ -1858,6 +1929,23 @@ fn text_inserted_before_cursor(prev: &str, text: &str, cursor: u32, inserted: &s
         && prev.len() + inserted.len() == text.len()
         && prev.as_bytes().get(..start) == text.as_bytes().get(..start)
         && prev.as_bytes().get(start..) == text.as_bytes().get(cursor..)
+}
+
+/// The edit that turns `screen` into `desired` by rewriting only what follows
+/// their common prefix; `None` when they already match.
+fn suffix_edit(screen: &str, desired: &str) -> Option<RetroEdit> {
+    let common = screen
+        .chars()
+        .zip(desired.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let backspaces = screen.chars().count() - common;
+    let commit: String = desired.chars().skip(common).collect();
+    (backspaces > 0 || !commit.is_empty()).then_some(RetroEdit { backspaces, commit })
+}
+
+fn within_double_space_window(earlier: Option<Instant>, now: Instant) -> bool {
+    earlier.is_some_and(|t| now.saturating_duration_since(t) <= DOUBLE_SPACE_WINDOW)
 }
 
 fn text_before_cursor(text: &str, cursor: u32) -> &str {
@@ -4514,79 +4602,71 @@ mod tests {
     mod surrounding_policy {
 
         #[test]
-        fn surrounding_observer_trusts_mid_word_one_char_without_reseed() {
-            let decision = super::SurroundingObserver::observe(true, true, false, false, false);
-
-            assert_eq!(
-                decision,
-                super::SurroundingDecision {
-                    trust: true,
-                    reseed: false
-                }
-            );
-        }
-
-        #[test]
-        fn surrounding_observer_trusts_recent_shadow_confirmed_without_reseed() {
-            // A recent frame whose before-cursor text matches our shadow (post-commit
-            // echo, or a Chromium autocomplete selection whose prefix is what we
-            // typed) is trusted — syncs the shadow/selection without reseeding.
-            let decision = super::SurroundingObserver::observe(true, false, false, false, true);
-
-            assert_eq!(
-                decision,
-                super::SurroundingDecision {
-                    trust: true,
-                    reseed: false
-                }
-            );
-        }
-
-        #[test]
-        fn surrounding_observer_drops_recent_unconfirmed_selection() {
-            // A STALE Chromium-omnibox autocomplete selection (recent, not a one-char
-            // insert, before-cursor does NOT match shadow) must be dropped — trusting
-            // it re-armed a stale selection span and broke `haf`→`à`.
-            let decision = super::SurroundingObserver::observe(true, false, false, false, false);
-
-            assert_eq!(
-                decision,
-                super::SurroundingDecision {
-                    trust: false,
-                    reseed: false
-                }
-            );
-        }
-
-        #[test]
-        fn surrounding_observer_drops_recent_delete_echo() {
-            // A deletion within the recent-action window is our own
-            // delete_surrounding_text echo, not an external edit — drop it so the
-            // shadow and in-progress composition survive until the commit echo.
-            let decision = super::SurroundingObserver::observe(true, false, true, false, false);
-
-            assert_eq!(
-                decision,
-                super::SurroundingDecision {
-                    trust: false,
-                    reseed: false
-                }
-            );
-        }
-
-        #[test]
-        fn surrounding_observer_trusts_external_delete_for_reset() {
-            // The same deletion outside the recent-action window IS an external
-            // edit — trust it so the deletion branch can reset the engine.
-            let decision = super::SurroundingObserver::observe(false, false, true, false, false);
-
-            assert_eq!(
-                decision,
-                super::SurroundingDecision {
-                    trust: true,
-                    reseed: false
-                }
-            );
+        fn surrounding_observer_classifies_frames() {
+            use super::SurroundingDecision::{
+                Confirmed, ExternalDeletion, Ignore, Reseed, TypedChar,
+            };
+            const RECENT: u8 = 1;
+            const TYPED: u8 = 2;
+            const DELETED: u8 = 4;
+            const ACTIVATE: u8 = 8;
+            const MATCHES_SHADOW: u8 = 16;
+            let cases = [
+                // The user's own key, echoed mid-word: reseeding would clobber
+                // the running composition (`hieeus`, `phucs`).
+                ("typed char, echoed at once", RECENT | TYPED, TypedChar),
+                ("typed char, echoed late", TYPED, TypedChar),
+                // Post-commit echo, or a Chromium autocomplete selection whose
+                // prefix is what was typed: sync without reseeding.
+                (
+                    "recent frame equal to the shadow",
+                    RECENT | MATCHES_SHADOW,
+                    Confirmed,
+                ),
+                // A stale Chromium-omnibox selection describes a prefix already
+                // typed past; trusting it broke `haf` -> `à`.
+                ("recent frame, nothing proven", RECENT, Ignore),
+                // Our own delete_surrounding_text echo: the shadow and the
+                // composition must survive until the commit echo.
+                ("recent deletion", RECENT | DELETED, Ignore),
+                (
+                    "deletion outside the echo window",
+                    DELETED,
+                    ExternalDeletion,
+                ),
+                ("caret somewhere else", 0, Reseed),
+                (
+                    "activation inside the echo window",
+                    RECENT | ACTIVATE,
+                    Reseed,
+                ),
+                (
+                    "activation that looks like a typed char",
+                    ACTIVATE | TYPED,
+                    Reseed,
+                ),
+                // More specific evidence wins over an activation.
+                (
+                    "activation onto the shadow's text",
+                    ACTIVATE | MATCHES_SHADOW,
+                    Confirmed,
+                ),
+                (
+                    "activation showing a deletion",
+                    ACTIVATE | DELETED,
+                    ExternalDeletion,
+                ),
+            ];
+            for (name, facts, expected) in cases {
+                let decision = super::SurroundingObserver::observe(
+                    facts & RECENT != 0,
+                    facts & TYPED != 0,
+                    facts & DELETED != 0,
+                    facts & ACTIVATE != 0,
+                    facts & MATCHES_SHADOW != 0,
+                );
+                assert_eq!(decision, expected, "{name}");
+            }
         }
 
         #[test]

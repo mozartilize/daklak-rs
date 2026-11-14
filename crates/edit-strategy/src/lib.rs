@@ -129,7 +129,6 @@ pub trait OutputSink {
 pub struct Strategy {
     method: BackspaceMethod,
     pub shadow: ShadowBuffer,
-    modifiers: ModifierState,
 }
 
 impl Strategy {
@@ -137,7 +136,6 @@ impl Strategy {
         Self {
             method,
             shadow: ShadowBuffer::new(),
-            modifiers: ModifierState::empty(),
         }
     }
 
@@ -211,11 +209,6 @@ impl Strategy {
     /// Reset shadow on focus loss or navigation key.
     pub fn reset_shadow(&mut self) {
         self.shadow.clear();
-    }
-
-    /// Update modifier state from a Modifiers event on the keyboard grab.
-    pub fn set_modifiers(&mut self, m: ModifierState) {
-        self.modifiers = m;
     }
 
     pub fn method(&self) -> BackspaceMethod {

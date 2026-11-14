@@ -57,7 +57,6 @@ impl AdapterHandler for Daemon {
             // ONLY by the runtime ST-liveness probe at the ST→FK downgrade —
             // not by a purpose/capability guess, because text-input-v3 exposes
             // no per-feature bit and the breakage is per-widget.
-            c.set_modifiers(self.router.modifiers);
             self.router.composer = Some(c);
         } else if deactivate {
             tracing::debug!("deactivate");
@@ -344,9 +343,6 @@ impl AdapterHandler for Daemon {
 
     fn on_modifiers(&mut self, _ctx: &mut AdapterCtx<'_>, m: ModifierState) {
         self.router.modifiers = m;
-        if let Some(w) = self.router.composer.as_mut() {
-            w.set_modifiers(m);
-        }
     }
 
     fn on_focus_changed(
@@ -388,7 +384,6 @@ impl AdapterHandler for Daemon {
             c.set_v2_key_replacement(self.config.v2_key_replacement);
             c.set_auto_capitalize(self.config.auto_capitalize);
             c.set_double_space_period(self.config.double_space_period);
-            c.set_modifiers(self.router.modifiers);
             // No text-input session exists for this client, so commit_string is
             // dead. Force ForwardKey to route replacements through the virtual
             // keyboard's synthetic keymap instead.
