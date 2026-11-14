@@ -197,25 +197,35 @@ searches `~/.config/xkb` first, so they shadow the stock ruleset cleanly.
 Meson installs all three generated artifacts when configured with
 `-Devdev_grab=true` and `sudo meson install`: `daklak.xkb`, `daklak_vn`, and
 `evdev` under `${datadir}/daklak/xkb` (typically `/usr/share/daklak/xkb`). It
-also installs `daklak_vn` system-wide under `/usr/share/X11/xkb/symbols/` for
-the `setxkbmap daklak_vn` *layout* path. The built-in hooks consume these
-installed files instead of running `daklak gen-keymap` at runtime.
+does not install a duplicate into `${datadir}/X11/xkb/symbols/`. The built-in
+hooks consume the private artifacts above instead of running
+`daklak gen-keymap` at runtime; KDE uses the XKB extension described below.
 
 With `-Dkde=true`, Meson also installs the option files into libxkbcommon's
 **XKB extensions directory** (libxkbcommon ≥ 1.13; the path comes from its
 pkg-config variable `xkb_unversioned_extensions_path`, typically
 `/usr/share/xkeyboard-config.d/daklak/`): `symbols/daklak_vn` and
-`rules/evdev.post`. libxkbcommon adds that directory to its include path and
+`rules/evdev.post`, plus `rules/evdev.xml` registry metadata. libxkbcommon adds that directory to its include path and
 appends every `evdev.post` to the stock `evdev` ruleset, so no per-user copy is
 needed — only the `kxkbrc` option below. That location is fixed by
 libxkbcommon, not by daklak's `--prefix`. For a user install (`--prefix` inside
-`$HOME`, e.g. `~/.local`) Meson installs the same two files into
+`$HOME`, e.g. `~/.local`) Meson installs the same three files into
 `${XDG_CONFIG_HOME:-~/.config}/xkb` instead, since no root is available. With
 an older libxkbcommon, Meson prints a warning and skips these files; use the
 manual `~/.config/xkb` copies below instead. A `~/.config/xkb/rules/evdev` left
 from a manual setup shadows the stock ruleset and registers the option a second
 time; delete it (and a stale `symbols/daklak_vn`) after switching to the Meson
 install.
+
+Alternatively, reopen KDE **System Settings → Keyboard → Layouts**, enable
+layout configuration, and add **Vietnamese (US + Daklak)** (`daklak_vn`).
+Select it as the active layout: adding it as an inactive second layout is not
+enough, since KWin resolves keysyms only in the active layout. This layout
+already includes US typing keys and the Vietnamese additions, so it does not
+need the separate `daklak:vn` option. It is not a Telex engine; daklak still
+performs composition. Right Alt acts as AltGr and Henkan as the level-5 selector,
+as with the option. The registry fragment adds this entry without replacing the
+system layout list.
 
 Verify it parses cleanly (optional — the crate's tests compile the blob and the
 option against several layouts, so this is just for hand-editing or CI):

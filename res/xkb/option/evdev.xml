@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xkbConfigRegistry SYSTEM "xkb.dtd">
+<xkbConfigRegistry version="1.1">
+  <layoutList>
+    <layout>
+      <configItem>
+        <name>daklak_vn</name>
+        <shortDescription>vi</shortDescription>
+        <description>Vietnamese (US + Daklak)</description>
+        <languageList><iso639Id>vie</iso639Id></languageList>
+      </configItem>
+    </layout>
+  </layoutList>
+</xkbConfigRegistry>

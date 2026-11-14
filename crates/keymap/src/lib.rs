@@ -690,6 +690,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn standalone_layout_needs_no_option_for_vietnamese() {
+        let root = OptionRoot::new("standalone-layout", true);
+        let plain = root.compile("us", "", None);
+        let daklak = root.compile("daklak_vn", "", None);
+        for slot in SLOTS {
+            let kc = slot.keycode as u32;
+            assert_eq!(levels(&plain, kc, 0, 4), levels(&daklak, kc, 0, 4));
+        }
+        for c in all_vn() {
+            let sym = xkb::commit_keysym(c).unwrap();
+            assert!(kwin_lookup(&daklak, 0, sym).is_some(), "missing {c}");
+        }
+    }
+
     fn option_layouts_check(root: &OptionRoot) {
         for (layout, variant) in [
             ("us", ""),
