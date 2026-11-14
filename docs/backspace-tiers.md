@@ -104,6 +104,11 @@ continuously revalidate that confirmation. The trust-and-reseed decision
 is isolated in the `SurroundingObserver`
 (see [Architecture](architecture.md#crate-responsibilities)).
 
+Reseeding uses the syllable immediately before the insertion point. An ASCII
+hyphen (`-`) separates composing context even inside a compound: correcting
+`bán-nguyêt` with `j` seeds only `nguyêt`, producing `bán-nguyệt` without
+replacing the prefix or text after the caret.
+
 A selection reported by the last surrounding frame is not part of the shadow.
 When daklak deletes with Backspace keys, the first Backspace clears the
 selection, whatever its length or direction, and the rest delete the engine's

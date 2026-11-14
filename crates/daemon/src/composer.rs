@@ -1868,16 +1868,15 @@ pub fn current_word_before_cursor(text: &str, cursor: u32) -> &str {
     &before[start..]
 }
 
-/// Hyphen is intentionally NOT a word boundary: Vietnamese uses hyphens
-/// within compound words and proper nouns (e.g. `bán-nguyệt`, `Ê-đê`).
-/// Breaking at `-` would prevent surrounding-text reseeding from
-/// reconstructing the full compound for the engine.
+/// The engine composes one syllable, so a hyphen separates composing context
+/// even within a compound such as `bán-nguyệt`.
 fn is_word_boundary(c: char) -> bool {
     c.is_whitespace()
         || c == '\0'
         || matches!(
             c,
             '.' | ','
+                | '-'
                 | ';'
                 | ':'
                 | '!'
@@ -3225,6 +3224,28 @@ mod tests {
 
     mod retroactive_context {
         use super::*;
+
+        #[test]
+        fn hyphenated_context_edits_only_the_syllable_at_the_caret() {
+            for confirmation in [false, true] {
+                for (text, before_caret, key, expected) in [
+                    ("bán-nguyêt nhé", "bán-nguyêt", 'j', "bán-nguyệt nhé"),
+                    ("xin-chao", "xin-chao", 'f', "xin-chào"),
+                    ("ca-phe", "ca-phe", 'e', "ca-phê"),
+                ] {
+                    let mut c = Composer::new(InputMethod::Telex, BackspaceMethod::SurroundingText, false);
+                    c.set_surrounding_confirmation(confirmation);
+                    let mut client = CachedReportClient::new(text, before_caret.len());
+                    deliver_report_with_repairs(&mut c, &mut client, true);
+
+                    type_key(&mut c, &mut client, key);
+                    client.report_live();
+                    deliver_report_with_repairs(&mut c, &mut client, false);
+
+                    assert_eq!(client.text, expected, "{text:?} + {key}, confirmation={confirmation}");
+                }
+            }
+        }
 
         // Kate, Telex: live typing is continuous composition — never
         // confirm-deferred, no raw-key flash. "kww" composes ư then reverts
