@@ -80,34 +80,50 @@ unaffected.
 
 ## Wayland
 
-Crate: [`wayland-adapter`](../crates/wayland-adapter/). This mode targets two
-distinct compositor families through two input-method protocol versions.
+Crate: [`wayland-adapter`](../crates/wayland-adapter/). Wayland mode needs two
+keyboard capabilities before it starts: intercepting physical keys, and
+returning keys Daklak does not consume. `connect()` inspects the advertised
+globals before registering an input method:
+
+| Advertised | Selected text channel | Selected key channel |
+|---|---|---|
+| IMv2 + virtual keyboard (with or without IMv1) | IMv2 | virtual keyboard |
+| IMv1 (with or without IMv2/virtual keyboard) | IMv1 context | IMv1 context `key` / `keysym` |
+| IMv2 only | startup error | none |
+
+IMv2 alone can edit text but cannot return grabbed keys such as Enter, Tab,
+arrows, or application shortcuts, so it is rejected. IMv1 plus a virtual
+keyboard is representable but not selected yet: whether compositors keep those
+synthetic keys out of the IMv1 grab has not been validated.
 
 ### Input-method v2 (wlroots / Sway)
 
 - Uses `zwp_input_method_v2` plus `zwp_virtual_keyboard_v1`.
-- Has a real **virtual keyboard**, so Tier 2 (`ForwardKey`) can drive both the
-  synthesized backspaces and the virtual-keyboard synthetic-keymap replacement
-  channel.
+- The IMv2 grab exists outside a text-input session, so the virtual keyboard can
+  serve both raw passthrough and focus-synthesized ForwardKey sessions.
 - Tier 1 (`SurroundingText`) commits via `delete_surrounding_text` +
   `commit_string`; daklak's own commit acknowledges the frame (the v2 client
   does not heartbeat `done` on its own). Tier 2 (`ForwardKey`) sends both the
   Backspaces and the replacement through the virtual keyboard's synthetic
   keymap, so the whole edit stays on one ordered channel — GTK clients apply
   text-input commits ahead of queued key events, so mixing the two reorders
-  the edit. `commit_string` is only the fallback for chars outside the
-  synthetic keymap. Clients that never enable text-input get a ForwardKey
-  session synthesized from focus metadata, which uses the same channel.
+  the edit. A replacement uses the key channel only if every character is
+  supported; otherwise the whole replacement uses `commit_string`. Clients that
+  never enable text-input get a ForwardKey session synthesized from focus
+  metadata, which uses the same channel.
 
 ### Input-method v1 (KWin / Plasma)
 
-- Uses `zwp_input_method_v1` via the input-method context.
-- **No** virtual keyboard exposed; ForwardKey replacement text is kept on the
+- Uses `zwp_input_method_v1`; its keyboard grab and context exist only while a
+  text-input context is active.
+- Without a virtual keyboard, ForwardKey replacement text is kept on the
   context **keysym** path as one whole replacement. daklak does not split one
   replacement between keysym and `commit_string` on this transport.
-- The v1 protocol applies updates immediately per frame and heartbeats the
-  text-input-v3 client through its commit state — it does not batch via a `done`
-  event the way v2 does.
+- The context serial comes from `commit_state`; daklak does not increment it.
+  The v1 protocol applies updates immediately per frame and heartbeats the
+  text-input client through its commit state.
+- Focus metadata alone cannot synthesize a session because no IMv1 grab exists
+  for applications that never activate text-input.
 
 These differences are captured as capability booleans rather than hard-coded
 branches; see [Capability model](capability-model.md). For the protocol history,
@@ -116,16 +132,16 @@ keyboard-filter design, and future XX path, see
 
 ### Focus
 
-Wayland mode tracks the focused application through the
-[`focus`](key-emit-and-focus.md#focus-tracking) backends
-(wlr-foreign-toplevel, KDE Plasma window management, or an X11 bridge for
-XWayland), which feeds per-app routing and tier selection.
+Wayland mode can track the focused toplevel through wlr-foreign-toplevel or KDE
+Plasma window management, with an optional X11 bridge marking XWayland windows.
+Focus is optional: text-input sessions work without it. Without a toplevel source,
+applications that never activate text-input do not get Vietnamese composition.
 
 ### Key emission
 
-The actual key synthesis goes through the unified `KeyEmitter` backends —
-virtual-keyboard v2 or input-method-context v1 — see
-[Key emit & focus](key-emit-and-focus.md).
+Text operations and key output are selected independently. Raw passthrough,
+synthetic Backspace, modifiers, and key-channel replacement text all use the
+selected key channel; see [Key emit & focus](key-emit-and-focus.md).
 
 ### Key repeat
 

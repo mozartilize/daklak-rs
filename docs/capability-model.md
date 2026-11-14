@@ -9,7 +9,7 @@ abstraction that makes that possible.
 ## Contents
 
 - [Capability over identity](#capability-over-identity)
-- [TransportProfile](#transportprofile)
+- [One source of truth](#one-source-of-truth)
 - [The orthogonal axes](#the-orthogonal-axes)
 - [How it is used](#how-it-is-used)
 
@@ -20,16 +20,18 @@ The principle: **branch on capabilities, not on compositor names.**
 A single "which backend am I" flag is tempting but quickly fuses unrelated
 concerns — the protocol version, how focus is tracked, whether a virtual
 keyboard exists — into one value, and every new compositor either fits an
-existing label or forces a new one. daklak instead records a small set of
+existing label or forces a new one. daklak instead exposes a small set of
 **independent capability facts**, fixed once at connect time, and lets each
 decision read exactly the fact it needs.
 
-## TransportProfile
+## One source of truth
 
-A `TransportProfile` is captured **once at `connect()`** and not re-detected
-afterwards. It combines protocol identity, focus source, and the capability
-facts needed by downstream decisions. Read the `wayland-adapter` crate when
-changing the concrete profile shape.
+The Wayland adapter negotiates its channels **once at `connect()`** and keeps
+them in one connection object that owns the protocol objects. Capability facts
+are questions answered by that object, not a separate copy of what was
+negotiated, so they cannot drift from what is actually bound. The daemon reads
+them through the adapter context. Read the `wayland-adapter` crate when
+changing what can be asked.
 
 ## The orthogonal axes
 
@@ -49,16 +51,17 @@ focus source.
 
 ### Capability facts
 
-What the transport can actually do: whether it has a virtual keyboard, whether
-it can commit text through protocol paths, whether it receives surrounding text,
-and how frame acknowledgement is handled. Keep this list conceptual in docs; the
-source and tests define the exact matrix.
+What the transport can actually do, for the decisions that need to know:
+whether replacement text can be typed as keysyms, and whether a session can be
+created from focus alone (the keyboard grab exists outside a text-input session
+and the virtual keyboard carries Daklak's synthetic keymap). Keep this list
+conceptual in docs; the source and tests define the exact set.
 
 ## How it is used
 
 - **Tier selection** consults capabilities before choosing a deletion mechanism.
 - **Emit path** chooses a backend based on what the active transport exposes.
-- **Focus-driven routing** uses the focus source plus the focused app id.
+- **Focus-driven routing** uses the focused app id when a focus source exists.
 
 ## Next
 

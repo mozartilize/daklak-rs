@@ -33,7 +33,7 @@ Before changing anything, hold these three facts:
 | How an edit is executed on the wire | the relevant transport adapter's sink |
 | Composition state / shadow / reseed | `daemon::composer` |
 | Key routing per transport | `daemon::handler` |
-| Capability detection | `wayland-adapter` (`TransportProfile`) |
+| Capability detection | `wayland-adapter` (the negotiated connection) |
 | Focus tracking | `focus` |
 | Key synthesis | `key-emitter` |
 | CLI / mode selection / config | `daemon::{main, config}` |
@@ -43,9 +43,9 @@ Before changing anything, hold these three facts:
 
 - **The `OutputSink` boundary.** The brain must not learn which compositor it is
   talking to. Keep transport-specific logic in the adapters.
-- **Profile is fixed at connect.** `TransportProfile` is captured once and not
-  re-detected mid-session. Don't sprinkle live capability probes through the
-  decision paths.
+- **Capabilities are fixed at connect.** The Wayland channels are negotiated
+  once and not re-detected mid-session. Ask the adapter context for a capability
+  fact; don't keep a second copy of it or probe live in the decision paths.
 - **Branch on capabilities, not protocol names.** Prefer capability facts over
   protocol identity when choosing behavior.
 - **The re-seed gate.** Navigation and shortcut keys must not be treated as
@@ -83,10 +83,10 @@ cargo test                  # core + wayland
 cargo test --features ibus  # IBus-gated tests too
 ```
 
-Favor unit tests that don't need a live compositor — the `TransportProfile`
-capability matrix and `detect_method` tier selection are both designed to be
-testable in isolation. Prefer adding a profile/selection test over a manual
-end-to-end check where possible.
+Favor unit tests that don't need a live compositor — channel negotiation and
+`detect_method` tier selection are both testable in isolation, and the Wayland
+adapter's test state runs on a real connection whose requests can be read back.
+Prefer adding such a test over a manual end-to-end check where possible.
 
 For real-key browser reproductions, the local harness in
 [`tools/typing-race-e2e`](../tools/typing-race-e2e/README.md) provides native,

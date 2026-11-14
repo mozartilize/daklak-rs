@@ -28,13 +28,14 @@ The active backend is selected from the transport's
 
 ## Focus tracking
 
-Crate: [`focus`](../crates/focus/). daklak needs the focused application's
-identity to drive per-app routing, terminal detection, and XWayland-specific
-handling.
+Crates: [`focus`](../crates/focus/) defines the shared event and X11 bridge;
+[`wayland-adapter`](../crates/wayland-adapter/src/focus/) owns Wayland toplevel
+drivers. Focus is optional metadata, not a requirement for text-input sessions.
 
-A runtime probe selects a focus backend based on what the compositor exposes.
-The live source is recorded in the transport profile so routing code can reason
-about where app identity came from.
+The Wayland drivers normalize toplevels into one window model: application ID,
+title, and activated state. A newly activated window wins over an older window
+that has not reported deactivation yet. The X11 bridge only adds the XWayland
+flag to that normalized focus event.
 
 ### Backends
 
@@ -44,13 +45,12 @@ about where app identity came from.
 
 ### Why focus matters
 
-- **No-text-input fallback** — a focused client that never enables text-input
-  gets a ForwardKey session synthesized from focus metadata.
+- **No-text-input fallback** — when the transport has a global keyboard grab and
+  synthetic virtual-keyboard output, a focused client that never enables
+  text-input gets a ForwardKey session synthesized from focus metadata. IMv1
+  cannot do this because its keyboard grab exists only inside a text-input context.
 - **XWayland detection** — XWayland clients behave differently from native
   Wayland clients on some compositors, so daklak distinguishes them.
-
-The Wayland adapter uses the shared `focus` crate rather than maintaining its own
-copy of focus logic.
 
 ## Next
 

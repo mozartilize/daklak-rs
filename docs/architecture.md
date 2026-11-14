@@ -102,18 +102,36 @@ A single composing keystroke, end to end:
 
 ## Composition & seeding
 
-The Composer owns exactly **two** pieces of word state, with a strict division:
+The engine owns linguistic state; the Composer owns the evidence that an edit
+is safe at the client's caret. Similar-looking fields have different lifetimes:
 
-- **the engine** owns the *composition* state — the in-progress syllable and the
-  raw keystrokes behind it (vnkey keeps its own keystroke buffer internally).
-- **the shadow** owns daklak's mirror of the **app's visible text** before the
-  cursor. It is the only thing daklak itself tracks per word.
+| State | Owner | Meaning |
+| ----- | ----- | ------- |
+| `word`, `word_raw` | `EngineState` | Composed word and its typing order. Seeds, corrections and history compaction can replace the keys; this is not a literal record of user input. |
+| `screen_word` | `EngineState` | Temporary raw spelling still on screen after a delete, when vnkey renders those keys differently (`thoong` versus `thông`). |
+| `typed_word` | `Composer` | Literal letters typed since the word began, used to prove that a delayed client frame shows the user's input. Unknown after Backspace; not reconstructed from the engine. |
+| Shadow text and selection | `EditModel` / `ShadowBuffer` | Predicted app text before the insertion point and the selection to replace. Includes surrounding context, not just the engine's syllable. |
+| `prev_text`, `prev_cursor`, `prev_anchor` | `EditModel` | Last adopted frame used as the diff baseline; it stays unchanged when an echo is ignored. |
+| `client_report`, `previous_client_report` | `Composer` | Last two received Wayland reports, including ignored echoes; needed for byte-delete safety and insertion confirmation. |
 
-Daklak keeps no third copy. The engine runs **continuously**: every printable
-key is fed to it *without resetting it between keys*, so vowel-cluster context
-survives across transforms — typing `tieengs`, the sắc tone lands on `iê`
-because the engine still holds the cluster. All three transports (wayland IM
-v1/v2, IBus, evdev) use this one path, `Composer::feed_key`.
+The engine can have processed a key whose edit is still awaiting client
+confirmation, so its word cannot replace the shadow. Similarly,
+`last_input_char` records a key, not the last rendered glyph (`w` can show `ư`).
+`keys_since_reset` records that input occurred even after Backspace makes both
+`typed_word` and `last_input_char` unknown. The engine's `word_keys` is a separate
+history-size budget, not the length of either of those fields.
+
+Input-method options belong to `EngineState`: switching methods preserves
+bracket-shortcut and tone-placement settings without the Composer copying them.
+Keyboard modifiers belong to the router, not the Composer or edit strategy.
+The shadow only stores text and selection spans; frame trust and cursor-move
+classification belong to the Composer's confirmation logic.
+
+The engine runs **continuously**: every printable key is fed to it *without
+resetting it between keys*, so vowel-cluster context survives across transforms
+— typing `tieengs`, the sắc tone lands on `iê` because the engine still holds
+the cluster. All three transports (wayland IM v1/v2, IBus, evdev) use this one
+path, `Composer::feed_key`.
 
 The engine is **(re)seeded** from the word before the cursor in the shadow in
 two cases: retroactive editing (the cursor jumping into existing text), and a
@@ -230,8 +248,26 @@ confirmed by daklak's own key stream.
 `FeedKeyFacts`; pure `plan_key_start` and `plan_key_finish` functions then
 compute the transition without borrowing or changing the Composer. `feed_key`
 applies the selected engine, shadow, quirk, and confirmation mutations in one
-ordered block. This keeps transition policy independently testable while making
-the mutation owner explicit.
+ordered sequence. This keeps transition policy independently testable while
+making the mutation owner explicit.
+
+`Composer::apply_surrounding` owns the frame path the same way. It first tries
+the repairs a frame can trigger by itself: a pending double space, a pending raw
+key, a first-frame capitalization. Otherwise the pure
+`SurroundingObserver::observe` classifies the frame, and the first of these
+that applies wins:
+
+1. **ignore**: a late echo of daklak's own edit (the 150 ms rule above);
+2. **confirmed**: the text before the caret equals the shadow, so the engine
+   already agrees;
+3. **external deletion**: the app removed text daklak did not delete, so the
+   engine starts over;
+4. **reseed**: an activation, or a caret daklak did not place, so the engine is
+   reseeded from the word the caret now touches;
+5. **typed char**: the echo of the user's own key, which the running
+   composition already tracks.
+
+Every outcome except ignore adopts the frame as the visible text.
 
 ## Failure boundaries
 
@@ -255,10 +291,10 @@ failure, or an abort inside a dependency.
 Wraps the vendored vnkey engine and exposes the linguistic operations the
 Composer needs. No I/O, no Wayland, no transport policy.
 
-A word that stops being Vietnamese is restored to raw letters: either vnkey
-restores it, or a key makes it longer than 7 letters on screen, the length of
-the longest Vietnamese word (`nghiêng`; corrections such as a changed tone do
-not count against it). Either way the wrapper writes the raw letters of the
+A composition that stops being Vietnamese is restored to raw letters: either
+vnkey restores it, or a key makes it longer than 7 letters on screen, the
+maximum length of a Vietnamese syllable (`nghiêng`; corrections such as a
+changed tone do not count against it). Either way the wrapper writes the raw letters of the
 word **as it was on screen**, plus the new key, then passes keys through
 unchanged until vnkey's next word break. Each glyph is spelled as the user
 could have typed it (`ư` as `uw`, `w` or `u`; a tone key either last or right
@@ -277,14 +313,20 @@ through the same way. Separately, one word may
 feed vnkey at most 32 keys before its key history is compacted to keys that
 reproduce the word on screen: vnkey's non-Vietnamese restore copies the whole
 history into a fixed 128-entry buffer, so tone toggling on a short word would
-otherwise overflow it.
+otherwise overflow it. Compaction is render-gated too: an escaped literal
+spelling such as `af` must not be replayed as `à`. If it cannot round-trip,
+composition stops until the next word break. After a backspace handled by
+vnkey itself, the wrapper rebuilds history from the remaining word as well:
+legacy `hoàn` minus `n` becomes `hòa`, and a later restore must not resurrect
+that deleted `n`.
 
 ### `edit-strategy`
 The policy layer, independent of any transport:
 - `BackspaceMethod` enum and `detect_method()` — tier selection.
 - `CapabilityProbe` — the inputs to tier selection.
 - `OutputSink` trait — the abstract edit interface the brain calls.
-- The shadow buffer and its invalidation rules.
+- The shadow buffer and selection-aware byte/character deletion spans.
+  The Composer decides when to adopt a frame or invalidate context.
 
 ### `daemon`
 - `composer::Composer` — the transport-neutral composition core.
@@ -301,8 +343,8 @@ The policy layer, independent of any transport:
 
 ### `wayland-adapter`
 Owns all Wayland wire concerns: input-method v1 and v2 protocols, the virtual
-keyboard, the xkb keymap upload, the `TransportProfile` capability snapshot, and
-the tier emit paths. See [Transports](transports.md) and
+keyboard, the xkb keymap upload, channel negotiation and its capability facts,
+and the tier emit paths. See [Transports](transports.md) and
 [Capability model](capability-model.md).
 
 ### `evdev-adapter`
