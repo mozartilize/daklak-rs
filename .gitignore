@@ -5,3 +5,8 @@ target/
 .code-review-graph/
 
 .ideas/
+
+# Generated Python bytecode and Meson subproject locks.
+__pycache__/
+*.py[cod]
+.wraplock
