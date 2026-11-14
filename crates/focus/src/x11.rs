@@ -14,7 +14,6 @@ pub(crate) struct X11Window {
     pub wm_class_instance: Option<String>,
     pub wm_class_class: Option<String>,
     pub net_wm_name: Option<String>,
-    pub net_wm_pid: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -154,18 +153,6 @@ fn fetch_window(conn: &RustConnection, win: Window) -> Option<X11Window> {
                     if !s.is_empty() {
                         entry.net_wm_name = Some(s.to_owned());
                     }
-                }
-            }
-        }
-    }
-    if let Ok(pid_atom) = intern_atom(conn, b"_NET_WM_PID") {
-        if let Ok(cookie) =
-            conn.get_property(false, win, pid_atom, AtomEnum::CARDINAL, 0, 1)
-        {
-            if let Ok(r) = cookie.reply() {
-                if r.value.len() >= 4 {
-                    let pid = u32::from_ne_bytes([r.value[0], r.value[1], r.value[2], r.value[3]]);
-                    entry.net_wm_pid = Some(pid);
                 }
             }
         }

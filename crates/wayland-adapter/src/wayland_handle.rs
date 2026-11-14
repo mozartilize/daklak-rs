@@ -7,7 +7,7 @@ use tokio::io::unix::AsyncFd;
 use wayland_client::backend::WaylandError;
 use wayland_client::{Connection, EventQueue};
 
-use viet_ime_focus::{FocusBackend, FocusEvent};
+use viet_ime_focus::FocusBackend;
 
 use crate::{AdapterHandler, WaylandAdapter};
 
@@ -87,14 +87,6 @@ impl<H: AdapterHandler> WaylandHandle<H> {
         };
         tracing::trace!(key, time, "client repeat timer fired");
         self.app.dispatch_client_key_repeat(time, key);
-    }
-
-    pub fn focus_snapshot(&self) -> Option<FocusEvent> {
-        self.app.state.focus_snapshot()
-    }
-
-    pub fn focus_backend(&mut self) -> &mut Option<Box<dyn FocusBackend>> {
-        &mut self.focus_backend
     }
 
     pub fn wl_fd(&self) -> &AsyncFd<WlRawFd> {

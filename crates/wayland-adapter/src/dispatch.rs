@@ -72,9 +72,6 @@ impl<H: AdapterHandler> Dispatch<ZwpInputMethodV2, ()> for WaylandAdapter<H> {
             zwp_input_method_v2::Event::SurroundingText { text, cursor, anchor } => {
                 state.state.apply_event(FrameEvent::SurroundingText { text, cursor, anchor });
             }
-            zwp_input_method_v2::Event::TextChangeCause { cause } => {
-                state.state.apply_event(FrameEvent::ChangeCause(cause.into()));
-            }
             zwp_input_method_v2::Event::ContentType { hint: _, purpose } => {
                 state.state.apply_event(FrameEvent::Purpose(purpose.into()));
             }

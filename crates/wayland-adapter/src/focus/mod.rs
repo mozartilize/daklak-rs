@@ -1,7 +1,7 @@
 //! Optional focused-window tracking, independent of the input-method channel.
 //! Protocol drivers normalize Wayland toplevels; X11 only enriches their metadata.
 
-use std::{collections::HashMap, hash::Hash, sync::{Arc, Mutex}};
+use std::{collections::HashMap, hash::Hash};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use wayland_client::{backend::ObjectId, globals::GlobalList, QueueHandle};
@@ -40,21 +40,19 @@ struct FocusState<Id> {
     active: Option<Id>,
     xwayland: Option<x11::X11Bridge>,
     tx: mpsc::UnboundedSender<FocusEvent>,
-    current: Arc<Mutex<Option<FocusEvent>>>,
+    current: Option<FocusEvent>,
 }
 
 struct FocusFeed {
     name: &'static str,
     rx: mpsc::UnboundedReceiver<FocusEvent>,
-    current: Arc<Mutex<Option<FocusEvent>>>,
 }
 
 impl<Id: Eq + Hash + Clone> FocusState<Id> {
     fn new(xwayland: Option<x11::X11Bridge>, name: &'static str) -> (Self, FocusFeed) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let current = Arc::new(Mutex::new(None));
-        let feed = FocusFeed { name, rx, current: current.clone() };
-        (Self { windows: HashMap::new(), active: None, xwayland, tx, current }, feed)
+        let feed = FocusFeed { name, rx };
+        (Self { windows: HashMap::new(), active: None, xwayland, tx, current: None }, feed)
     }
 
     fn set(&mut self, id: Id, window: Window) {
@@ -88,12 +86,10 @@ impl<Id: Eq + Hash + Clone> FocusState<Id> {
             }
             None => FocusEvent::default(),
         };
-        if let Ok(mut current) = self.current.lock() {
-            if !active_changed && current.as_ref() == Some(&event) {
-                return;
-            }
-            *current = Some(event.clone());
+        if !active_changed && self.current.as_ref() == Some(&event) {
+            return;
         }
+        self.current = Some(event.clone());
         tracing::trace!(?event, "focused window changed");
         if self.tx.send(event).is_err() {
             tracing::debug!("focus observer dropped");
@@ -136,7 +132,7 @@ impl FocusTracker {
     }
 
     pub fn current(&self) -> Option<FocusEvent> {
-        self.state.current.lock().ok().and_then(|current| current.clone())
+        self.state.current.clone()
     }
 
     pub fn finish(&mut self) {
@@ -149,7 +145,6 @@ impl FocusTracker {
 #[async_trait]
 impl FocusBackend for FocusFeed {
     async fn next_event(&mut self) -> Option<FocusEvent> { self.rx.recv().await }
-    fn current(&self) -> Option<FocusEvent> { self.current.lock().ok().and_then(|current| current.clone()) }
     fn name(&self) -> &'static str { self.name }
 }
 
@@ -178,7 +173,7 @@ mod tests {
         assert!(feed.rx.try_recv().is_err());
         state.remove(&22);
         assert_eq!(feed.rx.try_recv().unwrap(), FocusEvent::default());
-        assert_eq!(feed.current(), Some(FocusEvent::default()));
+        assert_eq!(state.current, Some(FocusEvent::default()));
     }
 
     #[test]
@@ -189,7 +184,7 @@ mod tests {
         state.set(7, window("org.example.Editor", true));
         let expected = FocusEvent { app_id: Some("org.example.Editor".into()), is_xwayland: false };
         assert_eq!(feed.rx.try_recv().unwrap(), expected);
-        assert_eq!(feed.current(), Some(expected));
+        assert_eq!(state.current, Some(expected));
         state.set(7, window("org.example.Editor", true));
         assert!(feed.rx.try_recv().is_err());
     }

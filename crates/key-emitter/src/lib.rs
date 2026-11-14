@@ -75,9 +75,4 @@ pub trait KeyEmitter {
     fn modifier_echo_through_grab(&self) -> bool {
         false
     }
-
-    /// Block until every emit issued on this backend so far has been
-    /// processed by the compositor. Default no-op; `LibeiEmitter`
-    /// overrides with `ei_connection.sync`.
-    fn sync_barrier(&mut self) {}
 }

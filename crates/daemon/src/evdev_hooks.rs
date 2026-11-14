@@ -32,11 +32,6 @@ impl AppliedHooks {
     pub fn is_empty(&self) -> bool {
         self.hooks.is_empty()
     }
-
-    #[allow(dead_code)]
-    pub fn names(&self) -> Vec<String> {
-        self.hooks.iter().map(|h| h.name.clone()).collect()
-    }
 }
 
 pub trait HookCommandRunner: Send + Sync {
@@ -779,7 +774,8 @@ mod runner_tests {
         let runner = FakeRunner::new(&[(("sway", "set"), 10), (("kde", "set"), 0)]);
         let (applied, outcomes) =
             run_setup_hooks_without_file_checks_for_test(&hooks, &runner).unwrap();
-        assert_eq!(applied.names(), vec!["kde"]);
+        let names: Vec<_> = applied.hooks.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["kde"]);
         assert_eq!(
             outcomes,
             vec![

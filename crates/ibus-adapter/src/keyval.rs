@@ -49,11 +49,6 @@ pub fn keyval_to_char(keyval: u32) -> Option<char> {
     None
 }
 
-/// X11 keycode → Linux evdev keycode (subtract 8).
-pub fn x11_to_evdev(x11_kc: u32) -> u32 {
-    x11_kc.saturating_sub(8)
-}
-
 /// Map an IBus key event to the Linux evdev keycode daklak's core expects.
 ///
 /// IBus keycodes are NOT reliably X11 keycodes: under X11 they are X11 codes

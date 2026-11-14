@@ -30,10 +30,6 @@ impl UinputEmitter {
             .map_err(|e| anyhow::anyhow!("uinput: open /dev/uinput failed: {e}"))?;
         Ok(Self { dev })
     }
-
-    pub fn from_device(dev: UinputDevice) -> Self {
-        Self { dev }
-    }
 }
 
 impl KeyEmitter for UinputEmitter {

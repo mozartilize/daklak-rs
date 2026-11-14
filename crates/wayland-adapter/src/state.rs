@@ -243,10 +243,6 @@ impl AdapterState {
                 self.pending_frame.purpose = purpose;
                 self.wire.mark_pending_commit(true);
             }
-            FrameEvent::ChangeCause(cause) => {
-                tracing::trace!(cause, "im: TextChangeCause");
-                self.pending_frame.change_cause = Some(cause);
-            }
             FrameEvent::Unavailable => {
                 tracing::error!("compositor sent Unavailable — another IM is registered");
                 self.should_exit = true;

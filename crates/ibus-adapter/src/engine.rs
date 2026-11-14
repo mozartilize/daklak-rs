@@ -391,21 +391,6 @@ impl<D: IbusHandler + Send + 'static> Engine<D> {
     /// emit it on focus-in/enable so the client starts sending SetSurroundingText.
     #[zbus(signal)]
     async fn require_surrounding_text(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn update_preedit_text(
-        emitter: &SignalEmitter<'_>,
-        text: Value<'_>,
-        cursor_pos: u32,
-        visible: bool,
-        mode: u32,
-    ) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn show_preedit_text(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn hide_preedit_text(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
 impl<D: IbusHandler + Send + 'static> Engine<D> {
